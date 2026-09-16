@@ -9,6 +9,7 @@
  *    마지막에 value × (1 + pct/100) 로 한 번 곱한다.
  *  - critChance / critMult / cooldownReduction 은 퍼센트 값(150 = 1.5배). accuracy / evasion 은 원본 스탯값이며
  *    적중 공식은 sim 에 있다 (편의용 hitChancePct 를 여기서도 제공).
+ *  - Character.derivedMult(몬스터 전용 최종 배율)는 맵 보정·pctMods 가 모두 끝난 뒤 마지막에 곱해진다.
  */
 import type { BaseStatKey, Character, DerivedStatKey, DerivedStats, MapType } from './types';
 import { BASE_STAT_KEYS, DERIVED_STAT_KEYS, STAT_MAX, STAT_MIN } from './types';
@@ -85,8 +86,10 @@ export function computeDerived(c: Character, map: MapType, pctMods?: Partial<Rec
   const cdr = mastery * 0.4;
   const d: DerivedStats = {
     // 최대 HP: 체력에 대해 초선형(체력²) — 성장할수록 공격력보다 HP 가 빨리 늘어 후반 전투가 길어진다 (GDD 6.1 전투 시간 목표).
-    // 체력 40 ≈ 1580, 체력 55 ≈ 2720 (+직업 보정 × 3).
-    maxHp: (300 + vitality * vitality * 0.8 + hpBonus * 3) * mapMod,
+    // 고정항 300 → 900: 체력이 낮은 편성(하급 몬스터, 초반 5:5)의 전투가 목표 하한 40초를 크게 밑돌았다.
+    // 고정항은 양 팀에 똑같이 더해지므로 승률은 그대로 두고 짧은 쪽 꼬리만 끌어올린다.
+    // 체력 40 ≈ 2180, 체력 55 ≈ 3320 (+직업 보정 × 3).
+    maxHp: (900 + vitality * vitality * 0.8 + hpBonus * 3) * mapMod,
     physAtk: (strength * 1.0 + mastery * 0.3) * mapMod,
     magAtk: (magicPower * 1.0 + mastery * 0.3) * mapMod,
     physDef: (defenseTech * 0.8 + vitality * 0.2) * mapMod,
@@ -136,6 +139,17 @@ export function computeDerived(c: Character, map: MapType, pctMods?: Partial<Rec
       let mult = 1 + v / 100;
       if (mult < 0) mult = 0;
       d[k] = d[k] * mult;
+    }
+  }
+
+  // ── 최종 배율: Character.derivedMult (몬스터 전용). 모든 계산이 끝난 뒤 마지막에 곱한다 ──
+  const dm = c.derivedMult;
+  if (dm !== undefined) {
+    for (let j = 0; j < DERIVED_STAT_KEYS.length; j++) {
+      const k = DERIVED_STAT_KEYS[j];
+      const v = dm[k];
+      if (v === undefined || v === 1) continue;
+      d[k] = d[k] * (v < 0 ? 0 : v);
     }
   }
 

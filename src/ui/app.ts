@@ -1,19 +1,28 @@
 /**
  * 브라우저 UI 진입점. #app 에 화면을 상태 기반으로 렌더링한다.
  * 시뮬레이션/육성 로직은 src/core 에 있고 여기서는 호출만 한다.
+ *
+ * 육성 구조 (v0.4): 10일 × 5스텝 — 선택 · 선택 · 몬스터 · 선택 · 5:5 전투 → 하루 마무리.
+ * 화면 왼쪽 위에는 항상 진행 HUD 가 떠 있다 (전투 관전 중에도).
  */
 import {
   BASE_STAT_KEYS,
   CHOICE_KIND_NAME_KO,
+  DAY_STEPS,
   JOB_NAME_KO,
   MAP_NAME_KO,
   MAP_TYPES,
   MAX_ACTIVE_SKILLS,
   MAX_PASSIVE_SKILLS,
+  MONSTER_TIER_NAME_KO,
+  MONSTER_TIER_ORDER,
   STAT_CATEGORY_NAME_KO,
+  STAT_MAX,
   STAT_NAME_KO,
+  STEPS_PER_DAY,
+  STEP_KIND_NAME_KO,
   TICK_RATE,
-  TOTAL_CYCLES,
+  TOTAL_DAYS,
   type BaseStatKey,
   type BattleEvent,
   type BattleFrame,
@@ -22,8 +31,11 @@ import {
   type BattleSimulator,
   type Character,
   type Choice,
+  type DayRecord,
   type GhostSnapshot,
   type MapType,
+  type MonsterEncounter,
+  type MonsterTier,
   type RunState,
   type StatCategory,
   type Team,
@@ -31,8 +43,9 @@ import {
   type UnitBattleStats,
 } from '../core/types';
 import { MAPS } from '../core/data/maps';
+import { monsterReward as monsterRewardOf } from '../core/data/monsters';
 import { getSkill, skillPoolFor, countSkills } from '../core/data/skills';
-import { computeDerived, powerRating, statTotal } from '../core/stats';
+import { computeDerived, statTotal } from '../core/stats';
 import { createBattle } from '../core/battle/sim';
 import {
   BONUS_DRAW,
@@ -41,34 +54,48 @@ import {
   REROLL_COST,
   STAT_TRAIN_COST,
   STAT_TRAIN_DELTA,
-  battleInput,
   buySkill,
   ensureChoices,
   finishBattle,
-  finishBonus,
+  finishDay,
+  finishMonsterBattle,
   isSubJobChoiceSet,
+  monsterOptions,
   newRun,
   pickChoice,
-  prepareNextBattle,
+  pickMonster,
+  prepareBattle,
   rerollChoices,
   selectTeam,
+  startBattle as runStartBattle,
+  teamPower,
   trainStat,
 } from '../core/growth/run';
-import { BattleRenderer } from './render';
+import { BattleRenderer, monsterTiersOfInput } from './render';
 import * as storage from './storage';
 import {
+  MONSTER_TIER_COLOR,
+  MONSTER_TIER_HINT_KO,
   VICTORY_KO,
   categoryAverages,
   clear,
+  composition,
+  monsterDifficultyKo,
   fmtNum,
   fmtSec,
+  fmtSigned,
   h,
   jobLabel,
+  phaseKo,
+  rarityColor,
+  rarityKo,
   reasonKo,
+  safePower,
   skillName,
   skillTypeKo,
   stars,
   statsOfCategory,
+  stepLabel,
   subJobName,
   type Child,
 } from './format';
@@ -76,12 +103,15 @@ import {
 // ───────────────────────── 앱 상태 ─────────────────────────
 
 type View = 'start' | 'run' | 'pvp_setup' | 'battle' | 'result';
-type BattleMode = 'run' | 'pvp';
+/** 'run' = 5:5 전투, 'monster' = 몬스터 전투, 'pvp' = 완성팀 대전 */
+type BattleMode = 'run' | 'monster' | 'pvp';
 
 interface BattleSession {
   mode: BattleMode;
   sim: BattleSimulator;
   input: BattleInput;
+  /** 전투 상단에 표시할 부제 (몬스터 이름 등) */
+  title: string;
   speed: number;
   paused: boolean;
   acc: number;
@@ -109,7 +139,10 @@ interface LastResult {
   mode: BattleMode;
   input: BattleInput;
   result: BattleResult;
-  bonusEarned: number | null;
+  /** 이 전투로 얻은 보너스 포인트 (pvp 는 null) */
+  pointsEarned: number | null;
+  /** 몬스터 전투였다면 그 정보 */
+  monster: { tier: MonsterTier; name: string; won: boolean; reward: MonsterEncounter['reward'] } | null;
 }
 
 let view: View = 'start';
@@ -130,6 +163,10 @@ const root = document.getElementById('app') ?? (() => {
   document.body.appendChild(d);
   return d;
 })();
+
+/** 좌상단 고정 진행 HUD (전투 관전 중에도 보인다) */
+const hudEl = h('div', { id: 'run-hud', class: 'run-hud' });
+document.body.appendChild(hudEl);
 
 // ───────────────────────── 유틸 ─────────────────────────
 
@@ -179,6 +216,18 @@ function toast(msg: string, ms = 2200): void {
   toastTimer = window.setTimeout(() => el && el.classList.remove('show'), ms);
 }
 
+/** 팀 전투력 (데이터가 깨져 있어도 예외를 던지지 않는다) */
+function safeTeamPower(t: Team | null | undefined): number {
+  if (!t) return 0;
+  try {
+    return teamPower(t);
+  } catch {
+    let sum = 0;
+    for (const c of t.members) sum += safePower(c);
+    return sum;
+  }
+}
+
 function memberName(team: Team | null, id: string): string {
   if (!team) return id;
   const m = team.members.find((c) => c.id === id);
@@ -206,6 +255,102 @@ function dedupeTeamIds(a: Team, b: Team): Team {
     }
   }
   return clone;
+}
+
+function safeSkillDesc(id: string): string {
+  try {
+    return getSkill(id).desc;
+  } catch {
+    return '';
+  }
+}
+
+function safeSkillPool(c: Character): string[] {
+  try {
+    return skillPoolFor(c);
+  } catch {
+    return [];
+  }
+}
+
+function safeCounts(c: Character): { active: number; passive: number } {
+  try {
+    return countSkills(c);
+  } catch {
+    let active = 0;
+    let passive = 0;
+    for (const id of c.skills) {
+      try {
+        if (getSkill(id).type === 'active') active++;
+        else passive++;
+      } catch {
+        /* 무시 */
+      }
+    }
+    return { active, passive };
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch] ?? ch);
+}
+
+// ───────────────────────── 진행 HUD ─────────────────────────
+
+function hudVisible(): boolean {
+  if (!run) return false;
+  if (view === 'run') return true;
+  // 완성 팀 대전(pvp) 결과에는 육성 진행 정보가 무관하므로 숨긴다
+  if (view === 'result') return !lastResult || lastResult.mode !== 'pvp';
+  if (view === 'battle') return battle !== null && battle.mode !== 'pvp';
+  return false;
+}
+
+/** 좌상단 고정 HUD 갱신. 400px 폭에서도 한 줄로 축약되어 화면을 가리지 않는다 */
+function syncHud(): void {
+  const show = hudVisible();
+  document.body.classList.toggle('hud-on', show);
+  clear(hudEl);
+  hudEl.hidden = !show;
+  if (!show || !run) return;
+  const st = run;
+
+  const dayText =
+    st.phase === 'select_team' ? '팀 선택'
+      : st.phase === 'done' ? '육성 완료'
+        : `${st.day}일차`;
+  const stepText =
+    st.phase === 'select_team' ? '준비'
+      : st.phase === 'day_end' ? '마무리'
+        : st.phase === 'done' ? `${TOTAL_DAYS}/${TOTAL_DAYS}일`
+          : `${st.step}/${STEPS_PER_DAY}`;
+
+  const chips = DAY_STEPS.map((kind, i) => {
+    const n = i + 1;
+    let cls = 'future';
+    if (st.phase === 'day_end' || st.phase === 'done') cls = 'done';
+    else if (st.phase === 'select_team') cls = 'future';
+    else if (n < st.step) cls = 'done';
+    else if (n === st.step) cls = 'current';
+    return h('span', { class: `hud-chip step-${kind} ${cls}`, title: `${n}스텝 ${STEP_KIND_NAME_KO[kind]}` }, STEP_KIND_NAME_KO[kind]);
+  });
+
+  hudEl.appendChild(
+    h(
+      'div',
+      { class: 'hud-inner' },
+      h('div', { class: 'hud-day' },
+        h('strong', null, dayText),
+        h('span', { class: 'hud-step' }, stepText),
+      ),
+      h('div', { class: 'hud-chips' }, chips),
+      h('div', { class: 'hud-meta' },
+        h('span', { class: 'hud-pt', title: '보너스 포인트' }, `${st.bonusPoints}pt`),
+        h('span', { class: 'hud-power', title: '팀 전투력' }, `전투력 ${fmtNum(safeTeamPower(st.team))}`),
+        st.rarityFloor ? h('span', { class: 'hud-floor', style: `color:${rarityColor(st.rarityFloor)}`, title: '다음 선택지 보장 등급' }, `${rarityKo(st.rarityFloor)}↑ 보장`) : null,
+      ),
+    ),
+  );
 }
 
 // ───────────────────────── 공용 컴포넌트 ─────────────────────────
@@ -255,30 +400,6 @@ function skillChips(c: Character): HTMLElement {
   );
 }
 
-function safeSkillDesc(id: string): string {
-  try {
-    return getSkill(id).desc;
-  } catch {
-    return '';
-  }
-}
-
-function safeSkillPool(c: Character): string[] {
-  try {
-    return skillPoolFor(c);
-  } catch {
-    return [];
-  }
-}
-
-function safePower(c: Character): number {
-  try {
-    return Math.round(powerRating(c));
-  } catch {
-    return statTotal(c);
-  }
-}
-
 /** 20개 스탯 표 (카테고리 4열) */
 function statTable(c: Character): HTMLElement {
   const cats: StatCategory[] = ['body', 'mind', 'skill', 'magic'];
@@ -307,7 +428,7 @@ function teamSummaryCard(team: Team, title: string, side?: TeamSide): HTMLElemen
   return h(
     'div',
     { class: `card team-card ${side ? `side-${side}` : ''}` },
-    h('div', { class: 'card-title' }, title, ' ', h('span', { class: 'muted' }, team.name)),
+    h('div', { class: 'card-title' }, title, ' ', h('span', { class: 'muted' }, team.name), ' ', h('span', { class: 'muted small' }, `전투력 ${fmtNum(safeTeamPower(team))}`)),
     h(
       'ul',
       { class: 'member-list' },
@@ -315,9 +436,9 @@ function teamSummaryCard(team: Team, title: string, side?: TeamSide): HTMLElemen
         h(
           'li',
           null,
-          h('span', { class: `job-badge job-${c.mainJob}` }, JOB_NAME_KO[c.mainJob]),
+          h('span', { class: `job-badge job-${c.mainJob} ${c.monster ? 'is-monster' : ''}` }, JOB_NAME_KO[c.mainJob]),
           h('span', { class: 'name' }, c.name),
-          h('span', { class: 'muted small' }, subJobName(c.subJob) || '—'),
+          h('span', { class: 'muted small' }, c.monster ? MONSTER_TIER_NAME_KO[c.monster.tier] : subJobName(c.subJob) || '—'),
           h('span', { class: 'power' }, `전투력 ${safePower(c)}`),
         ),
       ),
@@ -328,6 +449,11 @@ function teamSummaryCard(team: Team, title: string, side?: TeamSide): HTMLElemen
   );
 }
 
+/** 희귀도 배지 */
+function rarityBadge(r: Choice['rarity']): HTMLElement {
+  return h('span', { class: `chip rarity rarity-${r}`, style: `color:${rarityColor(r)}; border-color:${rarityColor(r)}` }, rarityKo(r));
+}
+
 // ───────────────────────── 렌더 루프 ─────────────────────────
 
 /** 직전에 그린 화면 키. 화면이 바뀔 때만 맨 위로 스크롤한다 (같은 화면 갱신은 스크롤 위치 유지). */
@@ -336,7 +462,7 @@ let lastScreenKey = '';
 const openDetails = new Set<string>();
 
 function screenKey(): string {
-  return view === 'run' && run ? `run:${run.phase}:${run.cycle}` : view;
+  return view === 'run' && run ? `run:${run.phase}:${run.day}:${run.step}` : view;
 }
 
 function render(): void {
@@ -366,6 +492,7 @@ function render(): void {
   if (changed || nextKey !== key) window.scrollTo(0, 0);
   else window.scrollTo(0, prevY);
   lastScreenKey = nextKey;
+  syncHud();
 }
 
 /** 재렌더 후에도 펼침 상태가 유지되는 <details> */
@@ -405,10 +532,13 @@ function renderStart(): HTMLElement {
       return;
     }
     run = s;
-    if (run.phase === 'battle') run.phase = 'pre_battle';
-    if (run.phase === 'pre_battle' && (!run.currentMap || !run.opponent)) {
-      prepareNextBattle(run, { ghosts: ghostsFor(run) });
+    if (s.phase === 'select_team') {
+      // 다른 시드의 풀을 고르던 흔적이 남지 않도록 초기화
+      selection.ids = [];
+      selection.name = s.team ? s.team.name : '나의 팀';
     }
+    // storage 가 전투 중 저장을 전투 직전 단계로 되돌려 준다. 부족한 데이터만 다시 만든다.
+    restoreRunData(s);
     persist();
     view = 'run';
     render();
@@ -417,13 +547,16 @@ function renderStart(): HTMLElement {
   return h(
     'div',
     { class: 'screen start' },
-    h('div', { class: 'hero' }, h('h1', null, '이능 5:5 전투 시뮬레이터'), h('p', { class: 'muted' }, '가챠 풀에서 5명을 고르고 10사이클 동안 육성해 팀을 완성하세요. 전투는 자동으로 진행되며 관전만 합니다.')),
+    h('div', { class: 'hero' },
+      h('h1', null, '이능 5:5 전투 시뮬레이터'),
+      h('p', { class: 'muted' }, `가챠 풀에서 5명을 고르고 ${TOTAL_DAYS}일 동안 육성해 팀을 완성하세요. 하루는 선택 · 선택 · 몬스터 전투 · 선택 · 5:5 전투 다섯 스텝입니다. 전투는 자동으로 진행되며 관전만 합니다.`),
+    ),
     h(
       'div',
       { class: 'card' },
       h('div', { class: 'card-title' }, '새 육성 시작'),
       h('div', { class: 'row' }, h('label', { class: 'label' }, '시드'), seedInput, h('button', { class: 'btn ghost', onclick: () => { seedInput.value = String(randomSeed()); } }, '랜덤')),
-      h('p', { class: 'muted small' }, '같은 시드면 같은 캐릭터 풀과 같은 상대가 나옵니다.'),
+      h('p', { class: 'muted small' }, '같은 시드면 같은 캐릭터 풀, 같은 몬스터, 같은 상대가 나옵니다.'),
       h('button', { class: 'btn primary wide', onclick: startNew }, '새 육성 시작'),
     ),
     saved
@@ -431,7 +564,7 @@ function renderStart(): HTMLElement {
           'div',
           { class: 'card' },
           h('div', { class: 'card-title' }, '이어하기'),
-          h('p', { class: 'muted small' }, `시드 ${saved.seed} · ${saved.cycle > 0 ? `사이클 ${saved.cycle}/${TOTAL_CYCLES}` : '팀 선택 중'} · 단계: ${phaseKo(saved.phase)}${saved.team ? ` · ${saved.team.name}` : ''}`),
+          h('p', { class: 'muted small' }, `시드 ${saved.seed} · ${saved.day > 0 ? `${saved.day}일차 ${saved.step > 0 ? stepLabel(saved.step) : ''}` : '팀 선택 중'} · 단계: ${phaseKo(saved.phase)}${saved.team ? ` · ${saved.team.name}` : ''}`),
           h('div', { class: 'row' },
             h('button', { class: 'btn primary', onclick: resume }, '이어하기'),
             h('button', { class: 'btn danger ghost', onclick: () => { if (window.confirm('진행 중인 육성을 삭제할까요?')) { storage.clearRun(); render(); } } }, '삭제'),
@@ -448,7 +581,7 @@ function renderStart(): HTMLElement {
     h(
       'div',
       { class: 'card muted small' },
-      h('div', null, `고스트 데이터 ${ghosts.length}개 (과거 육성의 사이클별 팀 스냅샷, 상대로 등장)`),
+      h('div', null, `고스트 데이터 ${ghosts.length}개 (과거 육성의 일차별 팀 스냅샷, 같은 일차의 상대로 등장)`),
       h('div', { class: 'row', style: 'margin-top:8px' },
         h('button', { class: 'btn ghost small', disabled: ghosts.length === 0, onclick: () => { if (window.confirm('고스트 데이터를 모두 삭제할까요?')) { storage.clearGhosts(); render(); } } }, '고스트 삭제'),
         h('button', { class: 'btn ghost small danger', onclick: () => { if (window.confirm('모든 저장 데이터(육성, 고스트, 완성 팀)를 삭제할까요?')) { storage.clearAll(); render(); } } }, '전체 초기화'),
@@ -457,15 +590,20 @@ function renderStart(): HTMLElement {
   );
 }
 
-function phaseKo(p: RunState['phase']): string {
-  switch (p) {
-    case 'select_team': return '팀 선택';
-    case 'pre_battle': return '전투 준비';
-    case 'battle': return '전투';
-    case 'bonus': return '보너스 상점';
-    case 'choice': return '로그라이크 선택';
-    case 'done': return '완료';
-    default: return p;
+/** 이어하기 시 비어 있는 단계별 데이터를 다시 만든다 (같은 시드 → 같은 결과) */
+function restoreRunData(s: RunState): void {
+  try {
+    if (s.phase === 'pre_battle' && (!s.currentMap || !s.opponent)) {
+      prepareBattle(s, { ghosts: ghostsFor(s) });
+    }
+    if (s.phase === 'monster_select' && (!s.monsterOptions || s.monsterOptions.length === 0)) {
+      monsterOptions(s);
+    }
+    if (s.phase === 'choice' && s.currentChoices.length === 0) {
+      ensureChoices(s);
+    }
+  } catch {
+    /* 복구 실패 시 각 화면에서 다시 시도한다 */
   }
 }
 
@@ -477,14 +615,28 @@ function renderRun(): HTMLElement {
     return renderStart();
   }
   switch (run.phase) {
-    case 'select_team': return renderSelectTeam(run);
-    case 'pre_battle': return renderPreBattle(run);
+    case 'select_team':
+      return renderSelectTeam(run);
+    case 'choice':
+      return renderChoice(run);
+    case 'monster_select':
+      return renderMonsterSelect(run);
+    case 'monster_battle':
+      // 관전 도중 화면을 떠났다면 난이도 선택으로 되돌린다
+      run.phase = 'monster_select';
+      run.currentMonster = null;
+      persist();
+      return renderMonsterSelect(run);
+    case 'pre_battle':
+      return renderPreBattle(run);
     case 'battle':
       run.phase = 'pre_battle';
+      persist();
       return renderPreBattle(run);
-    case 'bonus': return renderBonus(run);
-    case 'choice': return renderChoice(run);
-    case 'done': return renderDone(run);
+    case 'day_end':
+      return renderDayEnd(run);
+    case 'done':
+      return renderDone(run);
     default:
       return h('div', { class: 'screen' }, h('p', null, `알 수 없는 단계: ${String(run.phase)}`), h('button', { class: 'btn', onclick: () => { view = 'start'; render(); } }, '처음으로'));
   }
@@ -492,6 +644,10 @@ function renderRun(): HTMLElement {
 
 function backToStartButton(): HTMLElement {
   return h('button', { class: 'btn ghost small', onclick: () => { persist(); view = 'start'; render(); } }, '메인');
+}
+
+function noTeamScreen(): HTMLElement {
+  return h('div', { class: 'screen' }, h('div', { class: 'card' }, '팀이 없습니다.'), backToStartButton());
 }
 
 // ───────────────────────── 2. 팀 선택 ─────────────────────────
@@ -504,9 +660,7 @@ function renderSelectTeam(state: RunState): HTMLElement {
     if (selection.ids.length !== 5) { toast('5명을 선택해야 합니다.'); return; }
     const name = (nameInput.value.trim() || '나의 팀').slice(0, 16);
     selectTeam(state, selection.ids.slice(), name, { ghosts: ghostsFor(state) });
-    if (state.phase === 'pre_battle' && (!state.currentMap || !state.opponent)) {
-      prepareNextBattle(state, { ghosts: ghostsFor(state) });
-    }
+    restoreRunData(state);
     persist();
     render();
   };
@@ -530,7 +684,7 @@ function renderSelectTeam(state: RunState): HTMLElement {
   const cards = state.pool.map((c) => {
     const selected = selection.ids.includes(c.id);
     const full = selection.ids.length >= 5 && !selected;
-    const card = h(
+    return h(
       'div',
       {
         class: `card char-card ${selected ? 'selected' : ''} ${full ? 'dim' : ''}`,
@@ -552,26 +706,203 @@ function renderSelectTeam(state: RunState): HTMLElement {
       skillChips(c),
       selected ? h('div', { class: 'selected-mark' }, `${selection.ids.indexOf(c.id) + 1}`) : null,
     );
-    return card;
   });
 
   return h(
     'div',
     { class: 'screen' },
-    header('팀 선택', `풀 ${state.pool.length}명 중 5명을 고르세요 · 시드 ${state.seed}`, backToStartButton()),
+    header('팀 선택', `풀 ${state.pool.length}명 중 5명을 고르세요 · 시드 ${state.seed} · 총 ${TOTAL_DAYS}일 육성`, backToStartButton()),
     bar,
     h('div', { class: 'grid cards' }, cards),
   );
 }
 
-// ───────────────────────── 3. 전투 전 ─────────────────────────
+// ───────────────────────── 3. 선택지 (1·2·4스텝) ─────────────────────────
+
+function renderChoice(state: RunState): HTMLElement {
+  const team = state.team;
+  if (!team) return noTeamScreen();
+  // 저장 데이터 정리 등으로 선택지가 비어 있으면 다시 만든다 (같은 시드에서 같은 결과)
+  if (state.currentChoices.length === 0 && ensureChoices(state)) persist();
+  const choices = state.currentChoices;
+
+  const onPick = (index: number) => {
+    if (!run) return;
+    const choice = run.currentChoices[index];
+    const r = pickChoice(run, index, { ghosts: ghostsFor(run) });
+    if (choice) {
+      const msg = r.success === true ? `성공! ${choice.title}` : r.success === false ? `실패... ${choice.title}` : `적용: ${choice.title}`;
+      toast(msg, 2600);
+    }
+    restoreRunData(run);
+    persist();
+    render();
+  };
+
+  const subJobSet = isSubJobChoiceSet(state);
+  const canReroll = !subJobSet && state.rerolls > 0 && state.bonusPoints >= REROLL_COST;
+
+  const cards = choices.map((ch: Choice, i: number) =>
+    h(
+      'div',
+      {
+        class: `card choice-card kind-${ch.kind} rarity-${ch.rarity}`,
+        style: `--rc:${rarityColor(ch.rarity)}`,
+        onclick: () => onPick(i),
+      },
+      h('div', { class: 'row between wrap' },
+        rarityBadge(ch.rarity),
+        h('span', { class: `chip kind kind-${ch.kind}` }, CHOICE_KIND_NAME_KO[ch.kind] ?? ch.kind),
+      ),
+      h('div', { class: 'choice-title' }, ch.title),
+      h('div', { class: 'choice-desc' }, ch.desc),
+      h('div', { class: 'row between wrap small' },
+        h('span', {
+          class: `power-delta ${ch.powerDelta > 0 ? 'up' : ch.powerDelta < 0 ? 'down' : 'flat'}`,
+          title: '예상 전투력 상승치',
+        }, `전투력 ${fmtSigned(ch.powerDelta)}`),
+        ch.successChance !== undefined
+          ? h('span', { class: `chip chance ${ch.successChance >= 0.7 ? 'good' : ch.successChance >= 0.5 ? 'mid' : 'bad'}` }, `성공 ${Math.round(ch.successChance * 100)}%`)
+          : h('span', { class: 'chip muted' }, '확정'),
+      ),
+      ch.charIds.length > 0 ? h('div', { class: 'chips' }, ch.charIds.map((id) => {
+        const m = team.members.find((c) => c.id === id);
+        return h('span', { class: `chip ${m ? `job-${m.mainJob}` : ''}` }, memberName(team, id));
+      })) : null,
+      ch.failEffects && ch.failEffects.length > 0 ? h('div', { class: 'tiny muted' }, '실패 시 불이익 있음') : null,
+      h('button', { class: 'btn small wide', onclick: (ev: Event) => { ev.stopPropagation(); onPick(i); } }, '선택'),
+    ),
+  );
+
+  return h(
+    'div',
+    { class: 'screen' },
+    header(`${state.day}일차 · ${stepLabel(state.step)}`, `${team.name} · ${state.bonusPoints}pt · 전투력 ${fmtNum(safeTeamPower(team))}`, backToStartButton()),
+    state.rarityFloor
+      ? h('div', { class: 'card floor-note', style: `border-color:${rarityColor(state.rarityFloor)}` },
+          `몬스터 전투 보상: 이번 세트에 ${rarityKo(state.rarityFloor)} 이상 카드가 1장 이상 등장합니다.`)
+      : null,
+    h('div', { class: 'row between wrap' },
+      h('span', { class: 'muted small' }, subJobSet ? '직업 분화 선택입니다. 세 세부 직업 중 하나를 고르세요. (리롤 불가)' : '세 가지 중 하나를 고르세요. 결과는 즉시 적용됩니다.'),
+      h('button', {
+        class: 'btn ghost small',
+        disabled: !canReroll,
+        title: canReroll ? '' : subJobSet ? '분화 선택지는 리롤할 수 없습니다' : state.rerolls <= 0 ? '리롤권 없음' : '포인트 부족',
+        onclick: () => {
+          if (!run) return;
+          const ok = rerollChoices(run);
+          toast(ok ? `선택지를 리롤했습니다 (-${REROLL_COST}pt)` : '리롤할 수 없습니다.');
+          persist();
+          render();
+        },
+      }, `리롤 (${REROLL_COST}pt · ${state.rerolls}회)`),
+    ),
+    choices.length === 0 ? h('div', { class: 'card' }, '선택지가 없습니다.') : h('div', { class: 'grid three' }, cards),
+    h('div', { class: 'card' }, h('div', { class: 'card-title' }, '현재 팀'), h('div', { class: 'member-brief' }, team.members.map((c) =>
+      h('div', { class: 'brief' }, h('span', { class: `job-badge job-${c.mainJob}` }, JOB_NAME_KO[c.mainJob]), ' ', c.name, h('span', { class: 'muted small' }, ` ${subJobName(c.subJob)} · 전투력 ${safePower(c)}`)),
+    ))),
+  );
+}
+
+// ───────────────────────── 4. 몬스터 난이도 선택 (3스텝) ─────────────────────────
+
+function renderMonsterSelect(state: RunState): HTMLElement {
+  const team = state.team;
+  if (!team) return noTeamScreen();
+  let options: MonsterEncounter[] = state.monsterOptions ?? [];
+  if (options.length === 0) {
+    try {
+      options = monsterOptions(state);
+      persist();
+    } catch {
+      options = [];
+    }
+  }
+  const ourPower = safeTeamPower(team);
+
+  const start = (tier: MonsterTier) => {
+    if (!run) return;
+    const enc = (run.monsterOptions ?? []).find((e) => e.tier === tier);
+    if (!enc) { toast('선택할 수 없는 몬스터입니다.'); return; }
+    const input = pickMonster(run, tier);
+    persist();
+    startBattle(input, 'monster', `${MONSTER_TIER_NAME_KO[enc.tier]} · ${enc.name}`);
+  };
+
+  // 표시 순서는 항상 하급 → 중급 → 고급
+  const list: MonsterEncounter[] = [];
+  for (const tier of MONSTER_TIER_ORDER) {
+    const enc = options.find((o) => o.tier === tier);
+    if (enc) list.push(enc);
+  }
+  for (const enc of options) if (!list.includes(enc)) list.push(enc);
+
+  const cards = list.map((enc) => monsterCard(enc, ourPower, state.day, start));
+
+  return h(
+    'div',
+    { class: 'screen' },
+    header(`${state.day}일차 · ${stepLabel(state.step)}`, `${team.name} · ${state.bonusPoints}pt · 전투력 ${fmtNum(ourPower)}`, backToStartButton()),
+    h('div', { class: 'card' },
+      h('div', { class: 'card-title' }, '몬스터 토벌'),
+      h('p', { class: 'small muted' }, '난이도를 직접 고릅니다. 어려울수록 보상이 큽니다. 패배해도 포인트의 40%는 받고 다음 스텝으로 넘어갑니다.'),
+    ),
+    list.length === 0
+      ? h('div', { class: 'card' }, '몬스터 정보를 만들 수 없습니다. 메인으로 돌아갔다가 다시 시도하세요.')
+      : h('div', { class: 'grid three' }, cards),
+    h('div', { class: 'card' }, h('div', { class: 'card-title' }, '우리 팀'), h('div', { class: 'member-brief' }, team.members.map((c) =>
+      h('div', { class: 'brief' }, h('span', { class: `job-badge job-${c.mainJob}` }, JOB_NAME_KO[c.mainJob]), ' ', c.name, h('span', { class: 'muted small' }, ` ${subJobName(c.subJob)} · 전투력 ${safePower(c)}`)),
+    ))),
+  );
+}
+
+function monsterCard(enc: MonsterEncounter, ourPower: number, day: number, onStart: (tier: MonsterTier) => void): HTMLElement {
+  const color = MONSTER_TIER_COLOR[enc.tier];
+  const map = MAPS[enc.map];
+  const ratio = ourPower > 0 ? enc.estimatedPower / ourPower : 1;
+  // 난이도 라벨은 등급 기준이다. 전투력 '점수'비는 편성(소수 정예 vs 다수 약체)에 따라 뒤집히므로 쓰지 않는다
+  const diff = monsterDifficultyKo(enc.tier, ourPower, day);
+  const comp = composition(enc.team);
+  const reward = enc.reward;
+
+  return h(
+    'div',
+    { class: `card monster-card tier-${enc.tier}`, style: `--tc:${color}`, onclick: () => onStart(enc.tier) },
+    h('div', { class: 'row between wrap' },
+      h('span', { class: `chip tier-badge tier-${enc.tier}`, style: `color:${color}; border-color:${color}` }, MONSTER_TIER_NAME_KO[enc.tier]),
+      h('span', { class: `chip diff diff-${diff.level}` }, `예상 난이도 ${diff.label}`),
+    ),
+    h('div', { class: 'monster-name' }, enc.name),
+    h('div', { class: 'small muted monster-desc' }, enc.desc),
+    h('div', { class: 'section-title' }, '편성'),
+    h('div', { class: 'chips' }, comp.map((u) => h('span', { class: `chip job-${u.job}` }, u.count > 1 ? `${u.label} ×${u.count}` : u.label))),
+    h('div', { class: 'power-compare' },
+      h('div', { class: 'row between tiny muted' }, h('span', null, `우리 ${fmtNum(ourPower)}`), h('span', { title: '전투력 점수는 편성을 반영하지 않는다. 소수 정예는 점수보다 강하다' }, `적 ${fmtNum(enc.estimatedPower)}`)),
+      h('div', { class: 'bar' }, h('div', { class: 'fill', style: `width:${Math.max(4, Math.min(100, ratio * 50)).toFixed(1)}%; background:${color}` })),
+      h('div', { class: 'tiny muted' }, MONSTER_TIER_HINT_KO[enc.tier]),
+    ),
+    h('div', { class: 'section-title' }, '전장'),
+    h('div', { class: 'chips' },
+      h('span', { class: `chip map-chip map-${enc.map}` }, map.name),
+      h('span', { class: 'chip muted' }, VICTORY_KO[map.victory]),
+    ),
+    h('div', { class: 'section-title' }, '승리 보상'),
+    h('ul', { class: 'reward-list' },
+      h('li', null, `보너스 포인트 +${reward.points}`),
+      reward.rarityFloor ? h('li', { style: `color:${rarityColor(reward.rarityFloor)}` }, `다음 선택지에 ${rarityKo(reward.rarityFloor)} 이상 1장 보장`) : null,
+      reward.teamStatBonus > 0 ? h('li', null, `팀 전원 랜덤 스탯 +${reward.teamStatBonus}`) : null,
+      h('li', { class: 'tiny muted' }, `패배 시 포인트 ${Math.round(reward.points * 0.4)}만 획득`),
+    ),
+    h('button', { class: 'btn small wide', onclick: (ev: Event) => { ev.stopPropagation(); onStart(enc.tier); } }, '도전'),
+  );
+}
+
+// ───────────────────────── 5. 5:5 전투 준비 (5스텝) ─────────────────────────
 
 function renderPreBattle(state: RunState): HTMLElement {
-  if (!state.team) {
-    return h('div', { class: 'screen' }, h('p', null, '팀이 없습니다.'), backToStartButton());
-  }
+  if (!state.team) return noTeamScreen();
   if (!state.currentMap || !state.opponent) {
-    prepareNextBattle(state, { ghosts: ghostsFor(state) });
+    prepareBattle(state, { ghosts: ghostsFor(state) });
     persist();
   }
   const mapId = state.currentMap ?? 'plains';
@@ -582,16 +913,15 @@ function renderPreBattle(state: RunState): HTMLElement {
 
   const start = () => {
     if (!run || !run.team || !run.opponent || !run.currentMap) return;
-    const input = battleInput(run);
-    run.phase = 'battle';
+    const input = runStartBattle(run);
     persist();
-    startBattle(input, 'run');
+    startBattle(input, 'run', `${MAPS[input.map].name} · ${input.teamB.name}`);
   };
 
   return h(
     'div',
     { class: 'screen' },
-    header(`사이클 ${state.cycle}/${TOTAL_CYCLES} · 전투 준비`, `${state.team.name} · 보너스 ${state.bonusPoints}pt`, backToStartButton()),
+    header(`${state.day}일차 · ${stepLabel(state.step)}`, `${state.team.name} · 보너스 ${state.bonusPoints}pt`, backToStartButton()),
     h(
       'div',
       { class: `card map-card map-${mapId}` },
@@ -639,21 +969,23 @@ function historyStrip(state: RunState): HTMLElement | null {
       state.history.map((r) => {
         const w = r.result.winner === 'A' ? 'win' : r.result.winner === 'B' ? 'lose' : 'draw';
         const label = w === 'win' ? '승' : w === 'lose' ? '패' : '무';
-        return h('span', { class: `chip result-${w}`, title: `${r.opponentName} · ${reasonKo(r.result.reason)} · +${r.bonusEarned}pt` }, `${r.cycle} ${MAP_NAME_KO[r.map]} ${label}`);
+        const mon = r.monster ? ` · 몬스터 ${MONSTER_TIER_NAME_KO[r.monster.tier]} ${r.monster.won ? '승' : '패'}` : '';
+        return h('span', { class: `chip result-${w}`, title: `${r.opponentName} · ${reasonKo(r.result.reason)} · +${r.pointsEarned}pt${mon}` }, `${r.day}일 ${MAP_NAME_KO[r.map]} ${label}`);
       }),
     ),
   );
 }
 
-// ───────────────────────── 4. 전투 ─────────────────────────
+// ───────────────────────── 6. 전투 관전 (몬스터 / 5:5 공용) ─────────────────────────
 
-function startBattle(input: BattleInput, mode: BattleMode): void {
+function startBattle(input: BattleInput, mode: BattleMode, title: string): void {
   stopBattleLoop();
   const sim = createBattle(input);
   battle = {
     mode,
     sim,
     input,
+    title,
     speed: 1,
     paused: false,
     acc: 0,
@@ -707,12 +1039,18 @@ function renderBattle(): HTMLElement {
 
   b.hud = { time, hpA, hpB, hpAText, hpBText, kills, capture, capA, capB, speedBtns, pauseBtn };
 
+  const dayLabel = b.mode !== 'pvp' && run ? `${run.day}일차 ${b.mode === 'monster' ? '3스텝 몬스터 전투' : '5스텝 5:5 전투'}` : '완성 팀 대전';
+
   const screen = h(
     'div',
-    { class: 'screen battle' },
+    { class: `screen battle ${b.mode === 'monster' ? 'monster-battle' : ''}` },
+    h('div', { class: 'battle-banner' },
+      h('span', { class: 'small muted' }, dayLabel),
+      h('strong', { class: 'battle-subtitle' }, b.title),
+    ),
     h('div', { class: 'battle-head' },
       h('div', { class: 'team-hp side-A' }, h('div', { class: 'row between' }, h('strong', null, b.input.teamA.name), hpAText), h('div', { class: 'bar' }, hpA)),
-      h('div', { class: 'battle-mid' }, h('div', { class: 'small muted' }, `${map.name}${b.mode === 'run' && run ? ` · 사이클 ${run.cycle}` : ''}`), time),
+      h('div', { class: 'battle-mid' }, h('div', { class: 'small muted' }, map.name), time),
       h('div', { class: 'team-hp side-B' }, h('div', { class: 'row between' }, hpBText, h('strong', null, b.input.teamB.name)), h('div', { class: 'bar rtl' }, hpB)),
     ),
     wrap,
@@ -724,7 +1062,7 @@ function renderBattle(): HTMLElement {
   // 캔버스가 DOM 에 붙은 뒤 렌더러 생성 및 루프 시작
   requestAnimationFrame(() => {
     if (!battle || battle !== b) return;
-    b.renderer = new BattleRenderer(canvas, map);
+    b.renderer = new BattleRenderer(canvas, map, monsterTiersOfInput(b.input));
     b.renderer.draw(b.frame);
     updateHud(b, b.frame);
     b.lastTs = performance.now();
@@ -783,11 +1121,6 @@ function loop(ts: number): void {
   b.raf = requestAnimationFrame(loop);
 }
 
-function unitName(frame: BattleFrame, id: string): string {
-  const u = frame.units.find((x) => x.id === id);
-  return u ? u.name : id;
-}
-
 function handleEvents(b: BattleSession, events: BattleEvent[], frame: BattleFrame): void {
   let touched = false;
   for (const e of events) {
@@ -815,10 +1148,6 @@ function handleEvents(b: BattleSession, events: BattleEvent[], frame: BattleFram
       b.hud.kills.appendChild(li);
     }
   }
-}
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch] ?? ch);
 }
 
 function updateHud(b: BattleSession, frame: BattleFrame): void {
@@ -867,27 +1196,38 @@ function onBattleEnd(): void {
 }
 
 function finalizeBattle(b: BattleSession, result: BattleResult): void {
-  let bonusEarned: number | null = null;
-  if (b.mode === 'run' && run) {
+  let pointsEarned: number | null = null;
+  let monster: LastResult['monster'] = null;
+
+  if (b.mode === 'monster' && run) {
+    const enc = run.currentMonster;
+    const out = finishMonsterBattle(run, result);
+    pointsEarned = out.reward.points;
+    monster = { tier: enc?.tier ?? 'low', name: enc?.name ?? '몬스터', won: out.won, reward: out.reward };
+    restoreRunData(run);
+    persist();
+  } else if (b.mode === 'run' && run) {
+    const before = run.bonusPoints;
     finishBattle(run, result);
+    pointsEarned = run.bonusPoints - before;
     const record = run.history[run.history.length - 1];
     if (record) {
-      bonusEarned = record.bonusEarned;
       try {
-        storage.saveGhost({ runSeed: run.seed, cycle: record.cycle, team: record.teamSnapshot, savedAt: new Date().toISOString() });
+        storage.saveGhost({ runSeed: run.seed, day: record.day, team: record.teamSnapshot, savedAt: new Date().toISOString() });
       } catch {
         /* 무시 */
       }
     }
     persist();
   }
-  lastResult = { mode: b.mode, input: b.input, result, bonusEarned };
+
+  lastResult = { mode: b.mode, input: b.input, result, pointsEarned, monster };
   battle = null;
   view = 'result';
   render();
 }
 
-// ───────────────────────── 5. 결과 ─────────────────────────
+// ───────────────────────── 7. 전투 결과 ─────────────────────────
 
 function renderResult(): HTMLElement {
   const lr = lastResult;
@@ -897,9 +1237,9 @@ function renderResult(): HTMLElement {
   }
   const { result, input } = lr;
   const playerWon = result.winner === 'A';
-  const title = lr.mode === 'run'
-    ? result.winner === 'draw' ? '무승부' : playerWon ? '승리!' : '패배'
-    : result.winner === 'draw' ? '무승부' : `${winnerLabel(input, result.winner)} 승리`;
+  const title = lr.mode === 'pvp'
+    ? result.winner === 'draw' ? '무승부' : `${winnerLabel(input, result.winner)} 승리`
+    : result.winner === 'draw' ? '무승부' : playerWon ? '승리!' : '패배';
 
   const nameOf = (id: string) => {
     const s = result.unitStats.find((u) => u.id === id);
@@ -934,163 +1274,78 @@ function renderResult(): HTMLElement {
 
   const next = () => {
     lastResult = null;
-    if (lr.mode === 'run') {
-      view = 'run';
-    } else {
-      view = 'pvp_setup';
-    }
+    view = lr.mode === 'pvp' ? 'pvp_setup' : 'run';
     render();
   };
+
+  const nextLabel = lr.mode === 'pvp' ? '다시' : lr.mode === 'monster' ? '다음 (4스텝 선택지)' : '하루 마무리로';
+
+  const monsterReward = lr.monster
+    ? h('div', { class: 'reward-box' },
+        h('div', null, `${MONSTER_TIER_NAME_KO[lr.monster.tier]} · ${lr.monster.name}`),
+        lr.monster.won
+          ? h('ul', { class: 'reward-list' },
+              h('li', null, `보너스 포인트 +${lr.pointsEarned ?? 0}`),
+              lr.monster.reward.rarityFloor ? h('li', { style: `color:${rarityColor(lr.monster.reward.rarityFloor)}` }, `다음 선택지에 ${rarityKo(lr.monster.reward.rarityFloor)} 이상 1장 보장`) : null,
+              lr.monster.reward.teamStatBonus > 0 ? h('li', null, `팀 전원 랜덤 스탯 +${lr.monster.reward.teamStatBonus}`) : null,
+            )
+          : h('ul', { class: 'reward-list' },
+              h('li', null, `보너스 포인트 +${lr.pointsEarned ?? 0} (패배 — 40%만 지급)`),
+              h('li', { class: 'tiny muted' }, '보장 등급과 추가 보상은 없습니다. 진행은 계속됩니다.'),
+            ),
+      )
+    : null;
 
   return h(
     'div',
     { class: 'screen' },
     header('전투 결과', `${MAPS[result.map].name} · ${reasonKo(result.reason)} · ${fmtSec(result.durationSec)}`),
-    h('div', { class: `card result-banner ${result.winner === 'draw' ? 'draw' : lr.mode === 'run' ? (playerWon ? 'win' : 'lose') : 'win'}` },
+    h('div', { class: `card result-banner ${result.winner === 'draw' ? 'draw' : lr.mode === 'pvp' ? 'win' : (playerWon ? 'win' : 'lose')}` },
       h('div', { class: 'result-title' }, title),
       h('div', { class: 'muted' }, `${input.teamA.name} vs ${input.teamB.name}`),
       result.mvpId ? h('div', null, 'MVP: ', h('strong', null, nameOf(result.mvpId))) : null,
-      lr.bonusEarned !== null ? h('div', { class: 'bonus-earned' }, `보너스 획득 +${lr.bonusEarned}pt`, h('span', { class: 'muted small' }, ` (승 ${BONUS_WIN} / 무 ${BONUS_DRAW} / 패 ${BONUS_LOSE})`)) : null,
+      lr.mode === 'run' && lr.pointsEarned !== null
+        ? h('div', { class: 'bonus-earned' }, `보너스 획득 +${lr.pointsEarned}pt`, h('span', { class: 'muted small' }, ` (승 ${BONUS_WIN} / 무 ${BONUS_DRAW} / 패 ${BONUS_LOSE} 기준)`))
+        : null,
+      monsterReward,
     ),
     table,
-    h('div', { class: 'row center' }, h('button', { class: 'btn primary big', onclick: next }, lr.mode === 'run' ? '보너스 상점으로' : '다시')),
+    h('div', { class: 'row center' }, h('button', { class: 'btn primary big', onclick: next }, nextLabel)),
   );
 }
 
-// ───────────────────────── 6. 보너스 상점 ─────────────────────────
+// ───────────────────────── 8. 하루 마무리 (보상 요약 + 보너스 상점) ─────────────────────────
 
-function renderBonus(state: RunState): HTMLElement {
-  const team = state.team;
-  if (!team) return h('div', { class: 'screen' }, '팀이 없습니다.', backToStartButton());
-
-  const memberCards = team.members.map((c) => {
-    const counts = safeCounts(c);
-    const pool = safeSkillPool(c);
-    const skillRows = pool.map((id) => {
-      let def;
-      try { def = getSkill(id); } catch { return null; }
-      const isActive = def.type === 'active';
-      const slotFull = isActive ? counts.active >= MAX_ACTIVE_SKILLS : counts.passive >= MAX_PASSIVE_SKILLS;
-      const poor = state.bonusPoints < def.cost;
-      const reason = slotFull ? (isActive ? '액티브 슬롯 가득' : '패시브 슬롯 가득') : poor ? '포인트 부족' : '';
-      return h(
-        'div',
-        { class: 'skill-row' },
-        h('div', { class: 'skill-info' },
-          h('div', null, h('span', { class: `chip ${isActive ? 'active' : 'passive'}` }, isActive ? '액티브' : '패시브'), ' ', h('strong', null, def.name)),
-          h('div', { class: 'small muted' }, def.desc),
-        ),
-        h('div', { class: 'skill-buy' },
-          h('button', {
-            class: 'btn small',
-            disabled: slotFull || poor,
-            title: reason,
-            onclick: () => {
-              if (!run) return;
-              const ok = buySkill(run, c.id, id);
-              if (ok) toast(`${c.name}: ${def.name} 습득 (-${def.cost}pt)`);
-              else toast('구매할 수 없습니다.');
-              persist();
-              render();
-            },
-          }, `${def.cost}pt`),
-          reason ? h('div', { class: 'tiny muted' }, reason) : null,
-        ),
-      );
-    });
-
-    const sel = h('select', { class: 'input' },
-      BASE_STAT_KEYS.map((k) => h('option', { value: k, selected: (trainSel[c.id] ?? 'vitality') === k }, `${STAT_NAME_KO[k]} (${c.stats[k]})`)),
-    );
-    sel.addEventListener('change', () => { trainSel[c.id] = sel.value as BaseStatKey; });
-    const canTrain = state.bonusPoints >= STAT_TRAIN_COST;
-
-    return h(
-      'div',
-      { class: 'card member-card' },
-      h('div', { class: 'char-head' },
-        h('span', { class: `job-badge job-${c.mainJob}` }, JOB_NAME_KO[c.mainJob]),
-        h('span', { class: 'name' }, c.name),
-        h('span', { class: 'muted small' }, subJobName(c.subJob)),
-        h('span', { class: 'muted small' }, `전투력 ${safePower(c)}`),
-      ),
-      h('div', { class: 'small muted' }, `보유 스킬 (액티브 ${counts.active}/${MAX_ACTIVE_SKILLS}, 패시브 ${counts.passive}/${MAX_PASSIVE_SKILLS})`),
-      skillChips(c),
-      persistentDetails(`bonus:${c.id}`, '스탯 상세', statTable(c)),
-      h('div', { class: 'section-title' }, '스탯 훈련'),
-      h('div', { class: 'row' },
-        sel,
-        h('button', {
-          class: 'btn small',
-          disabled: !canTrain,
-          onclick: () => {
-            if (!run) return;
-            const stat = (trainSel[c.id] ?? (sel.value as BaseStatKey)) as BaseStatKey;
-            const ok = trainStat(run, c.id, stat);
-            if (ok) toast(`${c.name}: ${STAT_NAME_KO[stat]} +${STAT_TRAIN_DELTA} (-${STAT_TRAIN_COST}pt)`);
-            else toast('훈련할 수 없습니다.');
-            persist();
-            render();
-          },
-        }, `+${STAT_TRAIN_DELTA} (${STAT_TRAIN_COST}pt)`),
-      ),
-      h('div', { class: 'section-title' }, '스킬 상점'),
-      skillRows.length === 0 ? h('div', { class: 'small muted' }, '구매 가능한 스킬이 없습니다.') : h('div', { class: 'skill-list' }, skillRows),
-    );
-  });
-
-  return h(
-    'div',
-    { class: 'screen' },
-    header(`사이클 ${state.cycle}/${TOTAL_CYCLES} · 보너스 상점`, `${team.name}`, backToStartButton()),
-    h('div', { class: 'sticky-bar' },
-      h('div', { class: 'row between wrap' },
-        h('div', null, h('strong', { class: 'points' }, `${state.bonusPoints}pt`), h('span', { class: 'muted small' }, ` · 리롤권 ${state.rerolls}개 (선택지 리롤 ${REROLL_COST}pt)`)),
-        h('button', { class: 'btn primary', onclick: () => { if (!run) return; finishBonus(run); persist(); render(); } }, '다음 (로그라이크 선택)'),
-      ),
-    ),
-    h('div', { class: 'grid cards wide-cards' }, memberCards),
-  );
-}
-
-function safeCounts(c: Character): { active: number; passive: number } {
-  try {
-    return countSkills(c);
-  } catch {
-    let active = 0;
-    let passive = 0;
-    for (const id of c.skills) {
-      try {
-        if (getSkill(id).type === 'active') active++;
-        else passive++;
-      } catch {
-        /* 무시 */
-      }
-    }
-    return { active, passive };
+/**
+ * 하루 마무리에 표시할 몬스터 승리 추가 보상 줄.
+ * state.rarityFloor / state.pendingTeamStatBonus 는 day_end 에 닿기 전에 이미 소비되므로
+ * (4스텝 선택 확정 시 / 5:5 전투 준비 시) 그 값이 아니라 그날의 기록에서 다시 구한다.
+ */
+function monsterExtraRewardLines(rec: DayRecord | undefined): Child[] {
+  if (!rec || !rec.monster || !rec.monster.won) return [];
+  const r = monsterRewardOf(rec.monster.tier, rec.day, true);
+  const out: Child[] = [];
+  if (r.rarityFloor) {
+    out.push(h('div', { class: 'small', style: `color:${rarityColor(r.rarityFloor)}` },
+      `획득: 다음 선택지 ${rarityKo(r.rarityFloor)} 이상 1장 보장 (적용 완료)`));
   }
+  if (r.teamStatBonus > 0) {
+    out.push(h('div', { class: 'small muted' }, `획득: 팀 전원 랜덤 스탯 +${r.teamStatBonus} (적용 완료)`));
+  }
+  return out;
 }
 
-// ───────────────────────── 7. 로그라이크 선택 ─────────────────────────
-
-function renderChoice(state: RunState): HTMLElement {
+function renderDayEnd(state: RunState): HTMLElement {
   const team = state.team;
-  if (!team) return h('div', { class: 'screen' }, '팀이 없습니다.', backToStartButton());
-  // 저장 데이터 정리 등으로 선택지가 비어 있으면 다시 만든다 (같은 시드에서 같은 결과)
-  if (state.currentChoices.length === 0 && ensureChoices(state)) persist();
-  const choices = state.currentChoices;
+  if (!team) return noTeamScreen();
+  const rec: DayRecord | undefined = state.history[state.history.length - 1];
+  const isLastDay = state.day >= TOTAL_DAYS;
 
-  const onPick = (index: number) => {
+  const nextDay = () => {
     if (!run) return;
-    const choice = run.currentChoices[index];
-    // 3번째 선택이면 run.ts 가 다음 사이클 전투(고스트 상대 포함)를 준비한다
-    const r = pickChoice(run, index, { ghosts: ghostsFor(run) });
-    if (choice) {
-      const msg = r.success === true ? `성공! ${choice.title}` : r.success === false ? `실패... ${choice.title}` : `적용: ${choice.title}`;
-      toast(msg, 2600);
-    }
+    finishDay(run, { ghosts: ghostsFor(run) });
+    restoreRunData(run);
     persist();
-    // 10사이클 완료: 완성 팀을 자동 저장한다 (저장을 잊고 새 육성을 시작해도 팀이 남도록)
     if (run.phase === 'done' && run.team) {
       storage.saveCompletedTeam(run.team);
       toast('육성 완료! 완성 팀이 저장되었습니다.', 3000);
@@ -1098,61 +1353,170 @@ function renderChoice(state: RunState): HTMLElement {
     render();
   };
 
-  const subJobSet = isSubJobChoiceSet(state);
-  const canReroll = !subJobSet && state.rerolls > 0 && state.bonusPoints >= REROLL_COST;
-  const cards = choices.map((ch: Choice, i: number) =>
-    h(
-      'div',
-      { class: `card choice-card kind-${ch.kind}`, onclick: () => onPick(i) },
-      h('div', { class: 'row between' },
-        h('span', { class: `chip kind kind-${ch.kind}` }, CHOICE_KIND_NAME_KO[ch.kind] ?? ch.kind),
-        ch.successChance !== undefined ? h('span', { class: `chip chance ${ch.successChance >= 0.7 ? 'good' : ch.successChance >= 0.5 ? 'mid' : 'bad'}` }, `성공 ${Math.round(ch.successChance * 100)}%`) : h('span', { class: 'chip muted' }, '확정'),
-      ),
-      h('div', { class: 'choice-title' }, ch.title),
-      h('div', { class: 'choice-desc' }, ch.desc),
-      ch.charIds.length > 0 ? h('div', { class: 'chips' }, ch.charIds.map((id) => {
-        const m = team.members.find((c) => c.id === id);
-        return h('span', { class: `chip ${m ? `job-${m.mainJob}` : ''}` }, memberName(team, id));
-      })) : null,
-      ch.failEffects && ch.failEffects.length > 0 ? h('div', { class: 'tiny muted' }, '실패 시 불이익 있음') : null,
-      h('button', { class: 'btn small wide', onclick: (ev: Event) => { ev.stopPropagation(); onPick(i); } }, '선택'),
-    ),
+  const summary = h(
+    'div',
+    { class: 'card day-summary' },
+    h('div', { class: 'card-title' }, `${state.day}일차 결과`),
+    h('div', { class: 'section-title' }, '고른 선택지'),
+    rec && rec.choicesTaken.length > 0
+      ? h('ul', { class: 'taken-list' }, rec.choicesTaken.map((ct) =>
+          h('li', null,
+            h('span', { class: `chip rarity rarity-${ct.rarity}`, style: `color:${rarityColor(ct.rarity)}; border-color:${rarityColor(ct.rarity)}` }, rarityKo(ct.rarity)),
+            ' ',
+            h('span', null, ct.title),
+            ct.success === true ? h('span', { class: 'win-text' }, ' 성공') : ct.success === false ? h('span', { class: 'lose-text' }, ' 실패') : null,
+          ),
+        ))
+      : h('div', { class: 'small muted' }, '기록 없음'),
+    h('div', { class: 'section-title' }, '몬스터 전투'),
+    rec && rec.monster
+      ? h('div', { class: 'row wrap' },
+          h('span', { class: 'chip tier-badge', style: `color:${MONSTER_TIER_COLOR[rec.monster.tier]}; border-color:${MONSTER_TIER_COLOR[rec.monster.tier]}` }, MONSTER_TIER_NAME_KO[rec.monster.tier]),
+          h('span', null, rec.monster.name),
+          h('span', { class: rec.monster.won ? 'win-text' : 'lose-text' }, rec.monster.won ? '승리' : '패배'),
+          h('span', { class: 'tiny muted' }, `${reasonKo(rec.monster.result.reason)} · ${fmtSec(rec.monster.result.durationSec)}`),
+        )
+      : h('div', { class: 'small muted' }, '기록 없음'),
+    h('div', { class: 'section-title' }, '5:5 전투'),
+    rec
+      ? h('div', { class: 'row wrap' },
+          h('span', { class: `chip map-chip map-${rec.map}` }, MAP_NAME_KO[rec.map]),
+          h('span', null, rec.opponentName),
+          h('span', { class: rec.result.winner === 'A' ? 'win-text' : rec.result.winner === 'B' ? 'lose-text' : '' }, rec.result.winner === 'A' ? '승리' : rec.result.winner === 'B' ? '패배' : '무승부'),
+          h('span', { class: 'tiny muted' }, `${reasonKo(rec.result.reason)} · ${fmtSec(rec.result.durationSec)}`),
+        )
+      : h('div', { class: 'small muted' }, '기록 없음'),
+    h('div', { class: 'day-points' }, `오늘 획득 포인트 +${rec ? rec.pointsEarned : 0}`),
+    ...monsterExtraRewardLines(rec),
   );
 
   return h(
     'div',
     { class: 'screen' },
-    header(`사이클 ${state.cycle}/${TOTAL_CYCLES} · 로그라이크 선택 ${Math.min(state.choiceIndex + 1, 3)}/3`, `${team.name} · ${state.bonusPoints}pt`, backToStartButton()),
-    h('div', { class: 'row between wrap' },
-      h('span', { class: 'muted small' }, '세 가지 중 하나를 고르세요. 결과는 즉시 적용됩니다.'),
-      h('button', {
-        class: 'btn ghost small',
-        disabled: !canReroll,
-        title: canReroll ? '' : subJobSet ? '분화 선택지는 리롤할 수 없습니다' : state.rerolls <= 0 ? '리롤권 없음' : '포인트 부족',
-        onclick: () => {
-          if (!run) return;
-          const ok = rerollChoices(run);
-          toast(ok ? `선택지를 리롤했습니다 (-${REROLL_COST}pt)` : '리롤할 수 없습니다.');
-          persist();
-          render();
-        },
-      }, `리롤 (${REROLL_COST}pt · ${state.rerolls}회)`),
+    header(`${state.day}일차 · 하루 마무리`, `${team.name} · 전투력 ${fmtNum(safeTeamPower(team))}`, backToStartButton()),
+    h('div', { class: 'sticky-bar' },
+      h('div', { class: 'row between wrap' },
+        h('div', null, h('strong', { class: 'points' }, `${state.bonusPoints}pt`), h('span', { class: 'muted small' }, ` · 리롤권 ${state.rerolls}개 (선택지 리롤 ${REROLL_COST}pt)`)),
+        h('button', { class: 'btn primary', onclick: nextDay }, isLastDay ? '육성 완료' : `다음 날 (${state.day + 1}일차)`),
+      ),
     ),
-    choices.length === 0 ? h('div', { class: 'card' }, '선택지가 없습니다.') : h('div', { class: 'grid three' }, cards),
-    h('div', { class: 'card' }, h('div', { class: 'card-title' }, '현재 팀'), h('div', { class: 'member-brief' }, team.members.map((c) =>
-      h('div', { class: 'brief' }, h('span', { class: `job-badge job-${c.mainJob}` }, JOB_NAME_KO[c.mainJob]), ' ', c.name, h('span', { class: 'muted small' }, ` ${subJobName(c.subJob)} · 전투력 ${safePower(c)}`)),
-    ))),
+    summary,
+    h('div', { class: 'card' },
+      h('div', { class: 'card-title' }, '보너스 상점'),
+      h('p', { class: 'small muted' }, `포인트로 스킬을 사거나 스탯을 훈련합니다 (스탯 +${STAT_TRAIN_DELTA} / ${STAT_TRAIN_COST}pt).`),
+    ),
+    h('div', { class: 'grid cards wide-cards' }, team.members.map((c) => shopCard(state, c))),
+    h('div', { class: 'row center' }, h('button', { class: 'btn primary big', onclick: nextDay }, isLastDay ? '육성 완료' : `다음 날 (${state.day + 1}일차)`)),
   );
 }
 
-// ───────────────────────── 8. 완료 ─────────────────────────
+function shopCard(state: RunState, c: Character): HTMLElement {
+  const counts = safeCounts(c);
+  const pool = safeSkillPool(c);
+  const skillRows = pool.map((id) => {
+    let def;
+    try { def = getSkill(id); } catch { return null; }
+    const isActive = def.type === 'active';
+    const slotFull = isActive ? counts.active >= MAX_ACTIVE_SKILLS : counts.passive >= MAX_PASSIVE_SKILLS;
+    const poor = state.bonusPoints < def.cost;
+    const reason = slotFull ? (isActive ? '액티브 슬롯 가득' : '패시브 슬롯 가득') : poor ? '포인트 부족' : '';
+    return h(
+      'div',
+      { class: 'skill-row' },
+      h('div', { class: 'skill-info' },
+        h('div', null, h('span', { class: `chip ${isActive ? 'active' : 'passive'}` }, isActive ? '액티브' : '패시브'), ' ', h('strong', null, def.name)),
+        h('div', { class: 'small muted' }, def.desc),
+      ),
+      h('div', { class: 'skill-buy' },
+        h('button', {
+          class: 'btn small',
+          disabled: slotFull || poor,
+          title: reason,
+          onclick: () => {
+            if (!run) return;
+            const ok = buySkill(run, c.id, id);
+            if (ok) toast(`${c.name}: ${def.name} 습득 (-${def.cost}pt)`);
+            else toast('구매할 수 없습니다.');
+            persist();
+            render();
+          },
+        }, `${def.cost}pt`),
+        reason ? h('div', { class: 'tiny muted' }, reason) : null,
+      ),
+    );
+  });
+
+  const sel = h('select', { class: 'input' },
+    BASE_STAT_KEYS.map((k) => h('option', { value: k, selected: (trainSel[c.id] ?? BASE_STAT_KEYS[0]) === k },
+      c.stats[k] >= STAT_MAX ? `${STAT_NAME_KO[k]} (${c.stats[k]} · 최대)` : `${STAT_NAME_KO[k]} (${c.stats[k]})`)),
+  );
+  // 포인트뿐 아니라 선택된 스탯이 이미 상한(STAT_MAX)인지도 함께 본다 (run.ts 의 trainStat 거절 조건)
+  const poorForTrain = state.bonusPoints < STAT_TRAIN_COST;
+  const trainReasonOf = (stat: BaseStatKey): string =>
+    c.stats[stat] >= STAT_MAX ? '이미 최대치입니다' : poorForTrain ? '포인트 부족' : '';
+
+  const trainBtn = h('button', {
+    class: 'btn small',
+    onclick: () => {
+      if (!run) return;
+      const stat = (trainSel[c.id] ?? (sel.value as BaseStatKey)) as BaseStatKey;
+      const ok = trainStat(run, c.id, stat);
+      if (ok) toast(`${c.name}: ${STAT_NAME_KO[stat]} +${STAT_TRAIN_DELTA} (-${STAT_TRAIN_COST}pt)`);
+      else toast(`훈련할 수 없습니다. (${trainReasonOf(stat) || '조건 불충족'})`);
+      persist();
+      render();
+    },
+  }, `+${STAT_TRAIN_DELTA} (${STAT_TRAIN_COST}pt)`);
+  const trainNote = h('span', { class: 'tiny muted' });
+
+  /** 드롭다운 선택이 바뀌면 버튼 활성/사유를 그 자리에서 갱신한다 (전체 재렌더 없이) */
+  const syncTrainBtn = (): void => {
+    const stat: BaseStatKey = trainSel[c.id] ?? BASE_STAT_KEYS[0];
+    const reason = trainReasonOf(stat);
+    trainBtn.disabled = reason !== '';
+    trainBtn.title = reason;
+    trainNote.textContent = reason;
+  };
+  sel.addEventListener('change', () => {
+    trainSel[c.id] = sel.value as BaseStatKey;
+    syncTrainBtn();
+  });
+  syncTrainBtn();
+
+  return h(
+    'div',
+    { class: 'card member-card' },
+    h('div', { class: 'char-head' },
+      h('span', { class: `job-badge job-${c.mainJob}` }, JOB_NAME_KO[c.mainJob]),
+      h('span', { class: 'name' }, c.name),
+      h('span', { class: 'muted small' }, subJobName(c.subJob)),
+      h('span', { class: 'muted small' }, `전투력 ${safePower(c)}`),
+    ),
+    h('div', { class: 'small muted' }, `보유 스킬 (액티브 ${counts.active}/${MAX_ACTIVE_SKILLS}, 패시브 ${counts.passive}/${MAX_PASSIVE_SKILLS})`),
+    skillChips(c),
+    persistentDetails(`shop:${c.id}`, '스탯 상세', statTable(c)),
+    h('div', { class: 'section-title' }, '스탯 훈련'),
+    h('div', { class: 'row' },
+      sel,
+      trainBtn,
+      trainNote,
+    ),
+    h('div', { class: 'section-title' }, '스킬 상점'),
+    skillRows.length === 0 ? h('div', { class: 'small muted' }, '구매 가능한 스킬이 없습니다.') : h('div', { class: 'skill-list' }, skillRows),
+  );
+}
+
+// ───────────────────────── 9. 육성 완료 (10일 요약) ─────────────────────────
 
 function renderDone(state: RunState): HTMLElement {
   const team = state.team;
-  if (!team) return h('div', { class: 'screen' }, '팀이 없습니다.', backToStartButton());
+  if (!team) return noTeamScreen();
   const wins = state.history.filter((r) => r.result.winner === 'A').length;
   const draws = state.history.filter((r) => r.result.winner === 'draw').length;
   const losses = state.history.length - wins - draws;
+  const monsterWins = state.history.filter((r) => r.monster && r.monster.won).length;
+  const monsterCount = state.history.filter((r) => r.monster).length;
+  const totalPoints = state.history.reduce((acc, r) => acc + r.pointsEarned, 0);
   const alreadySaved = storage.isTeamSaved(team);
 
   const memberCards = team.members.map((c) => {
@@ -1185,22 +1549,23 @@ function renderDone(state: RunState): HTMLElement {
   return h(
     'div',
     { class: 'screen' },
-    header('육성 완료', `${team.name} · ${wins}승 ${draws}무 ${losses}패`, backToStartButton()),
+    header('육성 완료', `${team.name} · 5:5 ${wins}승 ${draws}무 ${losses}패 · 몬스터 ${monsterWins}/${monsterCount} · 전투력 ${fmtNum(safeTeamPower(team))}`, backToStartButton()),
     h('div', { class: 'card' },
       h('div', { class: 'card-title' }, '팀 시너지'),
       team.synergies.length === 0 ? h('div', { class: 'small muted' }, '없음') : h('ul', { class: 'skill-ul' }, team.synergies.map((s) => h('li', null, h('strong', null, s.name), h('div', { class: 'tiny muted' }, s.desc)))),
     ),
     h('div', { class: 'card' },
-      h('div', { class: 'card-title' }, '사이클 기록'),
+      h('div', { class: 'card-title' }, `${TOTAL_DAYS}일 기록 (누적 포인트 ${fmtNum(totalPoints)})`),
       h('div', { class: 'table-wrap' }, h('table', { class: 'table' },
-        h('thead', null, h('tr', null, ['사이클', '맵', '상대', '결과', '보너스', '선택'].map((t) => h('th', null, t)))),
+        h('thead', null, h('tr', null, ['일차', '맵', '상대', '5:5 결과', '몬스터', '포인트', '선택'].map((t) => h('th', null, t)))),
         h('tbody', null, state.history.map((r) => h('tr', null,
-          h('td', null, String(r.cycle)),
+          h('td', null, `${r.day}일`),
           h('td', null, MAP_NAME_KO[r.map]),
           h('td', null, r.opponentName),
           h('td', { class: r.result.winner === 'A' ? 'win-text' : r.result.winner === 'B' ? 'lose-text' : '' }, r.result.winner === 'A' ? '승' : r.result.winner === 'B' ? '패' : '무', h('span', { class: 'tiny muted' }, ` ${reasonKo(r.result.reason)} ${fmtSec(r.result.durationSec)}`)),
-          h('td', { class: 'num' }, `+${r.bonusEarned}`),
-          h('td', { class: 'small' }, r.choicesTaken.map((ct) => `${ct.title}${ct.success === true ? ' ✓' : ct.success === false ? ' ✗' : ''}`).join(', ')),
+          h('td', { class: r.monster ? (r.monster.won ? 'win-text' : 'lose-text') : 'muted' }, r.monster ? `${MONSTER_TIER_NAME_KO[r.monster.tier]} ${r.monster.name} ${r.monster.won ? '승' : '패'}` : '—'),
+          h('td', { class: 'num' }, `+${r.pointsEarned}`),
+          h('td', { class: 'small' }, r.choicesTaken.map((ct) => `[${rarityKo(ct.rarity)}] ${ct.title}${ct.success === true ? ' ✓' : ct.success === false ? ' ✗' : ''}`).join(', ')),
         ))),
       )),
     ),
@@ -1229,7 +1594,7 @@ function renderDone(state: RunState): HTMLElement {
   );
 }
 
-// ───────────────────────── 9. 완성팀 대전 ─────────────────────────
+// ───────────────────────── 10. 완성팀 대전 ─────────────────────────
 
 function renderPvpSetup(): HTMLElement {
   const teams = storage.loadCompletedTeams();
@@ -1244,12 +1609,11 @@ function renderPvpSetup(): HTMLElement {
       h('div', { class: 'card-title' }, side === 'A' ? '팀 A (파랑)' : '팀 B (빨강)'),
       h('div', { class: 'team-pick-list' }, teams.map((t) => {
         const checked = (side === 'A' ? pvp.aId : pvp.bId) === t.id;
-        const power = t.members.reduce((acc, c) => acc + safePower(c), 0);
         return h('label', { class: `pick-row ${checked ? 'checked' : ''}` },
           h('input', { type: 'radio', name: `pick-${side}`, checked, onchange: () => { if (side === 'A') pvp.aId = t.id; else pvp.bId = t.id; render(); } }),
           h('span', { class: 'name' }, t.name),
           h('span', { class: 'muted small' }, t.members.map((c) => JOB_NAME_KO[c.mainJob]).join('/')),
-          h('span', { class: 'muted small' }, `전투력 ${power}`),
+          h('span', { class: 'muted small' }, `전투력 ${fmtNum(safeTeamPower(t))}`),
           h('button', { class: 'btn ghost tiny danger', onclick: (ev: Event) => { ev.preventDefault(); ev.stopPropagation(); if (window.confirm(`${t.name} 팀을 삭제할까요?`)) { storage.deleteCompletedTeam(t.id); render(); } } }, '삭제'),
         );
       })),
@@ -1267,7 +1631,7 @@ function renderPvpSetup(): HTMLElement {
     const b = dedupeTeamIds(a, b0);
     pvp.seed = parseSeed(seedInput.value);
     pvp.map = mapSel.value as MapType;
-    startBattle({ seed: pvp.seed, map: pvp.map, teamA: a, teamB: b }, 'pvp');
+    startBattle({ seed: pvp.seed, map: pvp.map, teamA: a, teamB: b }, 'pvp', `${a.name} vs ${b.name}`);
   };
 
   return h(

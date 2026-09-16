@@ -280,6 +280,17 @@ export interface Character {
   skills: string[];
   /** 가챠 등급 표시용 (1~5) */
   rarity: number;
+  /**
+   * 몬스터 유닛 표시용. 있으면 렌더러가 일반 캐릭터와 다르게 그린다.
+   * 플레이어 캐릭터는 항상 undefined.
+   */
+  monster?: { kind: string; tier: MonsterTier };
+  /**
+   * 파생 전투 수치 최종 배율. computeDerived 가 모든 계산을 끝낸 뒤 마지막에 곱한다.
+   * 스탯 상한(100) 때문에 난이도를 더 못 올리는 문제를 피하기 위한 몬스터 전용 수단.
+   * 플레이어 캐릭터에는 사용하지 않는다.
+   */
+  derivedMult?: Partial<Record<DerivedStatKey, number>>;
 }
 
 export interface SynergyDef {
@@ -307,7 +318,7 @@ export interface SynergyDef {
 export interface Team {
   id: string;
   name: string;
-  members: Character[]; // 정확히 5명
+  members: Character[]; // 플레이어 팀 5명, 몬스터 팀 1~5명
   synergies: SynergyDef[];
 }
 
@@ -407,12 +418,127 @@ export interface BattleSimulator {
   runToEnd(): BattleResult;
 }
 
-// ───────────────────────── 육성 ─────────────────────────
+// ───────────────────────── 육성: 일정 (10일 × 5스텝) ─────────────────────────
 
-export const TOTAL_CYCLES = 10;
-export const CHOICES_PER_CYCLE = 3;
-export const SUBJOB_CHOICE_CYCLE_MIN = 4;
-export const SUBJOB_CHOICE_CYCLE_MAX = 6;
+/** 육성 총 일수 */
+export const TOTAL_DAYS = 10;
+/** 하루의 스텝 수 */
+export const STEPS_PER_DAY = 5;
+/** 선택지가 나오는 스텝 번호 */
+export const CHOICE_STEPS = [1, 2, 4] as const;
+/** 몬스터 전투 스텝 번호 */
+export const MONSTER_STEP = 3;
+/** 5:5 전투 스텝 번호 */
+export const BATTLE_STEP = 5;
+/** 선택지 한 세트의 카드 수 */
+export const CHOICES_PER_SET = 3;
+/** 직업 분화 선택지 보장 구간 (캐릭터당 1회) */
+export const SUBJOB_DAY_MIN = 4;
+export const SUBJOB_DAY_MAX = 6;
+
+export type StepKind = 'choice' | 'monster' | 'battle';
+
+/** 하루의 고정 스텝 순서. 인덱스 0 이 1스텝. 길이 = STEPS_PER_DAY */
+export const DAY_STEPS: readonly StepKind[] = [
+  'choice', // 1스텝
+  'choice', // 2스텝
+  'monster', // 3스텝
+  'choice', // 4스텝
+  'battle', // 5스텝
+];
+
+export const STEP_KIND_NAME_KO: Record<StepKind, string> = {
+  choice: '선택', monster: '몬스터', battle: '전투',
+};
+
+/** 스텝 번호(1~5) → 스텝 종류. 범위 밖이면 'choice' 로 클램프한다. */
+export function stepKindOf(step: number): StepKind {
+  const i = step - 1;
+  if (i < 0) return DAY_STEPS[0];
+  if (i >= DAY_STEPS.length) return DAY_STEPS[DAY_STEPS.length - 1];
+  return DAY_STEPS[i];
+}
+
+// ───────────────────────── 육성: 몬스터 전투 ─────────────────────────
+
+/** 몬스터 난이도. 표시 순서도 이 배열 순서를 따른다 */
+export const MONSTER_TIER_ORDER = ['low', 'mid', 'high'] as const;
+export type MonsterTier = (typeof MONSTER_TIER_ORDER)[number];
+
+export const MONSTER_TIER_NAME_KO: Record<MonsterTier, string> = {
+  low: '하급', mid: '중급', high: '고급',
+};
+
+/** 몬스터 1종(유닛 단위) 정의. Character 로 변환되어 sim 에 그대로 들어간다 */
+export interface MonsterUnitTemplate {
+  /** AI 행동을 재사용하기 위해 기존 직업 중 성향이 맞는 것을 쓴다 */
+  mainJob: MainJob;
+  name: string; // 한국어 표시명
+  /** 기준 스탯 (1~100). 없는 스탯은 직업 프로필/기본값을 따른다 */
+  statProfile: Partial<Record<BaseStatKey, number>>;
+  /** 파생 수치 최종 배율. 스탯 상한을 넘는 강도가 필요할 때 사용 */
+  derivedMult?: Partial<Record<DerivedStatKey, number>>;
+  skills: string[];
+}
+
+/** 몬스터 편성 정의. units 의 count 합계는 1~5 여야 한다 */
+export interface MonsterDef {
+  id: string;
+  name: string; // 한국어 표시명 (예: '슬라임 무리')
+  tier: MonsterTier;
+  desc: string;
+  units: { template: MonsterUnitTemplate; count: number }[];
+  /** 이 몬스터가 선호하는 맵 (비어 있으면 전체 맵) */
+  preferredMaps: MapType[];
+  /** 일차 스케일링에 곱해지는 종별 강도 배율 (1.0 기준) */
+  powerScale: number;
+}
+
+/** 몬스터 전투 보상 */
+export interface MonsterReward {
+  points: number;
+  /** 승리 시 다음 선택지 세트에 보장할 최소 희귀도. null 이면 보장 없음 */
+  rarityFloor: ChoiceRarity | null;
+  /** 승리 시 팀 전원 랜덤 스탯 +N. 0 이면 없음 */
+  teamStatBonus: number;
+}
+
+/** 몬스터 선택 카드 1장 = 실제로 싸우게 될 편성 */
+export interface MonsterEncounter {
+  id: string;
+  tier: MonsterTier;
+  monsterId: string; // MonsterDef.id
+  name: string;
+  desc: string;
+  map: MapType;
+  team: Team; // 몬스터 팀 (1~5명)
+  reward: MonsterReward;
+  /** 표시용 예상 전투력 */
+  estimatedPower: number;
+}
+
+// ───────────────────────── 육성: 선택지 ─────────────────────────
+
+/** 선택지 희귀도. 낮은 등급부터 */
+export const CHOICE_RARITY_ORDER = ['common', 'rare', 'epic', 'legendary'] as const;
+export type ChoiceRarity = (typeof CHOICE_RARITY_ORDER)[number];
+
+export const CHOICE_RARITY_NAME_KO: Record<ChoiceRarity, string> = {
+  common: '일반', rare: '레어', epic: '에픽', legendary: '전설',
+};
+
+/** 비교용 등급 순위 (높을수록 상위) */
+export const CHOICE_RARITY_RANK: Record<ChoiceRarity, number> = {
+  common: 0, rare: 1, epic: 2, legendary: 3,
+};
+
+/** 카드 테두리/텍스트 색 */
+export const CHOICE_RARITY_COLOR: Record<ChoiceRarity, string> = {
+  common: '#9aa3ad', // 회색
+  rare: '#4a9eff', // 파랑
+  epic: '#a563f0', // 보라
+  legendary: '#f0b429', // 황금
+};
 
 export type ChoiceKind =
   | 'big_single' // 한 명 대폭
@@ -446,58 +572,80 @@ export type ChoiceEffect =
 export interface Choice {
   id: string;
   kind: ChoiceKind;
+  /** 카드 희귀도. 효과 크기는 이 등급에 맞춰 생성된다 */
+  rarity: ChoiceRarity;
   title: string;
   desc: string;
   /** 관련 캐릭터 id (표시용) */
   charIds: string[];
   effects: ChoiceEffect[];
+  /** 예상 전투력 상승치 (표시용). estimatePowerDelta 로 계산 */
+  powerDelta: number;
   /** 도박형: 성공 확률 0~1. 없으면 확정 */
   successChance?: number;
   failEffects?: ChoiceEffect[];
 }
 
-export type RunPhase =
-  | 'select_team' // 풀에서 5명 선택
-  | 'pre_battle' // 맵/상대 공개, 전투 시작 대기
-  | 'battle' // 전투 관전
-  | 'bonus' // 보너스 포인트로 스킬 구매 등
-  | 'choice' // 로그라이크 선택 (3회)
-  | 'done'; // 10사이클 완료
+// ───────────────────────── 육성: 진행 상태 ─────────────────────────
 
-export interface CycleRecord {
-  cycle: number;
-  map: MapType;
-  result: BattleResult;
+export type RunPhase =
+  | 'select_team' // 풀에서 5명 선택 (day=0, step=0)
+  | 'choice' // 선택지 3장 중 1장 (step 1, 2, 4)
+  | 'monster_select' // 몬스터 난이도 3장 중 1장 (step 3 전반)
+  | 'monster_battle' // 몬스터 전투 관전 (step 3 후반)
+  | 'pre_battle' // 5:5 맵·상대 공개 (step 5 전반)
+  | 'battle' // 5:5 전투 관전 (step 5 후반)
+  | 'day_end' // 하루 마무리: 보상 요약 + 보너스 상점 (스텝 아님)
+  | 'done'; // 10일 완료
+
+/** 하루의 기록 */
+export interface DayRecord {
+  day: number; // 1~10
+  map: MapType; // 5:5 전투 맵
+  result: BattleResult; // 5:5 전투 결과
   opponentName: string;
-  bonusEarned: number;
-  choicesTaken: { title: string; success: boolean | null }[];
-  /** 전투 직전 팀 스냅샷 (Bazaar 방식 상대 풀용) */
+  /** 그날의 몬스터 전투. 아직 없거나 건너뛰었으면 null */
+  monster: { tier: MonsterTier; name: string; won: boolean; result: BattleResult } | null;
+  /** 그날 획득한 보너스 포인트 총합 */
+  pointsEarned: number;
+  choicesTaken: { title: string; rarity: ChoiceRarity; success: boolean | null }[];
+  /** 5:5 전투 직전 팀 스냅샷 (고스트 상대 풀용) */
   teamSnapshot: Team;
 }
 
 export interface RunState {
   seed: number;
   phase: RunPhase;
-  cycle: number; // 1~10, select_team 단계에서는 0
+  /** 1~10. select_team 단계에서는 0 */
+  day: number;
+  /** 1~5. select_team / day_end / done 단계에서는 0 */
+  step: number;
   pool: Character[]; // 가챠 풀 (선택 단계)
   team: Team | null;
   bonusPoints: number;
+  /** 현재 5:5 전투 맵 */
   currentMap: MapType | null;
   opponent: Team | null;
-  /** 현재 사이클에서 몇 번째 선택인지 (0~2) */
-  choiceIndex: number;
+  /** monster_select 단계에서 제시된 난이도 3장. 그 외에는 null */
+  monsterOptions: MonsterEncounter[] | null;
+  /** 선택된 몬스터 (monster_battle 진행 중). 그 외에는 null */
+  currentMonster: MonsterEncounter | null;
   currentChoices: Choice[];
-  /** 캐릭터별 분화 선택지 등장 예정 사이클 (등장하면 삭제) */
-  subJobChoiceCycle: Record<string, number>;
-  history: CycleRecord[];
-  /** 현재 사이클에서 다음 선택지 리롤 가능 횟수 */
+  /** 값이 있으면 다음 선택지 3장 중 최소 1장이 이 등급 이상. 사용 후 null */
+  rarityFloor: ChoiceRarity | null;
+  /** 캐릭터별 분화 선택지 등장 예정 일차 (등장하면 삭제) */
+  subJobChoiceDay: Record<string, number>;
+  history: DayRecord[];
+  /** 현재 선택지 세트의 남은 리롤 횟수 */
   rerolls: number;
+  /** 몬스터 보상으로 받은, 아직 적용되지 않은 팀 전원 랜덤 스탯 상승량 */
+  pendingTeamStatBonus: number;
 }
 
-/** 저장된 과거 육성의 사이클별 스냅샷. Bazaar 방식 상대 매칭에 사용 */
+/** 저장된 과거 육성의 일차별 스냅샷. Bazaar 방식 상대 매칭에 사용 */
 export interface GhostSnapshot {
   runSeed: number;
-  cycle: number;
+  day: number;
   team: Team;
   savedAt: string; // ISO
 }

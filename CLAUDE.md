@@ -21,10 +21,15 @@
 - `src/core/data/skills.ts` 스킬 정의 + `SKILLS` 맵, `getSkill(id)`
 - `src/core/data/maps.ts` 맵 4종 정의 + `MAPS`
 - `src/core/data/synergies.ts` 시너지 정의 생성기
+- `src/core/data/monsters.ts` 몬스터 정의 12종 이상 (`MONSTERS`), 난이도별 조회 + 인카운터 생성
 - `src/core/battle/sim.ts` 결정론 전투 시뮬레이션 (`createBattle(input): BattleSimulator`)
 - `src/core/gen/charGen.ts` 캐릭터 풀 / 상대팀 랜덤 생성
-- `src/core/growth/choices.ts` 로그라이크 선택지 생성·적용
-- `src/core/growth/run.ts` 육성 상태 머신 (10사이클)
-- `src/core/growth/storage.ts` localStorage 저장, 고스트 스냅샷
+- `src/core/growth/choices.ts` 로그라이크 선택지 생성·적용, 희귀도, `estimatePowerDelta`
+- `src/core/growth/run.ts` 육성 상태 머신 (10일 × 5스텝)
+- `src/ui/storage.ts` localStorage 저장(`SAVE_VERSION = 2`), 고스트 스냅샷
 - `src/ui/app.ts` 화면 흐름, `src/ui/render.ts` 캔버스 렌더러, `src/ui/style.css`
 - `tools/headless.ts` 대량 시뮬레이션 CLI
+
+## 용어 (v0.4)
+- 육성 단위는 **일(day)**. 예전 `cycle` 은 전부 `day` 로 바뀌었다: `TOTAL_CYCLES` → `TOTAL_DAYS(10)`, `CycleRecord` → `DayRecord`, `RunState.cycle` → `day`, `GhostSnapshot.cycle` → `day`.
+- 하루는 5스텝 고정: 선택(1) · 선택(2) · 몬스터(3) · 선택(4) · 5:5 전투(5). 이후 하루 마무리(`day_end`)를 거쳐 다음 날로 간다. 자세한 내용은 GDD §7.

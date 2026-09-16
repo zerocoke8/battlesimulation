@@ -12,5 +12,6 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src", "tools"]
+  "include": ["src", "tools"],
+  "exclude": ["node_modules", "dist", "tools/_*"]
 }

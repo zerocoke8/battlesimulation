@@ -243,11 +243,73 @@ const SKILL_LIST: SkillDef[] = [
   active({ id: 'healer_ward_empower', name: '결계 강화', desc: '반경 4 안의 아군에게 8초 동안 물리 방어 +15%, 이능 방어 +15%.', job: 'healer', magic: 'holy', cd: 18, mp: 30, cast: 0.5, range: 0, target: 'ally_area', radius: 4, effects: [{ kind: 'buff', stat: 'physDef', pct: 15, durationSec: 8 }, { kind: 'buff', stat: 'magDef', pct: 15, durationSec: 8 }], cost: 120 }),
 ];
 
+// ───────────────────────── 몬스터 전용 스킬 ─────────────────────────
+//
+// id 는 전부 'mon_' 으로 시작한다. 어떤 직업 풀(JobDef.skillPool / SubJobDef.skillPool)에도 넣지 않으므로
+// skillPoolFor 가 절대 돌려주지 않는다 (아래에 방어 필터도 둔다). 상점·선택지에도 등장하지 않는다.
+// job 필드는 표시·AI 성향 참고용이며 실제 소속 풀과는 무관하다.
+
+/** 몬스터 전용 스킬 id 접두사 */
+export const MONSTER_SKILL_PREFIX = 'mon_';
+
+export function isMonsterSkillId(id: string): boolean {
+  return id.slice(0, MONSTER_SKILL_PREFIX.length) === MONSTER_SKILL_PREFIX;
+}
+
+const MONSTER_SKILL_LIST: SkillDef[] = [
+  // ══════════ 하급 몬스터 ══════════
+  active({ id: 'mon_bite', name: '물어뜯기', desc: '적 하나를 물어뜯어 물리 공격력의 140% 피해를 입힌다.', job: 'berserker', cd: 6, mp: 8, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 1.4 }], cost: 60 }),
+  active({ id: 'mon_pack_howl', name: '무리의 포효', desc: '반경 6 안의 아군에게 6초 동안 물리 공격 +18%, 공격 속도 +10%.', job: 'berserker', cd: 14, mp: 15, range: 0, target: 'ally_area', radius: 6, effects: [{ kind: 'buff', stat: 'physAtk', pct: 18, durationSec: 6 }, { kind: 'buff', stat: 'atkSpeed', pct: 10, durationSec: 6 }], cost: 90 }),
+  passive({ id: 'mon_swarm_instinct', name: '군집 본능', desc: '무리로 몰려다닌다. 공격 속도 +10%, 회피 +8%.', job: 'berserker', mods: { atkSpeed: 10, evasion: 8 }, cost: 70 }),
+  active({ id: 'mon_acid_splash', name: '산성 점액', desc: '반경 2.5 안의 적에게 물리 공격력의 100% 피해와 3초 동안 이동 속도 35% 감소.', job: 'tank', cd: 10, mp: 15, range: MELEE, target: 'enemy_area', radius: 2.5, effects: [{ kind: 'damage', school: 'phys', coef: 1.0 }, { kind: 'status', status: 'slow', durationSec: 3, value: 0.35 }], cost: 80 }),
+  passive({ id: 'mon_tough_hide', name: '질긴 가죽', desc: '물리 방어 +14%, 최대 HP +8%.', job: 'tank', mods: { physDef: 14, maxHp: 8 }, cost: 70 }),
+  active({ id: 'mon_rusty_slash', name: '녹슨 칼질', desc: '적 하나에게 물리 공격력의 130% 피해.', job: 'swordsman', cd: 7, mp: 10, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 1.3 }], cost: 60 }),
+  active({ id: 'mon_crude_arrow', name: '조잡한 화살', desc: '먼 적에게 물리 공격력의 130% 피해.', job: 'archer', cd: 7, mp: 10, range: 8, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 1.3 }], cost: 60 }),
+  active({ id: 'mon_screech', name: '초음파 비명', desc: '반경 3 안의 적에게 물리 공격력의 80% 피해와 3초 동안 이동 속도 40% 감소.', job: 'assassin', cd: 11, mp: 15, range: 5, target: 'enemy_area', radius: 3, effects: [{ kind: 'damage', school: 'phys', coef: 0.8 }, { kind: 'status', status: 'slow', durationSec: 3, value: 0.4 }], ai: 'enemies_clustered_2', cost: 80 }),
+  passive({ id: 'mon_erratic_flight', name: '불규칙한 비행', desc: '궤적을 읽기 어렵다. 회피 +18%, 이동 속도 +8%.', job: 'assassin', mods: { evasion: 18, moveSpeed: 8 }, cost: 80 }),
+  active({ id: 'mon_venom_spore', name: '독포자', desc: '반경 2.5 안의 적에게 이능 공격력의 90% 자연 피해와 5초 동안 초당 10 독 피해.', job: 'healer', magic: 'nature', cd: 12, mp: 20, cast: 0.5, range: 6, target: 'enemy_area', radius: 2.5, effects: [{ kind: 'damage', school: 'magic', coef: 0.9, magic: 'nature' }, { kind: 'status', status: 'poison', durationSec: 5, value: 10 }], cost: 90 }),
+  active({ id: 'mon_spore_mend', name: '포자 치유', desc: 'HP가 가장 낮은 아군을 이능 공격력의 160%만큼 회복. 아군 HP 60% 이하일 때 사용.', job: 'healer', magic: 'nature', cd: 8, mp: 20, cast: 0.5, range: 6, target: 'ally_lowest_hp', effects: [{ kind: 'heal', coef: 1.6 }], ai: 'ally_hp_below_60', cost: 90 }),
+
+  // ══════════ 중급 몬스터 ══════════
+  active({ id: 'mon_heavy_cleave', name: '거친 내려치기', desc: '적 하나에게 물리 공격력의 190% 피해.', job: 'swordsman', cd: 8, mp: 15, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 1.9 }], cost: 100 }),
+  active({ id: 'mon_war_cry', name: '전투 함성', desc: '반경 6 안의 아군에게 8초 동안 물리 공격 +20%, 물리 방어 +15%.', job: 'tank', cd: 16, mp: 20, range: 0, target: 'ally_area', radius: 6, effects: [{ kind: 'buff', stat: 'physAtk', pct: 20, durationSec: 8 }, { kind: 'buff', stat: 'physDef', pct: 15, durationSec: 8 }], cost: 110 }),
+  passive({ id: 'mon_iron_carapace', name: '강철 외피', desc: '물리 방어 +18%, 이능 방어 +10%, 최대 HP +6%.', job: 'tank', mods: { physDef: 18, magDef: 10, maxHp: 6 }, cost: 110 }),
+  active({ id: 'mon_shield_slam', name: '방패 밀치기', desc: '물리 공격력의 120% 피해와 55% 확률로 1초 기절.', job: 'tank', cd: 11, mp: 15, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 1.2 }, { kind: 'status', status: 'stun', durationSec: 1, chance: 0.55 }], cost: 100 }),
+  active({ id: 'mon_wing_gust', name: '날갯짓', desc: '적을 3칸 밀어내며 물리 공격력의 120% 피해.', job: 'archer', cd: 12, mp: 15, range: 8, target: 'enemy', effects: [{ kind: 'knockback', distance: 3 }, { kind: 'damage', school: 'phys', coef: 1.2 }], cost: 100 }),
+  active({ id: 'mon_dive_strike', name: '급강하', desc: '7칸을 내리꽂아 물리 공격력의 170% 피해. 대상이 사거리 밖일 때 사용.', job: 'archer', cd: 11, mp: 15, range: 9, target: 'enemy', effects: [{ kind: 'dash', distance: 7 }, { kind: 'damage', school: 'phys', coef: 1.7 }], ai: 'out_of_range', cost: 110 }),
+  active({ id: 'mon_backstab', name: '뒤치기', desc: '물리 공격력의 200% 피해. 은신 중 사용하면 피해 +80%.', job: 'assassin', cd: 9, mp: 15, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 2.0, bonusIfStealth: 0.8 }], cost: 110 }),
+  active({ id: 'mon_smoke_bomb', name: '연막탄', desc: '3초 동안 은신한다.', job: 'assassin', cd: 15, mp: 15, range: 0, target: 'self', effects: [{ kind: 'status', status: 'stealth', durationSec: 3 }], ai: 'not_stealthed', cost: 90 }),
+  active({ id: 'mon_haunting_bolt', name: '원혼탄', desc: '0.5초 시전 후 이능 공격력의 180% 암흑 피해.', job: 'mage', magic: 'shadow', cd: 8, mp: 18, cast: 0.5, range: 7, target: 'enemy', effects: [{ kind: 'damage', school: 'magic', coef: 1.8, magic: 'shadow' }], cost: 110 }),
+  active({ id: 'mon_wail_of_woe', name: '비탄의 울음', desc: '0.8초 시전 후 반경 3 안의 적에게 이능 공격력의 130% 암흑 피해와 6초 동안 물리 공격 -20%.', job: 'mage', magic: 'shadow', cd: 14, mp: 28, cast: 0.8, range: 7, target: 'enemy_area', radius: 3, effects: [{ kind: 'damage', school: 'magic', coef: 1.3, magic: 'shadow' }, { kind: 'debuff', stat: 'physAtk', pct: 20, durationSec: 6 }], ai: 'enemies_clustered_2', cost: 120 }),
+  active({ id: 'mon_dark_ritual', name: '어둠의 의식', desc: '0.8초 시전 후 반경 5 안의 아군을 이능 공격력의 120%만큼 회복하고 8초 동안 이능 방어 +15%. 아군 HP 60% 이하일 때 사용.', job: 'healer', magic: 'shadow', cd: 14, mp: 30, cast: 0.8, range: 0, target: 'ally_area', radius: 5, effects: [{ kind: 'heal', coef: 1.2 }, { kind: 'buff', stat: 'magDef', pct: 15, durationSec: 8 }], ai: 'ally_hp_below_60', cost: 120 }),
+
+  // ══════════ 고급 몬스터 ══════════
+  active({ id: 'mon_frost_breath', name: '서리 숨결', desc: '1초 시전 후 반경 3.5 안의 적에게 이능 공격력의 220% 냉기 피해와 50% 확률로 1.5초 빙결.', job: 'mage', magic: 'ice', cd: 14, mp: 35, cast: 1.0, range: 8, target: 'enemy_area', radius: 3.5, effects: [{ kind: 'damage', school: 'magic', coef: 2.2, magic: 'ice' }, { kind: 'status', status: 'freeze', durationSec: 1.5, chance: 0.5 }], cost: 150 }),
+  active({ id: 'mon_dragon_roar', name: '용의 포효', desc: '반경 6 안의 적의 물리 공격을 8초 동안 25% 낮추고 30% 확률로 0.8초 기절시킨다.', job: 'mage', cd: 18, mp: 25, range: 8, target: 'enemy_area', radius: 6, effects: [{ kind: 'debuff', stat: 'physAtk', pct: 25, durationSec: 8 }, { kind: 'status', status: 'stun', durationSec: 0.8, chance: 0.3 }], cost: 140 }),
+  passive({ id: 'mon_ice_scale', name: '서리 비늘', desc: '이능 방어 +20%, 최대 HP +12%.', job: 'mage', magic: 'ice', mods: { magDef: 20, maxHp: 12 }, cost: 130 }),
+  active({ id: 'mon_abyss_claw', name: '심연의 발톱', desc: '적의 방어 40%를 무시하고 물리 공격력의 240% 피해.', job: 'berserker', magic: 'shadow', cd: 9, mp: 18, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 2.4, ignoreDefPct: 0.4 }], cost: 150 }),
+  active({ id: 'mon_devour', name: '포식', desc: '물리 공격력의 200% 피해를 입히고 6초 동안 입힌 피해의 35%를 흡혈한다.', job: 'berserker', cd: 12, mp: 20, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 2.0 }, { kind: 'status', status: 'lifesteal', durationSec: 6, value: 0.35 }], cost: 150 }),
+  passive({ id: 'mon_dread_aura', name: '공포의 기운', desc: '물리 공격 +14%, 최대 HP +12%.', job: 'berserker', magic: 'shadow', mods: { physAtk: 14, maxHp: 12 }, cost: 130 }),
+  active({ id: 'mon_death_bolt', name: '죽음의 화살', desc: '0.6초 시전 후 이능 공격력의 240% 암흑 피해.', job: 'mage', magic: 'shadow', cd: 9, mp: 25, cast: 0.6, range: 8, target: 'enemy', effects: [{ kind: 'damage', school: 'magic', coef: 2.4, magic: 'shadow' }], cost: 150 }),
+  active({ id: 'mon_soul_drain', name: '영혼 흡수', desc: '이능 공격력의 160% 암흑 피해를 입히고 자신을 이능 공격력의 100%만큼 회복한다.', job: 'mage', magic: 'shadow', cd: 10, mp: 20, cast: 0.4, range: 7, target: 'enemy', effects: [{ kind: 'damage', school: 'magic', coef: 1.6, magic: 'shadow' }, { kind: 'heal', coef: 1.0 }], cost: 140 }),
+  active({ id: 'mon_raise_dead', name: '망자 소환', desc: '1.2초 시전 후 30초 동안 유지되는 해골 병사 3체를 일으킨다. 소환물이 없을 때 사용.', job: 'summoner', magic: 'shadow', cd: 24, mp: 40, cast: 1.2, range: 0, target: 'self', effects: [{ kind: 'summon', unit: 'skeleton', count: 3, durationSec: 30 }], ai: 'no_summons', cost: 150 }),
+  active({ id: 'mon_earth_slam', name: '대지 강타', desc: '0.5초 시전 후 반경 3 안의 적에게 물리 공격력의 200% 피해와 60% 확률로 1.2초 기절.', job: 'tank', cd: 15, mp: 30, cast: 0.5, range: MELEE, target: 'enemy_area', radius: 3, effects: [{ kind: 'damage', school: 'phys', coef: 2.0 }, { kind: 'status', status: 'stun', durationSec: 1.2, chance: 0.6 }], ai: 'enemies_clustered_2', cost: 150 }),
+  passive({ id: 'mon_granite_skin', name: '화강암 피부', desc: '물리 방어 +28%, 최대 HP +15%.', job: 'tank', mods: { physDef: 28, maxHp: 15 }, cost: 140 }),
+  passive({ id: 'mon_sovereign_aura', name: '군주의 위압', desc: '최대 HP +20%, 물리 공격 +12%.', job: 'tank', mods: { maxHp: 20, physAtk: 12 }, cost: 150 }),
+  active({ id: 'mon_hellfire', name: '지옥불', desc: '1.2초 시전 후 반경 3 안의 적에게 이능 공격력의 200% 화염 피해와 5초 동안 초당 20 화상.', job: 'mage', magic: 'fire', cd: 16, mp: 35, cast: 1.2, range: 7, target: 'enemy_area', radius: 3, effects: [{ kind: 'damage', school: 'magic', coef: 2.0, magic: 'fire' }, { kind: 'status', status: 'burn', durationSec: 5, value: 20 }], ai: 'enemies_clustered_2', cost: 150 }),
+  active({ id: 'mon_demon_rend', name: '마신의 참격', desc: '적 하나에게 물리 공격력의 230% 피해.', job: 'swordsman', magic: 'shadow', cd: 8, mp: 18, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 2.3 }], cost: 150 }),
+  active({ id: 'mon_dark_blessing', name: '암흑 축복', desc: '반경 5 안의 아군에게 8초 동안 물리 공격 +20%, 이능 공격 +20%.', job: 'healer', magic: 'shadow', cd: 16, mp: 25, cast: 0.5, range: 0, target: 'ally_area', radius: 5, effects: [{ kind: 'buff', stat: 'physAtk', pct: 20, durationSec: 8 }, { kind: 'buff', stat: 'magAtk', pct: 20, durationSec: 8 }], cost: 140 }),
+  active({ id: 'mon_unholy_mend', name: '사악한 치유', desc: '0.6초 시전 후 HP가 가장 낮은 아군을 이능 공격력의 240%만큼 회복. 아군 HP 60% 이하일 때 사용.', job: 'healer', magic: 'shadow', cd: 9, mp: 25, cast: 0.6, range: 6, target: 'ally_lowest_hp', effects: [{ kind: 'heal', coef: 2.4 }], ai: 'ally_hp_below_60', cost: 140 }),
+];
+
 // ───────────────────────── 조회 ─────────────────────────
+
+/** 플레이어 스킬 + 몬스터 스킬. 정의 순서 고정 (플레이어 먼저) */
+const ALL_SKILL_LIST: SkillDef[] = SKILL_LIST.concat(MONSTER_SKILL_LIST);
 
 function buildSkillMap(): Record<string, SkillDef> {
   const out: Record<string, SkillDef> = {};
-  for (const s of SKILL_LIST) {
+  for (const s of ALL_SKILL_LIST) {
     if (out[s.id]) throw new Error(`스킬 id 중복: ${s.id}`);
     out[s.id] = s;
   }
@@ -256,8 +318,14 @@ function buildSkillMap(): Record<string, SkillDef> {
 
 export const SKILLS: Record<string, SkillDef> = buildSkillMap();
 
-/** 정의 순서가 고정된 전체 스킬 id 목록 */
+/** 정의 순서가 고정된 플레이어 스킬 id 목록 (몬스터 전용 스킬 제외) */
 export const SKILL_IDS: readonly string[] = SKILL_LIST.map((s) => s.id);
+
+/** 몬스터 전용 스킬 id 목록 (정의 순서 고정) */
+export const MONSTER_SKILL_IDS: readonly string[] = MONSTER_SKILL_LIST.map((s) => s.id);
+
+/** 플레이어 + 몬스터 전체 스킬 id 목록 (정의 순서 고정) */
+export const ALL_SKILL_IDS: readonly string[] = ALL_SKILL_LIST.map((s) => s.id);
 
 export function getSkill(id: string): SkillDef {
   const def = SKILLS[id];
@@ -265,11 +333,15 @@ export function getSkill(id: string): SkillDef {
   return def;
 }
 
-/** 캐릭터가 아직 모르는, 습득 가능한 스킬 id (메인 풀 + 세부 직업 풀). 순서 고정 */
+/**
+ * 캐릭터가 아직 모르는, 습득 가능한 스킬 id (메인 풀 + 세부 직업 풀). 순서 고정.
+ * 몬스터 전용 스킬('mon_')은 절대 포함되지 않는다.
+ */
 export function skillPoolFor(c: Character): string[] {
   const known = new Set(c.skills);
   const out: string[] = [];
   const push = (id: string) => {
+    if (isMonsterSkillId(id)) return;
     if (!known.has(id) && !out.includes(id)) out.push(id);
   };
   for (const id of JOBS[c.mainJob].skillPool) push(id);
@@ -292,7 +364,12 @@ export function countSkills(c: Character): { active: number; passive: number } {
   return { active, passive };
 }
 
-/** 특정 직업 풀 전체 (메인 + 모든 세부 직업의 granted/pool). 표시/상점용 */
+/** 특정 직업 풀 전체 (메인 + 모든 세부 직업의 granted/pool). 표시/상점용. 몬스터 전용 스킬은 제외 */
 export function allSkillsOfJob(job: MainJob): SkillDef[] {
   return SKILL_LIST.filter((s) => s.job === job);
+}
+
+/** 몬스터 전용 스킬 정의 목록 (표시/디버그용) */
+export function allMonsterSkills(): SkillDef[] {
+  return MONSTER_SKILL_LIST.slice();
 }

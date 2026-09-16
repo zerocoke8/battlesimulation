@@ -1,21 +1,29 @@
 /**
- * 로그라이크 선택지 생성·적용 (GDD §7.3).
- * - generateChoices: 사이클/팀 상태에 맞춰 정확히 CHOICES_PER_CYCLE 개의 서로 다른 선택지
- * - applyChoice / applyEffect: 선택지 효과 적용 (스탯 클램프, 스킬 슬롯 제한 준수)
+ * 로그라이크 선택지 생성·적용 (GDD §7.4, §7.5).
+ *
+ * 생성 순서가 중요하다: **먼저 카드별 희귀도를 뽑고, 그 희귀도에 맞는 크기로 효과를 만든다.**
+ * (효과를 만든 뒤에 등급을 붙이지 않는다)
+ *
+ *  - generateChoices: 정확히 CHOICES_PER_SET 장. 중복 없음. rarityFloor 보장. 분화 예정이면 3장 모두 분화 카드
+ *  - applyChoice / applyEffect: 효과 적용 (스탯 클램프, 스킬 슬롯 제한 준수)
+ *  - estimatePowerDelta: 카드에 표시할 예상 전투력 상승치
+ *
+ * 난수는 인자로 받은 Rng 만 쓴다. Math.random / Date 금지. 순회는 항상 상수 배열 순서.
  */
 import { Rng, hashSeed } from '../rng';
 import type {
-  BaseStatKey, Character, Choice, ChoiceEffect, ChoiceKind, MainJob, MapType, RunState, StatCategory,
-  SubJobDef, Team,
+  BaseStatKey, Character, Choice, ChoiceEffect, ChoiceKind, ChoiceRarity, MainJob, MapType, RunState,
+  StatCategory, SubJobDef, Team,
 } from '../types';
 import {
-  BASE_STAT_KEYS, CHOICES_PER_CYCLE, CHOICE_KIND_NAME_KO, JOB_NAME_KO, MAIN_JOBS, MAP_NAME_KO, MAP_TYPES,
-  MAX_ACTIVE_SKILLS, MAX_PASSIVE_SKILLS, STAT_CATEGORY, STAT_CATEGORY_NAME_KO, STAT_NAME_KO, TOTAL_CYCLES,
+  BASE_STAT_KEYS, CHOICES_PER_SET, CHOICE_KIND_NAME_KO, CHOICE_RARITY_NAME_KO, CHOICE_RARITY_ORDER,
+  CHOICE_RARITY_RANK, JOB_NAME_KO, MAIN_JOBS, MAP_NAME_KO, MAP_TYPES, MAX_ACTIVE_SKILLS, MAX_PASSIVE_SKILLS,
+  STAT_CATEGORY, STAT_CATEGORY_NAME_KO, STAT_MAX, STAT_NAME_KO, TOTAL_DAYS,
 } from '../types';
 import { JOBS, getSubJob } from '../data/jobs';
 import { getSkill, skillPoolFor } from '../data/skills';
 import { generateSynergyCandidates } from '../data/synergies';
-import { clampStat } from '../stats';
+import { clampStat, statTotal } from '../stats';
 
 // ───────────────────────── 텍스트 유틸 ─────────────────────────
 
@@ -37,6 +45,85 @@ function statName(k: BaseStatKey): string {
   return STAT_NAME_KO[k];
 }
 
+// ───────────────────────── 예상 전투력 가중치 (GDD §7.4.4) ─────────────────────────
+
+/** 스탯 1 = 1 */
+const W_STAT = 1;
+/** 스킬 1개 = 25 */
+const W_SKILL = 25;
+/** 시너지 1개 = 20 */
+const W_SYNERGY = 20;
+/** 직업 분화 = 35 */
+const W_SUBJOB = 35;
+/** 맵 적응 1 = 0.4 */
+const W_ADAPT = 0.4;
+/** 보너스 포인트 1 = 0.15 (30포인트 ≈ 스탯 +4) */
+const W_POINT = 0.15;
+
+// ───────────────────────── 희귀도 ─────────────────────────
+
+/** 희귀도별 총 스탯 상승량 기준 (GDD §7.4.2) */
+const RARITY_BUDGET: Record<ChoiceRarity, [number, number]> = {
+  common: [10, 16],
+  rare: [20, 30],
+  epic: [36, 50],
+  legendary: [60, 85],
+};
+
+/** 트레이드오프·도박형이 위험을 지는 대가로 받는 상승량 배율 (최대 1.4배) */
+const RISK_MULT = 1.4;
+
+/** 희생 카드 한 장이 줄 수 있는 보너스 포인트 상한 (하루 벌이를 넘지 않게) */
+const SACRIFICE_MAX_POINTS = 150;
+
+/** 스킬 습득 카드의 등급은 스킬 가격으로 본다 (skills.ts 의 cost 는 60~150) */
+const SKILL_COST_BAND: Record<ChoiceRarity, [number, number]> = {
+  common: [0, 79],
+  rare: [80, 109],
+  epic: [110, 129],
+  legendary: [130, 100000],
+};
+
+/** 일차별 희귀도 가중치 (GDD §7.4.1). CHOICE_RARITY_ORDER 순서 */
+function rarityWeights(day: number): number[] {
+  if (day <= 3) return [52, 32, 13, 3];
+  if (day <= 7) return [44, 34, 17, 5];
+  return [34, 35, 22, 9];
+}
+
+function rollRarity(rng: Rng, day: number): ChoiceRarity {
+  return rng.weighted(CHOICE_RARITY_ORDER, rarityWeights(day));
+}
+
+function budgetFor(rng: Rng, rarity: ChoiceRarity): number {
+  const [lo, hi] = RARITY_BUDGET[rarity];
+  return rng.int(lo, hi);
+}
+
+/**
+ * 표시 검증용: 예상 전투력 상승치를 희귀도 구간으로 되돌린다.
+ * 생성은 희귀도 → 효과 순서이므로 이 함수는 검증/디버그에만 쓴다
+ * (스킬·분화·시너지 카드는 스탯 환산값이 구간을 벗어날 수 있다).
+ */
+export function rarityForPowerDelta(delta: number): ChoiceRarity {
+  if (delta < 18) return 'common';
+  if (delta < 33) return 'rare';
+  if (delta < 56) return 'epic';
+  return 'legendary';
+}
+
+/** 총량을 n등분 (합이 정확히 total 이 되도록). 결정론적. */
+function splitBudget(total: number, n: number): number[] {
+  const out: number[] = [];
+  let left = total;
+  for (let i = 0; i < n; i++) {
+    const v = Math.max(1, Math.round(left / (n - i)));
+    out.push(v);
+    left -= v;
+  }
+  return out;
+}
+
 // ───────────────────────── 성장 계수 ─────────────────────────
 
 const CATEGORIES: readonly StatCategory[] = ['body', 'mind', 'skill', 'magic'];
@@ -50,18 +137,19 @@ function growthOf(c: Character, k: BaseStatKey): number {
   return Math.max(0.6, Math.min(1.4, g));
 }
 
-/** 양의 성장량을 직업 성장 계수로 보정 (GDD 4.3). 최소 1. */
-function scaled(base: number, c: Character, k: BaseStatKey): number {
-  return Math.max(1, Math.round(base * growthOf(c, k)));
-}
-
-/** 직업이 잘 성장하는 스탯을 우선 선택 */
-function pickStat(rng: Rng, c: Character): BaseStatKey {
-  const weights = BASE_STAT_KEYS.map((k) => {
+/**
+ * 직업 성향은 '얼마나 오르는가'가 아니라 '어느 스탯이 오르는가'로 반영한다.
+ * (상승량까지 성장 계수로 곱하면 희귀도별 총량 기준이 ±40% 흔들려 카드 등급 표시가 어긋난다)
+ * room 이 있으면 상한(STAT_MAX)에 여유가 있는 스탯만 후보로 삼는다.
+ */
+function pickStat(rng: Rng, c: Character, room = 0): BaseStatKey {
+  const roomy = BASE_STAT_KEYS.filter((k) => c.stats[k] + room <= STAT_MAX);
+  const pool: readonly BaseStatKey[] = roomy.length > 0 ? roomy : BASE_STAT_KEYS;
+  const weights = pool.map((k) => {
     const g = growthOf(c, k);
     return g * g;
   });
-  return rng.weighted(BASE_STAT_KEYS, weights);
+  return rng.weighted(pool, weights);
 }
 
 function findChar(team: Team, id: string): Character | null {
@@ -84,29 +172,147 @@ function skillTypeKo(type: 'active' | 'passive'): string {
   return type === 'active' ? '액티브' : '패시브';
 }
 
-// ───────────────────────── 선택지 가중치 ─────────────────────────
+function slotFull(c: Character, type: 'active' | 'passive'): boolean {
+  return countType(c, type) >= (type === 'active' ? MAX_ACTIVE_SKILLS : MAX_PASSIVE_SKILLS);
+}
+
+// ───────────────────────── 예상 전투력 상승치 ─────────────────────────
+
+function effectPower(team: Team, e: ChoiceEffect): number {
+  switch (e.kind) {
+    case 'stat':
+      return e.delta * W_STAT;
+    case 'stat_category': {
+      let n = 0;
+      for (const k of BASE_STAT_KEYS) if (STAT_CATEGORY[k] === e.category) n++;
+      return e.delta * n * W_STAT;
+    }
+    case 'adaptation': {
+      const n = e.charId === 'all' ? team.members.length : 1;
+      return e.delta * n * W_ADAPT;
+    }
+    case 'learn_skill': {
+      const c = findChar(team, e.charId);
+      if (!c) return W_SKILL;
+      if (c.skills.includes(e.skillId)) return 0;
+      // 슬롯이 가득 차 기존 스킬을 대체하면 순 이득이 줄어든다
+      return slotFull(c, getSkill(e.skillId).type) ? W_SKILL * 0.4 : W_SKILL;
+    }
+    case 'forget_skill':
+      return -W_SKILL;
+    case 'set_subjob': {
+      const sub = getSubJob(e.subJob);
+      let v = W_SUBJOB;
+      for (const k of BASE_STAT_KEYS) v += (sub.statBonus[k] ?? 0) * W_STAT;
+      v += sub.grantedSkills.length * W_SKILL;
+      return v;
+    }
+    case 'change_job': {
+      const c = findChar(team, e.charId);
+      if (!c) return 0;
+      let v = -statTotal(c) * (e.statLossPct / 100) * W_STAT;
+      const def = JOBS[e.mainJob];
+      const allowed = new Set<string>([...def.skillPool, ...def.starterSkills]);
+      let lost = 0;
+      for (const id of c.skills) if (!allowed.has(id)) lost++;
+      v -= lost * W_SKILL;
+      if (def.starterSkills.length > 0) v += W_SKILL;
+      if (c.subJob) v -= W_SUBJOB;
+      return v;
+    }
+    case 'add_synergy':
+      return W_SYNERGY;
+    case 'bonus_points':
+      return e.delta * W_POINT;
+  }
+}
+
+function sumPower(team: Team, effects: readonly ChoiceEffect[]): number {
+  let sum = 0;
+  for (const e of effects) sum += effectPower(team, e);
+  return sum;
+}
+
+/**
+ * 카드에 표시할 예상 전투력 상승치 (GDD §7.4.4).
+ * 가중치: 스탯 1 = 1, 스킬 = 25, 시너지 = 20, 직업 분화 = 35, 맵 적응 1 = 0.4.
+ * 도박형은 성공 확률로 가중한 기댓값을 돌려준다.
+ */
+export function estimatePowerDelta(team: Team, choice: Choice): number {
+  const win = sumPower(team, choice.effects);
+  if (choice.successChance === undefined) return Math.round(win);
+  const lose = sumPower(team, choice.failEffects ?? []);
+  const p = Math.max(0, Math.min(1, choice.successChance));
+  return Math.round(win * p + lose * (1 - p));
+}
+
+// ───────────────────────── 선택지 종류 가중치 ─────────────────────────
 
 const KINDS: readonly ChoiceKind[] = [
-  'big_single', 'small_multi', 'tradeoff', 'gamble', 'skill', 'job_change', 'adaptation', 'synergy', 'sacrifice',
+  'big_single', 'small_multi', 'tradeoff', 'gamble', 'skill', 'adaptation', 'synergy', 'sacrifice',
 ];
 
-function kindWeights(cycle: number): Record<ChoiceKind, number> {
-  if (cycle <= 3) {
-    return {
-      big_single: 18, small_multi: 22, tradeoff: 8, gamble: 8, skill: 18, subjob: 0,
-      job_change: cycle >= 3 ? 8 : 0, adaptation: 14, synergy: 6, sacrifice: 4,
-    };
+/**
+ * 희귀도별로 어울리는 종류.
+ * 'subjob'(항상 에픽)과 'job_change'(등급 예산 밖)는 여기 넣지 않고 별도 경로로 만든다.
+ */
+const RARITY_KINDS: Record<ChoiceRarity, readonly ChoiceKind[]> = {
+  common: ['big_single', 'small_multi', 'tradeoff', 'gamble', 'skill', 'adaptation', 'sacrifice'],
+  rare: ['big_single', 'small_multi', 'tradeoff', 'gamble', 'skill', 'adaptation', 'synergy', 'sacrifice'],
+  epic: ['big_single', 'small_multi', 'tradeoff', 'gamble', 'skill', 'adaptation', 'synergy', 'sacrifice'],
+  legendary: ['big_single', 'small_multi', 'tradeoff', 'gamble', 'skill', 'synergy', 'sacrifice'],
+};
+
+/**
+ * 직업 변경 카드가 한 세트에 낄 확률 (GDD §7.5 "낮은 확률 등장").
+ * 등급 롤과 무관한 별도 경로다. 3일차부터, 재분화 기회가 남는 마지막 날 전까지만 나온다.
+ */
+function jobChangeChance(day: number): number {
+  if (day < 3 || day >= TOTAL_DAYS) return 0;
+  return day <= 7 ? 0.09 : 0.07;
+}
+
+function dayKindWeight(day: number, kind: ChoiceKind): number {
+  if (day <= 3) {
+    switch (kind) {
+      case 'big_single': return 18;
+      case 'small_multi': return 22;
+      case 'tradeoff': return 8;
+      case 'gamble': return 8;
+      case 'skill': return 18;
+      case 'job_change': return day >= 3 ? 6 : 0;
+      case 'adaptation': return 14;
+      case 'synergy': return 6;
+      case 'sacrifice': return 4;
+      case 'subjob': return 0;
+    }
   }
-  if (cycle <= 6) {
-    return {
-      big_single: 18, small_multi: 14, tradeoff: 12, gamble: 12, skill: 14, subjob: 0,
-      job_change: 8, adaptation: 10, synergy: 10, sacrifice: 6,
-    };
+  if (day <= 7) {
+    switch (kind) {
+      case 'big_single': return 18;
+      case 'small_multi': return 14;
+      case 'tradeoff': return 12;
+      case 'gamble': return 12;
+      case 'skill': return 14;
+      case 'job_change': return 8;
+      case 'adaptation': return 10;
+      case 'synergy': return 10;
+      case 'sacrifice': return 6;
+      case 'subjob': return 0;
+    }
   }
-  return {
-    big_single: 22, small_multi: 8, tradeoff: 14, gamble: 16, skill: 10, subjob: 0,
-    job_change: 8, adaptation: 6, synergy: 16, sacrifice: 8,
-  };
+  switch (kind) {
+    case 'big_single': return 22;
+    case 'small_multi': return 8;
+    case 'tradeoff': return 14;
+    case 'gamble': return 16;
+    case 'skill': return 10;
+    case 'job_change': return 6;
+    case 'adaptation': return 6;
+    case 'synergy': return 16;
+    case 'sacrifice': return 8;
+    case 'subjob': return 0;
+  }
 }
 
 // ───────────────────────── 개별 선택지 생성 ─────────────────────────
@@ -115,143 +321,170 @@ interface Ctx {
   state: RunState;
   team: Team;
   rng: Rng;
-  cycle: number;
+  day: number;
   seq: number;
 }
 
 function makeId(ctx: Ctx, kind: ChoiceKind): string {
-  return `ch${ctx.cycle}_${ctx.state.choiceIndex}_${ctx.seq++}_${kind}`;
+  return `ch${ctx.day}_${ctx.state.step}r${ctx.state.rerolls}_${ctx.seq++}_${kind}`;
 }
 
-function buildBigSingle(ctx: Ctx): Choice {
+/** powerDelta 를 채워 완성한다 */
+function mk(ctx: Ctx, base: Omit<Choice, 'powerDelta'>): Choice {
+  const ch: Choice = { ...base, powerDelta: 0 };
+  ch.powerDelta = estimatePowerDelta(ctx.team, ch);
+  return ch;
+}
+
+function buildBigSingle(ctx: Ctx, rarity: ChoiceRarity): Choice {
   const { rng, team } = ctx;
+  const budget = budgetFor(rng, rarity);
   const c = rng.pick(team.members);
-  if (rng.chance(0.7)) {
-    const stat = pickStat(rng, c);
-    const delta = scaled(rng.int(12, 18), c, stat);
-    return {
-      id: makeId(ctx, 'big_single'), kind: 'big_single',
+  if (rng.chance(0.72)) {
+    const stat = pickStat(rng, c, Math.round(budget * 0.5));
+    return mk(ctx, {
+      id: makeId(ctx, 'big_single'), kind: 'big_single', rarity,
       title: `${CHOICE_KIND_NAME_KO.big_single}: ${c.name}의 ${statName(stat)}`,
-      desc: `${c.name}의 ${statName(stat)} ${fmt(delta)}.`,
+      desc: `${c.name}의 ${statName(stat)} ${fmt(budget)} (현재 ${c.stats[stat]}).`,
       charIds: [c.id],
-      effects: [{ kind: 'stat', charId: c.id, stat, delta }],
-    };
+      effects: [{ kind: 'stat', charId: c.id, stat, delta: budget }],
+    });
   }
   const category = rng.pick(CATEGORIES);
-  const delta = rng.int(6, 8);
-  return {
-    id: makeId(ctx, 'big_single'), kind: 'big_single',
+  let n = 0;
+  for (const k of BASE_STAT_KEYS) if (STAT_CATEGORY[k] === category) n++;
+  const delta = Math.max(1, Math.round(budget / n));
+  return mk(ctx, {
+    id: makeId(ctx, 'big_single'), kind: 'big_single', rarity,
     title: `${CHOICE_KIND_NAME_KO.big_single}: ${c.name}의 ${STAT_CATEGORY_NAME_KO[category]}`,
-    desc: `${c.name}의 ${STAT_CATEGORY_NAME_KO[category]} 카테고리 스탯 5개 각각 ${fmt(delta)}.`,
+    desc: `${c.name}의 ${STAT_CATEGORY_NAME_KO[category]} 카테고리 스탯 ${n}개 각각 ${fmt(delta)} (합계 ${fmt(delta * n)}).`,
     charIds: [c.id],
     effects: [{ kind: 'stat_category', charId: c.id, category, delta }],
-  };
+  });
 }
 
-function buildSmallMulti(ctx: Ctx): Choice {
+function buildSmallMulti(ctx: Ctx, rarity: ChoiceRarity): Choice {
   const { rng, team } = ctx;
-  const n = Math.min(team.members.length, rng.int(2, 3));
+  const budget = budgetFor(rng, rarity);
+  const want = rarity === 'legendary' ? rng.int(4, 5) : rarity === 'epic' ? rng.int(3, 4) : rng.int(2, 3);
+  const n = Math.max(1, Math.min(team.members.length, want));
   const chars = rng.sample(team.members, n);
   const stat = pickStat(rng, chars[0]);
+  const parts = splitBudget(budget, n);
   const effects: ChoiceEffect[] = [];
-  const parts: string[] = [];
-  for (const c of chars) {
-    const delta = scaled(rng.int(5, 7), c, stat);
-    effects.push({ kind: 'stat', charId: c.id, stat, delta });
-    parts.push(`${c.name} ${fmt(delta)}`);
+  const texts: string[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const delta = parts[i];
+    effects.push({ kind: 'stat', charId: chars[i].id, stat, delta });
+    texts.push(`${chars[i].name} ${fmt(delta)}`);
   }
-  return {
-    id: makeId(ctx, 'small_multi'), kind: 'small_multi',
-    title: `${CHOICE_KIND_NAME_KO.small_multi}: ${statName(stat)}`,
-    desc: `${statName(stat)} 훈련 — ${parts.join(', ')}.`,
+  return mk(ctx, {
+    id: makeId(ctx, 'small_multi'), kind: 'small_multi', rarity,
+    title: `${CHOICE_KIND_NAME_KO.small_multi}: ${statName(stat)} ${n}인`,
+    desc: `${statName(stat)} 합동 훈련 — ${texts.join(', ')}. (합계 ${fmt(budget)})`,
     charIds: chars.map((c) => c.id),
     effects,
-  };
+  });
 }
 
-function buildTradeoff(ctx: Ctx): Choice | null {
+function buildTradeoff(ctx: Ctx, rarity: ChoiceRarity): Choice | null {
   const { rng, team } = ctx;
-  if (team.members.length < 4) return null;
-  const picked = rng.sample(team.members, 4);
-  const gainers = picked.slice(0, 3);
-  const loser = picked[3];
+  if (team.members.length < 3) return null;
+  const budget = budgetFor(rng, rarity);
+  const gainTotal = Math.round(budget * RISK_MULT);
+  const gainerCount = Math.min(team.members.length - 1, 3);
+  const picked = rng.sample(team.members, gainerCount + 1);
+  const gainers = picked.slice(0, gainerCount);
+  const loser = picked[gainerCount];
+  const parts = splitBudget(gainTotal, gainerCount);
   const effects: ChoiceEffect[] = [];
-  const parts: string[] = [];
-  for (const c of gainers) {
-    const stat = pickStat(rng, c);
-    const delta = scaled(8, c, stat);
-    effects.push({ kind: 'stat', charId: c.id, stat, delta });
-    parts.push(`${c.name} ${statName(stat)} ${fmt(delta)}`);
+  const texts: string[] = [];
+  for (let i = 0; i < gainers.length; i++) {
+    const c = gainers[i];
+    const stat = pickStat(rng, c, parts[i]);
+    effects.push({ kind: 'stat', charId: c.id, stat, delta: parts[i] });
+    texts.push(`${c.name} ${statName(stat)} ${fmt(parts[i])}`);
   }
   const lossStat = rng.pick(BASE_STAT_KEYS);
-  const loss = -6;
+  const loss = -Math.max(2, Math.round(budget * 0.4));
   effects.push({ kind: 'stat', charId: loser.id, stat: lossStat, delta: loss });
-  return {
-    id: makeId(ctx, 'tradeoff'), kind: 'tradeoff',
+  return mk(ctx, {
+    id: makeId(ctx, 'tradeoff'), kind: 'tradeoff', rarity,
     title: `${CHOICE_KIND_NAME_KO.tradeoff}: ${loser.name}${iGa(loser.name)} 양보`,
-    desc: `${parts.join(', ')}. 대신 ${loser.name}의 ${statName(lossStat)} ${fmt(loss)}.`,
+    desc: `${texts.join(', ')}. 대신 ${loser.name}의 ${statName(lossStat)} ${fmt(loss)}.`,
     charIds: picked.map((c) => c.id),
     effects,
-  };
+  });
 }
 
-function buildGamble(ctx: Ctx): Choice {
+function buildGamble(ctx: Ctx, rarity: ChoiceRarity): Choice {
   const { rng, team } = ctx;
+  const budget = budgetFor(rng, rarity);
   const c = rng.pick(team.members);
-  const stat = pickStat(rng, c);
-  const pct = rng.int(55, 75);
-  const gain = scaled(rng.int(18, 25), c, stat);
-  const loss = -rng.int(5, 8);
-  return {
-    id: makeId(ctx, 'gamble'), kind: 'gamble',
-    title: `${CHOICE_KIND_NAME_KO.gamble}: ${c.name}의 ${statName(stat)} (${pct}%)`,
-    desc: `${pct}% 확률로 ${c.name}의 ${statName(stat)} ${fmt(gain)}. 실패 시 ${statName(stat)} ${fmt(loss)}.`,
+  const gain = Math.round(budget * RISK_MULT);
+  const stat = pickStat(rng, c, Math.round(gain * 0.5));
+  const pct = rng.int(60, 80);
+  const loss = -Math.max(2, Math.round(budget * 0.3));
+  return mk(ctx, {
+    id: makeId(ctx, 'gamble'), kind: 'gamble', rarity,
+    title: `${CHOICE_KIND_NAME_KO.gamble}: ${c.name}의 ${statName(stat)} (성공률 ${pct}%)`,
+    desc: `${pct}% 확률로 ${c.name}의 ${statName(stat)} ${fmt(gain)}. 실패 시 ${statName(stat)} ${fmt(loss)}. (현재 ${c.stats[stat]})`,
     charIds: [c.id],
     effects: [{ kind: 'stat', charId: c.id, stat, delta: gain }],
     successChance: pct / 100,
     failEffects: [{ kind: 'stat', charId: c.id, stat, delta: loss }],
-  };
+  });
 }
 
-function buildSkill(ctx: Ctx): Choice | null {
+/** 스킬 카드의 등급은 스킬 가격 구간으로 정한다 (GDD §7.4.2) */
+function buildSkill(ctx: Ctx, rarity: ChoiceRarity): Choice | null {
   const { rng, team } = ctx;
-  const candidates: { c: Character; pool: string[] }[] = [];
+  const [lo, hi] = SKILL_COST_BAND[rarity];
+  const cands: { c: Character; skillId: string }[] = [];
   for (const c of team.members) {
-    const pool = skillPoolFor(c);
-    if (pool.length > 0) candidates.push({ c, pool });
+    for (const id of skillPoolFor(c)) {
+      const cost = getSkill(id).cost;
+      if (cost >= lo && cost <= hi) cands.push({ c, skillId: id });
+    }
   }
-  if (candidates.length === 0) return null;
-  const { c, pool } = rng.pick(candidates);
-  const skillId = rng.pick(pool);
+  if (cands.length === 0) return null;
+  const { c, skillId } = rng.pick(cands);
   const def = getSkill(skillId);
-  const max = def.type === 'active' ? MAX_ACTIVE_SKILLS : MAX_PASSIVE_SKILLS;
   let note = '';
-  if (countType(c, def.type) >= max) {
+  if (slotFull(c, def.type)) {
     const old = oldestOfType(c, def.type);
     if (old) note = ` (${skillTypeKo(def.type)} 슬롯이 가득 차 [${getSkill(old).name}]${eulReul(getSkill(old).name)} 잊습니다)`;
   }
-  return {
-    id: makeId(ctx, 'skill'), kind: 'skill',
+  return mk(ctx, {
+    id: makeId(ctx, 'skill'), kind: 'skill', rarity,
     title: `${CHOICE_KIND_NAME_KO.skill}: [${def.name}]`,
     desc: `${c.name}${iGa(c.name)} ${skillTypeKo(def.type)} 스킬 [${def.name}]${eulReul(def.name)} 습득합니다${note}. ${def.desc}`,
     charIds: [c.id],
     effects: [{ kind: 'learn_skill', charId: c.id, skillId }],
-  };
+  });
 }
 
+/**
+ * 직업 변경 카드. 희귀도 예산(총 스탯 상승량) 체계 밖의 특수 카드다.
+ * 스탯을 잃는 대신 직업을 갈아엎는 선택이라 예상 전투력이 음수인 것이 정상이므로,
+ * 카드 색이 값을 과장하지 않도록 등급은 실제 powerDelta 구간(rarityForPowerDelta)으로 정한다.
+ * 스탯 손실은 GDD §7.5 의 -10% 를 그대로 쓴다.
+ */
+const JOB_CHANGE_STAT_LOSS_PCT = 10;
+
 function buildJobChange(ctx: Ctx): Choice | null {
-  const { rng, team, cycle } = ctx;
-  if (cycle < 3) return null;
-  // 육성의 마지막 선택(10사이클 3번째)에서는 재분화 기회가 없으므로 직업 변경을 내지 않는다
-  if (cycle >= TOTAL_CYCLES && ctx.state.choiceIndex >= CHOICES_PER_CYCLE - 1) return null;
+  const { rng, team, day } = ctx;
+  if (day < 3) return null;
+  // 마지막 날은 재분화 기회가 없으므로 직업 변경을 내지 않는다
+  if (day >= TOTAL_DAYS) return null;
   const c = rng.pick(team.members);
   const others = MAIN_JOBS.filter((j) => j !== c.mainJob);
   const newJob = rng.pick(others);
-  const statLossPct = 10;
+  const statLossPct = JOB_CHANGE_STAT_LOSS_PCT;
   const starter = JOBS[newJob].starterSkills;
   const starterName = starter.length > 0 ? getSkill(starter[hashSeed(c.id) % starter.length]).name : null;
-  return {
-    id: makeId(ctx, 'job_change'), kind: 'job_change',
+  const ch = mk(ctx, {
+    id: makeId(ctx, 'job_change'), kind: 'job_change', rarity: 'common',
     title: `${CHOICE_KIND_NAME_KO.job_change}: ${c.name} → ${JOB_NAME_KO[newJob]}`,
     desc:
       `${c.name}${eulReul(c.name)} ${JOB_NAME_KO[c.mainJob]}에서 ${JOB_NAME_KO[newJob]}${euro(JOB_NAME_KO[newJob])} 변경합니다. ` +
@@ -259,38 +492,44 @@ function buildJobChange(ctx: Ctx): Choice | null {
       (starterName ? `, 시작 스킬 [${starterName}] 습득.` : '.'),
     charIds: [c.id],
     effects: [{ kind: 'change_job', charId: c.id, mainJob: newJob, statLossPct }],
-  };
+  });
+  ch.rarity = rarityForPowerDelta(ch.powerDelta);
+  return ch;
 }
 
-function buildAdaptation(ctx: Ctx): Choice {
+function buildAdaptation(ctx: Ctx, rarity: ChoiceRarity): Choice {
   const { rng, team } = ctx;
+  const budget = budgetFor(rng, rarity);
+  const teamWide = budget >= 20 || rng.chance(0.5);
   const map = rng.pick(MAP_TYPES);
-  if (rng.chance(0.5)) {
-    const delta = 8;
-    return {
-      id: makeId(ctx, 'adaptation'), kind: 'adaptation',
+  if (teamWide) {
+    const n = Math.max(1, team.members.length);
+    const delta = Math.max(3, Math.min(25, Math.round(budget / (W_ADAPT * n))));
+    return mk(ctx, {
+      id: makeId(ctx, 'adaptation'), kind: 'adaptation', rarity,
       title: `${CHOICE_KIND_NAME_KO.adaptation}: 팀 전체 ${MAP_NAME_KO[map]}`,
-      desc: `팀 전체의 ${MAP_NAME_KO[map]} 적응도 ${fmt(delta)}.`,
+      desc: `팀 ${n}명 전원의 ${MAP_NAME_KO[map]} 적응도 ${fmt(delta)}.`,
       charIds: team.members.map((c) => c.id),
       effects: [{ kind: 'adaptation', charId: 'all', map, delta }],
-    };
+    });
   }
   const c = rng.pick(team.members);
-  const delta = 15;
-  return {
-    id: makeId(ctx, 'adaptation'), kind: 'adaptation',
+  const delta = Math.max(5, Math.min(30, Math.round(budget / W_ADAPT)));
+  return mk(ctx, {
+    id: makeId(ctx, 'adaptation'), kind: 'adaptation', rarity,
     title: `${CHOICE_KIND_NAME_KO.adaptation}: ${c.name}의 ${MAP_NAME_KO[map]}`,
     desc: `${c.name}의 ${MAP_NAME_KO[map]} 적응도 ${fmt(delta)} (현재 ${c.adaptation[map]}).`,
     charIds: [c.id],
     effects: [{ kind: 'adaptation', charId: c.id, map, delta }],
-  };
+  });
 }
 
-function buildSynergy(ctx: Ctx): Choice | null {
+function buildSynergy(ctx: Ctx, rarity: ChoiceRarity): Choice | null {
   const { rng, team } = ctx;
   const cands = generateSynergyCandidates(team, rng, 1);
   if (cands.length === 0) return null;
   const syn = cands[0];
+  const budget = budgetFor(rng, rarity);
   const charIds: string[] = [];
   if (syn.condition.kind === 'adjacency') charIds.push(syn.condition.a, syn.condition.b);
   else if (syn.condition.kind === 'job_count') {
@@ -298,60 +537,112 @@ function buildSynergy(ctx: Ctx): Choice | null {
   } else {
     for (const c of team.members) charIds.push(c.id);
   }
-  return {
-    id: makeId(ctx, 'synergy'), kind: 'synergy',
+  if (charIds.length === 0) for (const c of team.members) charIds.push(c.id);
+
+  const effects: ChoiceEffect[] = [{ kind: 'add_synergy', synergy: syn }];
+  // 시너지 자체는 20 상당. 남는 예산은 관련 캐릭터 스탯으로 채운다.
+  const extra = budget - W_SYNERGY;
+  let extraText = '';
+  if (extra >= 4) {
+    const targets: Character[] = [];
+    for (const id of charIds) {
+      const c = findChar(team, id);
+      if (c && !targets.includes(c)) targets.push(c);
+    }
+    const parts = splitBudget(extra, targets.length);
+    const texts: string[] = [];
+    for (let i = 0; i < targets.length; i++) {
+      const stat = pickStat(rng, targets[i], parts[i]);
+      effects.push({ kind: 'stat', charId: targets[i].id, stat, delta: parts[i] });
+      texts.push(`${targets[i].name} ${statName(stat)} ${fmt(parts[i])}`);
+    }
+    extraText = ` 추가로 ${texts.join(', ')}.`;
+  }
+  return mk(ctx, {
+    id: makeId(ctx, 'synergy'), kind: 'synergy', rarity,
     title: `${CHOICE_KIND_NAME_KO.synergy}: ${syn.name}`,
-    desc: `시너지 [${syn.name}] 획득. ${syn.desc}`,
+    desc: `시너지 [${syn.name}] 획득. ${syn.desc}${extraText}`,
     charIds,
-    effects: [{ kind: 'add_synergy', synergy: syn }],
-  };
+    effects,
+  });
 }
 
-function buildSacrifice(ctx: Ctx): Choice {
+function buildSacrifice(ctx: Ctx, rarity: ChoiceRarity): Choice {
   const { rng, team } = ctx;
+  const budget = budgetFor(rng, rarity);
   const c = rng.pick(team.members);
   const effects: ChoiceEffect[] = [];
-  let costText: string;
   const charIds = [c.id];
+  let costText: string;
+  let costValue: number;
 
-  if (c.skills.length > 0 && rng.chance(0.5)) {
+  if (c.skills.length > 1 && rng.chance(0.5)) {
     const skillId = rng.pick(c.skills);
     const sname = getSkill(skillId).name;
     effects.push({ kind: 'forget_skill', charId: c.id, skillId });
     costText = `${c.name}${iGa(c.name)} 스킬 [${sname}]${eulReul(sname)} 포기`;
+    costValue = W_SKILL;
   } else {
     const category = rng.pick(CATEGORIES);
-    const delta = -10;
+    let n = 0;
+    for (const k of BASE_STAT_KEYS) if (STAT_CATEGORY[k] === category) n++;
+    const delta = -Math.max(2, Math.round(budget / 10));
     effects.push({ kind: 'stat_category', charId: c.id, category, delta });
-    costText = `${c.name}의 ${STAT_CATEGORY_NAME_KO[category]} 카테고리 스탯 5개 각각 ${fmt(delta)}`;
+    costText = `${c.name}의 ${STAT_CATEGORY_NAME_KO[category]} 카테고리 스탯 ${n}개 각각 ${fmt(delta)}`;
+    costValue = -delta * n;
   }
 
-  let rewardText: string;
   const others = team.members.filter((m) => m.id !== c.id);
-  if (others.length > 0 && rng.chance(0.6)) {
-    const stat = rng.pick(BASE_STAT_KEYS);
-    const delta = 5;
-    for (const o of others) {
-      effects.push({ kind: 'stat', charId: o.id, stat, delta });
-      charIds.push(o.id);
+  const reward = budget + costValue;
+  let rewardText: string;
+  if (others.length > 0 && rng.chance(0.65)) {
+    const stat = pickStat(rng, others[0]);
+    const parts = splitBudget(reward, others.length);
+    const texts: string[] = [];
+    for (let i = 0; i < others.length; i++) {
+      effects.push({ kind: 'stat', charId: others[i].id, stat, delta: parts[i] });
+      charIds.push(others[i].id);
+      texts.push(`${others[i].name} ${fmt(parts[i])}`);
     }
-    rewardText = `나머지 팀원 ${others.length}명의 ${statName(stat)} ${fmt(delta)}`;
+    rewardText = `나머지 팀원 ${others.length}명의 ${statName(stat)} 상승 (${texts.join(', ')})`;
   } else {
-    const delta = 60;
-    effects.push({ kind: 'bonus_points', delta });
-    rewardText = `보너스 포인트 ${fmt(delta)}`;
+    // 포인트 환산은 W_POINT 기준이지만, 한 장으로 하루 벌이를 넘지 않도록 상한을 둔다.
+    // 상한 때문에 포기한 대가를 다 갚지 못하는 몫(leftover)은 스탯으로 돌려준다.
+    // (그러지 않으면 예산이 큰 에픽·전설 희생 카드의 예상 전투력이 음수가 된다)
+    const points = Math.max(20, Math.min(SACRIFICE_MAX_POINTS, Math.round(reward / W_POINT / 10) * 10));
+    effects.push({ kind: 'bonus_points', delta: points });
+    rewardText = `보너스 포인트 ${fmt(points)}`;
+    const leftover = Math.round(reward - points * W_POINT);
+    if (leftover >= 4 && others.length > 0) {
+      const stat = pickStat(rng, others[0]);
+      const parts = splitBudget(leftover, others.length);
+      const texts: string[] = [];
+      for (let i = 0; i < others.length; i++) {
+        effects.push({ kind: 'stat', charId: others[i].id, stat, delta: parts[i] });
+        charIds.push(others[i].id);
+        texts.push(`${others[i].name} ${fmt(parts[i])}`);
+      }
+      rewardText += `, 나머지 팀원 ${others.length}명의 ${statName(stat)} 상승 (${texts.join(', ')})`;
+    }
   }
 
-  return {
-    id: makeId(ctx, 'sacrifice'), kind: 'sacrifice',
+  return mk(ctx, {
+    id: makeId(ctx, 'sacrifice'), kind: 'sacrifice', rarity,
     title: `${CHOICE_KIND_NAME_KO.sacrifice}: ${c.name}의 결단`,
     desc: `${costText}하는 대신 ${rewardText}.`,
     charIds,
     effects,
-  };
+  });
 }
 
-function buildSubJob(ctx: Ctx, c: Character, sub: SubJobDef): Choice {
+/** 직업 분화 카드의 기준 등급. GDD §7.4.2 "직업 분화는 항상 에픽으로 본다" */
+const SUBJOB_RARITY: ChoiceRarity = 'epic';
+
+/**
+ * 직업 분화 카드는 항상 에픽으로 본다 (GDD §7.4.2).
+ * 단 rarityFloor 가 에픽보다 높으면(예: 전설 보장) 보장 계약을 깨지 않도록 그 등급으로 올린다.
+ */
+function buildSubJob(ctx: Ctx, c: Character, sub: SubJobDef, rarity: ChoiceRarity = SUBJOB_RARITY): Choice {
   const bonusParts: string[] = [];
   for (const k of BASE_STAT_KEYS) {
     const v = sub.statBonus[k];
@@ -362,26 +653,27 @@ function buildSubJob(ctx: Ctx, c: Character, sub: SubJobDef): Choice {
     `${c.name}${eulReul(c.name)} ${JOB_NAME_KO[c.mainJob]} → ${sub.name}${euro(sub.name)} 분화합니다. ${sub.desc}` +
     (bonusParts.length ? ` 스탯 보정: ${bonusParts.join(', ')}.` : '') +
     (skillNames.length ? ` 습득 스킬: ${skillNames.join(', ')}.` : '');
-  return {
-    id: makeId(ctx, 'subjob'), kind: 'subjob',
+  return mk(ctx, {
+    id: makeId(ctx, 'subjob'), kind: 'subjob', rarity,
     title: `${CHOICE_KIND_NAME_KO.subjob}: ${sub.name}`,
     desc,
     charIds: [c.id],
     effects: [{ kind: 'set_subjob', charId: c.id, subJob: sub.id }],
-  };
+  });
 }
 
-function build(ctx: Ctx, kind: ChoiceKind): Choice | null {
+function build(ctx: Ctx, kind: ChoiceKind, rarity: ChoiceRarity): Choice | null {
   switch (kind) {
-    case 'big_single': return buildBigSingle(ctx);
-    case 'small_multi': return buildSmallMulti(ctx);
-    case 'tradeoff': return buildTradeoff(ctx);
-    case 'gamble': return buildGamble(ctx);
-    case 'skill': return buildSkill(ctx);
-    case 'job_change': return buildJobChange(ctx);
-    case 'adaptation': return buildAdaptation(ctx);
-    case 'synergy': return buildSynergy(ctx);
-    case 'sacrifice': return buildSacrifice(ctx);
+    case 'big_single': return buildBigSingle(ctx, rarity);
+    case 'small_multi': return buildSmallMulti(ctx, rarity);
+    case 'tradeoff': return buildTradeoff(ctx, rarity);
+    case 'gamble': return buildGamble(ctx, rarity);
+    case 'skill': return buildSkill(ctx, rarity);
+    case 'adaptation': return buildAdaptation(ctx, rarity);
+    case 'synergy': return buildSynergy(ctx, rarity);
+    case 'sacrifice': return buildSacrifice(ctx, rarity);
+    // 등급 롤 밖의 카드들 (별도 경로에서 만든다)
+    case 'job_change': return null;
     case 'subjob': return null;
   }
 }
@@ -390,11 +682,11 @@ function signature(ch: Choice): string {
   return `${ch.kind}|${JSON.stringify(ch.effects)}|${JSON.stringify(ch.failEffects ?? null)}`;
 }
 
-/** 이번 생성에서 분화 선택지를 받아야 할 캐릭터 (예정 사이클이 현재 사이클 이하이고 아직 미분화) */
+/** 이번 생성에서 분화 선택지를 받아야 할 캐릭터 (예정 일차가 지났고 아직 미분화) */
 function scheduledSubJobChar(state: RunState, team: Team): Character | null {
   for (const c of team.members) {
-    const due = state.subJobChoiceCycle[c.id];
-    if (due !== undefined && due <= state.cycle && c.subJob === null && JOBS[c.mainJob].subJobs.length > 0) return c;
+    const due = state.subJobChoiceDay[c.id];
+    if (due !== undefined && due <= state.day && c.subJob === null && JOBS[c.mainJob].subJobs.length > 0) return c;
   }
   return null;
 }
@@ -402,59 +694,101 @@ function scheduledSubJobChar(state: RunState, team: Team): Character | null {
 // ───────────────────────── 공개 API ─────────────────────────
 
 /**
- * 정확히 CHOICES_PER_CYCLE 개의 서로 다른 선택지를 만든다.
- * 분화 예정 캐릭터가 있으면 그 캐릭터의 세부 직업 3종이 각각 하나의 선택지가 된다.
+ * 정확히 CHOICES_PER_SET 장의 서로 다른 선택지를 만든다.
+ *
+ * 1) 분화 예정 캐릭터가 있으면 그 캐릭터의 세부 직업 3종이 그대로 3장이 된다
+ *    (기준 에픽. rarityFloor 가 더 높으면 그 등급으로 올려 보장을 지킨다).
+ * 2) 아니면 낮은 확률로 '직업 변경' 특수 카드 1장을 먼저 깔고(등급 예산 밖),
+ *    남은 칸은 카드별 희귀도를 먼저 뽑고(일차별 가중치), state.rarityFloor 가 있으면 최소 1장을 그 등급 이상으로 올린 뒤,
+ *    각 희귀도에 맞는 크기로 효과를 만든다. 같은 세트에 같은 종류·같은 내용의 카드는 넣지 않는다.
+ *
+ * rarityFloor 는 여기서 지우지 않는다 (리롤해도 보장이 유지되도록). run.ts 의 pickChoice 가 소비한다.
  */
 export function generateChoices(state: RunState, rng: Rng): Choice[] {
   const team = state.team;
   if (!team) throw new Error('팀이 없는 상태에서는 선택지를 만들 수 없습니다.');
-  const ctx: Ctx = { state, team, rng, cycle: state.cycle, seq: 0 };
+  const ctx: Ctx = { state, team, rng, day: state.day, seq: 0 };
 
   const due = scheduledSubJobChar(state, team);
   if (due) {
+    // 분화 카드도 rarityFloor 보장을 지켜야 한다. 기준 등급(에픽)이 보장 등급보다 낮으면 그 등급으로 올린다.
+    const floor = state.rarityFloor;
+    const rarity: ChoiceRarity =
+      floor && CHOICE_RARITY_RANK[floor] > CHOICE_RARITY_RANK[SUBJOB_RARITY] ? floor : SUBJOB_RARITY;
     const subs = JOBS[due.mainJob].subJobs;
     const out: Choice[] = [];
-    for (let i = 0; i < subs.length && out.length < CHOICES_PER_CYCLE; i++) out.push(buildSubJob(ctx, due, subs[i]));
-    // 세부 직업이 3개 미만인 예외 상황: 나머지는 일반 선택지로 채운다
-    fillGeneral(ctx, out);
+    for (let i = 0; i < subs.length && out.length < CHOICES_PER_SET; i++) out.push(buildSubJob(ctx, due, subs[i], rarity));
+    if (out.length < CHOICES_PER_SET) fillGeneral(ctx, out); // 세부 직업이 3개 미만인 예외 상황
     return out;
   }
 
   const out: Choice[] = [];
+  // 직업 변경은 등급 예산 밖의 특수 카드라 희귀도 롤이 아니라 별도 확률로 낸다 (세트당 최대 1장).
+  if (rng.chance(jobChangeChance(state.day))) {
+    const jc = buildJobChange(ctx);
+    if (jc) out.push(jc);
+  }
   fillGeneral(ctx, out);
   return out;
 }
 
-function fillGeneral(ctx: Ctx, out: Choice[]): void {
-  const weights = kindWeights(ctx.cycle);
-  const usedKinds = new Set<ChoiceKind>();
-  const sigs = new Set<string>(out.map(signature));
-  let guard = 0;
-  while (out.length < CHOICES_PER_CYCLE && guard++ < 60) {
-    const avail = KINDS.filter((k) => weights[k] > 0 && !usedKinds.has(k));
-    if (avail.length === 0) break;
-    const kind = ctx.rng.weighted(avail, avail.map((k) => weights[k]));
-    usedKinds.add(kind);
-    const ch = build(ctx, kind);
-    if (!ch) continue;
-    const sig = signature(ch);
-    if (sigs.has(sig)) continue;
-    sigs.add(sig);
-    out.push(ch);
+/** 희귀도 3장을 뽑고 rarityFloor 보장을 적용한다 */
+function rollRaritySet(ctx: Ctx, count: number): ChoiceRarity[] {
+  const rarities: ChoiceRarity[] = [];
+  for (let i = 0; i < count; i++) rarities.push(rollRarity(ctx.rng, ctx.day));
+  const floor = ctx.state.rarityFloor;
+  if (floor) {
+    const need = CHOICE_RARITY_RANK[floor];
+    let best = 0;
+    for (let i = 1; i < rarities.length; i++) {
+      if (CHOICE_RARITY_RANK[rarities[i]] > CHOICE_RARITY_RANK[rarities[best]]) best = i;
+    }
+    if (CHOICE_RARITY_RANK[rarities[best]] < need) rarities[best] = floor;
   }
-  // 예비: 종류가 모자라면 집중 훈련으로 채우되 내용이 겹치지 않게 한다
-  let fallback = 0;
-  while (out.length < CHOICES_PER_CYCLE && fallback++ < 100) {
-    const ch = buildBigSingle(ctx);
-    const sig = signature(ch);
-    if (sigs.has(sig)) continue;
-    sigs.add(sig);
-    out.push(ch);
+  return rarities;
+}
+
+function fillGeneral(ctx: Ctx, out: Choice[]): void {
+  const need = CHOICES_PER_SET - out.length;
+  if (need <= 0) return;
+  const rarities = rollRaritySet(ctx, need);
+  const usedKinds = new Set<ChoiceKind>(out.map((c) => c.kind));
+  const sigs = new Set<string>(out.map(signature));
+
+  for (let i = 0; i < need; i++) {
+    const rarity = rarities[i];
+    const allowed = RARITY_KINDS[rarity];
+    let made: Choice | null = null;
+    let guard = 0;
+    const tried = new Set<ChoiceKind>();
+    while (!made && guard++ < 24) {
+      const avail = KINDS.filter(
+        (k) => allowed.includes(k) && !usedKinds.has(k) && !tried.has(k) && dayKindWeight(ctx.day, k) > 0,
+      );
+      if (avail.length === 0) break;
+      const kind = ctx.rng.weighted(avail, avail.map((k) => dayKindWeight(ctx.day, k)));
+      tried.add(kind);
+      const ch = build(ctx, kind, rarity);
+      if (!ch) continue;
+      if (sigs.has(signature(ch))) continue;
+      made = ch;
+    }
+    // 예비: 집중 훈련은 항상 만들 수 있다 (내용이 겹치면 다시 뽑는다)
+    let fallback = 0;
+    while (!made && fallback++ < 40) {
+      const ch = buildBigSingle(ctx, rarity);
+      if (sigs.has(signature(ch))) continue;
+      made = ch;
+    }
+    if (!made) made = buildBigSingle(ctx, rarity);
+    usedKinds.add(made.kind);
+    sigs.add(signature(made));
+    out.push(made);
   }
 }
 
 /**
- * 선택지 적용. 도박형은 rng.chance(successChance) 로 성공 여부 결정.
+ * 선택지 적용. 도박형은 rng.chance(successChance) 로 성공 여부를 정한다.
  * bonus_points 효과는 state.bonusPoints 에 반영한다. 분화 선택지는 예정 목록에서 제거한다.
  */
 export function applyChoice(state: RunState, choice: Choice, rng: Rng): { success: boolean | null; applied: ChoiceEffect[] } {
@@ -476,7 +810,7 @@ export function applyChoice(state: RunState, choice: Choice, rng: Rng): { succes
   }
 
   if (choice.kind === 'subjob') {
-    for (const id of choice.charIds) delete state.subJobChoiceCycle[id];
+    for (const id of choice.charIds) delete state.subJobChoiceDay[id];
   }
   return { success, applied };
 }
@@ -517,7 +851,7 @@ function changeJob(c: Character, newJob: MainJob, statLossPct: number): void {
   }
 }
 
-/** 효과 1개를 팀에 적용한다. bonus_points 는 팀 정보만으로는 처리할 수 없으므로 여기서는 무시 (applyChoice 가 처리). */
+/** 효과 1개를 팀에 적용한다. bonus_points 는 팀 정보만으로 처리할 수 없으므로 여기서는 무시 (applyChoice 가 처리). */
 export function applyEffect(team: Team, e: ChoiceEffect): void {
   switch (e.kind) {
     case 'stat': {
@@ -576,4 +910,9 @@ export function applyEffect(team: Team, e: ChoiceEffect): void {
 export function choiceMap(ch: Choice): MapType | null {
   for (const e of ch.effects) if (e.kind === 'adaptation') return e.map;
   return null;
+}
+
+/** 표시용: 희귀도 한국어 이름 */
+export function rarityName(r: ChoiceRarity): string {
+  return CHOICE_RARITY_NAME_KO[r];
 }

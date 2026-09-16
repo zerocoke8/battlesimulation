@@ -2,12 +2,43 @@
  * 전투 관전 캔버스 렌더러 (FM 모바일 스타일).
  * 시뮬레이션 프레임(BattleFrame)만 받아서 그린다. 시뮬레이션 상태를 바꾸지 않는다.
  */
-import type { BattleEvent, BattleFrame, MapDef, StatusKind, TeamSide, UnitSnapshot } from '../core/types';
-import { JOB_GLYPH, skillName } from './format';
+import type { BattleEvent, BattleFrame, BattleInput, MapDef, MonsterTier, StatusKind, Team, TeamSide, UnitSnapshot } from '../core/types';
+import { JOB_GLYPH, MONSTER_GLYPH, skillName } from './format';
+
+/** 고정 순회 순서 */
+const SIDES: readonly TeamSide[] = ['A', 'B'];
 
 const TEAM_COLOR: Record<TeamSide, string> = { A: '#4f8cff', B: '#ff5a5a' };
 const TEAM_COLOR_LIGHT: Record<TeamSide, string> = { A: '#a7c4ff', B: '#ffb0b0' };
 const TEAM_COLOR_DARK: Record<TeamSide, string> = { A: '#1f3f80', B: '#802626' };
+
+/** 몬스터 본체 색: 짙은 자주 → 검붉은색 (난이도가 올라갈수록 붉어진다) */
+const MONSTER_COLOR: Record<MonsterTier, string> = { low: '#5f2a52', mid: '#75203f', high: '#8a1622' };
+/** 몬스터 외곽선 색 */
+const MONSTER_EDGE: Record<MonsterTier, string> = { low: '#c98fd0', mid: '#ef6f92', high: '#ffb347' };
+/** 난이도별 반경 배율 (보스는 여기에 BOSS_RADIUS_MULT 를 더 곱한다) */
+const MONSTER_RADIUS_MULT: Record<MonsterTier, number> = { low: 0.95, mid: 1.05, high: 1.15 };
+const BOSS_RADIUS_MULT = 1.45;
+
+/** 몬스터 렌더링 정보: 캐릭터 id → 난이도 */
+export type MonsterTierMap = Record<string, MonsterTier>;
+
+/** 팀 목록에서 몬스터 유닛(Character.monster)의 난이도 맵을 만든다 */
+export function monsterTiersOfTeams(teams: readonly (Team | null | undefined)[]): MonsterTierMap {
+  const out: MonsterTierMap = {};
+  for (const t of teams) {
+    if (!t) continue;
+    for (const c of t.members) {
+      if (c.monster) out[c.id] = c.monster.tier;
+    }
+  }
+  return out;
+}
+
+/** 전투 입력에서 몬스터 난이도 맵을 만든다 */
+export function monsterTiersOfInput(input: BattleInput): MonsterTierMap {
+  return monsterTiersOfTeams([input.teamA, input.teamB]);
+}
 
 const STATUS_DOT: Partial<Record<StatusKind, string>> = {
   stun: '#ffd54a',
@@ -42,12 +73,44 @@ export class BattleRenderer {
   private floats: FloatText[] = [];
   private lastTick = -1;
   private summonIds = new Set<string>();
+  /** 팀별 보스(몬스터 중 최대 HP) 유닛 id. 첫 draw 에서 한 번 계산한다 */
+  private bossIds: Set<string> | null = null;
 
-  constructor(private readonly canvas: HTMLCanvasElement, private readonly map: MapDef) {
+  /**
+   * @param monsters 캐릭터 id → 몬스터 난이도. 몬스터 전투에서만 채워 넣는다.
+   *                 (UnitSnapshot 에는 몬스터 정보가 없으므로 밖에서 알려준다)
+   */
+  constructor(
+    private readonly canvas: HTMLCanvasElement,
+    private readonly map: MapDef,
+    private readonly monsters: MonsterTierMap = {},
+  ) {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Canvas 2D 컨텍스트를 만들 수 없습니다.');
     this.ctx = ctx;
     this.ensureSize();
+  }
+
+  /** 이 유닛이 몬스터면 난이도, 아니면 null */
+  private tierOf(u: UnitSnapshot): MonsterTier | null {
+    if (u.job === 'summon') return null;
+    return this.monsters[u.id] ?? null;
+  }
+
+  /** 각 팀에서 최대 HP 를 가진 몬스터를 보스로 본다 */
+  private ensureBosses(frame: BattleFrame): void {
+    if (this.bossIds) return;
+    const ids = new Set<string>();
+    for (const side of SIDES) {
+      let best: UnitSnapshot | null = null;
+      for (const u of frame.units) {
+        if (u.side !== side) continue;
+        if (!this.tierOf(u)) continue;
+        if (!best || u.maxHp > best.maxHp) best = u;
+      }
+      if (best) ids.add(best.id);
+    }
+    this.bossIds = ids;
   }
 
   /** 컨테이너 폭에 맞춰 내부 해상도를 40:30 비율로 맞춘다 */
@@ -76,6 +139,8 @@ export class BattleRenderer {
       byId.set(u.id, u);
       if (u.job === 'summon') this.summonIds.add(u.id);
     }
+
+    this.ensureBosses(frame);
 
     if (frame.tick !== this.lastTick) {
       this.ingestEvents(frame.events, byId, frame.timeSec);
@@ -317,14 +382,24 @@ export class BattleRenderer {
 
   // ───────────── 유닛 ─────────────
 
+  /** 유닛 반경 (맵 단위 × s). 몬스터는 난이도/보스 여부에 따라 커진다 */
+  private radiusOf(u: UnitSnapshot, s: number): number {
+    if (u.job === 'summon') return 0.55 * s;
+    const tier = this.tierOf(u);
+    if (!tier) return 0.9 * s;
+    const boss = this.bossIds?.has(u.id) ? BOSS_RADIUS_MULT : 1;
+    return 0.9 * s * MONSTER_RADIUS_MULT[tier] * boss;
+  }
+
   private drawDead(u: UnitSnapshot, s: number): void {
     const ctx = this.ctx;
     const x = u.x * s;
     const y = u.y * s;
-    const r = (u.job === 'summon' ? 0.55 : 0.9) * s;
+    const r = this.radiusOf(u, s);
+    const tier = this.tierOf(u);
     ctx.save();
     ctx.globalAlpha = 0.3;
-    ctx.strokeStyle = TEAM_COLOR[u.side];
+    ctx.strokeStyle = tier ? MONSTER_EDGE[tier] : TEAM_COLOR[u.side];
     ctx.lineWidth = Math.max(1.5, s * 0.18);
     ctx.beginPath();
     ctx.moveTo(x - r * 0.7, y - r * 0.7);
@@ -345,9 +420,11 @@ export class BattleRenderer {
   private drawUnit(u: UnitSnapshot, s: number, frame: BattleFrame, byId: Map<string, UnitSnapshot>): void {
     const ctx = this.ctx;
     const isSummon = u.job === 'summon';
+    const tier = this.tierOf(u);
+    const isBoss = tier !== null && !!this.bossIds?.has(u.id);
     const x = u.x * s;
     const y = u.y * s;
-    const r = (isSummon ? 0.55 : 0.9) * s;
+    const r = this.radiusOf(u, s);
 
     const stealthed = u.statuses.some((st) => st.kind === 'stealth');
     const shield = u.statuses.find((st) => st.kind === 'shield');
@@ -371,14 +448,34 @@ export class BattleRenderer {
       }
     }
 
+    // 보스 후광 (몬스터 팀에서 가장 HP 가 높은 개체)
+    if (isBoss && tier) {
+      ctx.beginPath();
+      ctx.arc(x, y, r + s * 0.4, 0, Math.PI * 2);
+      ctx.fillStyle = hexToRgba(MONSTER_EDGE[tier], 0.14);
+      ctx.fill();
+    }
+
     // 본체
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fillStyle = isSummon ? TEAM_COLOR_LIGHT[u.side] : TEAM_COLOR[u.side];
+    ctx.fillStyle = tier ? MONSTER_COLOR[tier] : isSummon ? TEAM_COLOR_LIGHT[u.side] : TEAM_COLOR[u.side];
     ctx.fill();
-    ctx.lineWidth = Math.max(1, s * 0.12);
-    ctx.strokeStyle = frozen ? '#5ee7ff' : stunned ? '#ffd54a' : 'rgba(0,0,0,0.45)';
+    ctx.lineWidth = Math.max(1, s * (tier ? 0.16 : 0.12));
+    ctx.strokeStyle = frozen ? '#5ee7ff' : stunned ? '#ffd54a' : tier ? MONSTER_EDGE[tier] : 'rgba(0,0,0,0.45)';
     ctx.stroke();
+
+    // 보스 표시: 바깥 점선 링
+    if (isBoss && tier) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.setLineDash([s * 0.3, s * 0.25]);
+      ctx.arc(x, y, r + s * 0.3, 0, Math.PI * 2);
+      ctx.strokeStyle = MONSTER_EDGE[tier];
+      ctx.lineWidth = Math.max(1, s * 0.1);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     // 방향 표시
     ctx.beginPath();
@@ -406,16 +503,16 @@ export class BattleRenderer {
       ctx.stroke();
     }
 
-    // 직업 글리프
-    const glyph = u.job === 'summon' ? '·' : JOB_GLYPH[u.job] ?? '?';
-    ctx.fillStyle = '#ffffff';
+    // 직업(또는 몬스터) 글리프
+    const glyph = tier ? MONSTER_GLYPH[tier] : u.job === 'summon' ? '·' : JOB_GLYPH[u.job] ?? '?';
+    ctx.fillStyle = tier ? '#ffe3ef' : '#ffffff';
     ctx.font = `bold ${Math.max(9, r * 1.05)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(glyph, x, y + (isSummon ? 0 : r * 0.02));
 
     // HP 바
-    const barW = (isSummon ? 1.6 : 2.4) * s;
+    const barW = (isSummon ? 1.6 : isBoss ? 3.2 : 2.4) * s;
     const barH = Math.max(2, s * 0.28);
     const bx = x - barW / 2;
     const by = y - r - barH - s * 0.25;

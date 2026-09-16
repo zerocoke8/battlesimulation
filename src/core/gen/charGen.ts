@@ -4,11 +4,11 @@
  */
 import { Rng } from '../rng';
 import type { Adaptation, BaseStatKey, Character, MainJob, MapType, StatBlock, Team } from '../types';
-import { BASE_STAT_KEYS, MAIN_JOBS, MAP_TYPES, MAX_ACTIVE_SKILLS, MAX_PASSIVE_SKILLS } from '../types';
+import { BASE_STAT_KEYS, MAIN_JOBS, MAP_TYPES, MAX_ACTIVE_SKILLS, MAX_PASSIVE_SKILLS, STAT_MAX, STAT_MIN } from '../types';
 import { JOBS } from '../data/jobs';
 import { getSkill, skillPoolFor } from '../data/skills';
 import { autoSynergies } from '../data/synergies';
-import { clampStat, statTotal } from '../stats';
+import { clampStat, powerRating, statTotal } from '../stats';
 import { applyEffect } from '../growth/choices';
 
 // ───────────────────────── 이름 ─────────────────────────
@@ -53,7 +53,7 @@ export function computeRarity(c: Character): number {
 
 /**
  * powerLevel 1 일 때 캐릭터 1명에게 더해지는 총 스탯 성장량. 성장 계수 비율로 20개 스탯에 분배된다
- * (평균 +7.5/스탯, 성장 계수 1.5 스탯은 약 +11). 10사이클 육성을 잘 마친 플레이어 팀(+130~160/캐릭터)과 맞춘 값.
+ * (평균 +7.5/스탯, 성장 계수 1.5 스탯은 약 +11). 10일 육성을 잘 마친 플레이어 팀(+130~160/캐릭터)과 맞춘 값.
  * 밸런싱 시 이 값만 조정하면 상대팀 강도가 바뀐다.
  */
 export const GROWTH_BUDGET_AT_MAX = 150;
@@ -162,17 +162,85 @@ function learnRandomFromPool(rng: Rng, c: Character): boolean {
 }
 
 /**
- * 사이클 수에 맞게 스케일링된 상대팀.
- * - powerLevel = (cycle-1)/9
- * - cycle ≥ 3: 탱커 또는 힐러 1명 이상. 같은 직업 최대 2명.
- * - cycle ≥ 6: 전원 세부 직업 분화 (statBonus + grantedSkills)
- * - floor(cycle/4) 개의 추가 스킬, 맵 적응도 소폭 훈련, 자동 시너지
+ * 일차별 5:5 상대팀 목표 전투력 (teamPower 척도 = 스탯 합 + 스킬 수 × 30). 인덱스 0 이 1일차.
+ *
+ * 보정 기준: `npm run headless -- --growth --policy greedy` 로 측정한 표준 성장 플레이어의 일차별 전투력
+ * (1일차 4693 → 10일차 6110) 대비 1~5일차는 약 1.02배, 6~10일차는 약 0.965배.
+ * 6일차에 상대가 전원 분화하는데, 분화는 전투력 '점수'보다 실전 값어치가 커서 그 구간부터 점수 목표를
+ * 한 단계 낮춰야 승률이 평평해진다 (그래서 5일차 목표가 6일차보다 높다).
+ * 실측 승률(시드 1~32, 탐욕 정책, 320판): 일차별 44~56%, 전체 50.6%.
+ * 이 표만 고치면 상대 강도 곡선 전체가 바뀐다.
  */
-export function generateOpponentTeam(rng: Rng, cycle: number, map: MapType, idPrefix: string): Team {
-  const powerLevel = Math.max(0, Math.min(1, (cycle - 1) / 9));
+export const OPPONENT_POWER_BY_DAY: readonly number[] = [
+  4702, // 1일차 (첫날은 양쪽 다 갓 만든 팀이라 동급)
+  4963, // 2일차
+  5120, // 3일차
+  5305, // 4일차
+  5525, // 5일차
+  5365, // 6일차 — 여기서 상대가 전원 세부 직업으로 분화한다. 분화는 점수보다 실전 값어치가 커서
+  5490, // 7일차    같은 승률을 유지하려면 점수 목표를 오히려 한 단계 낮춰야 한다 (5일차 > 6일차)
+  5633, // 8일차
+  5767, // 9일차
+  5900, // 10일차
+];
+
+/** 일차별 상대팀 목표 전투력. 표 밖의 일차는 양 끝 기울기로 선형 외삽한다 */
+export function opponentPowerTarget(day: number): number {
+  const t = OPPONENT_POWER_BY_DAY;
+  const last = t.length - 1;
+  const d = day !== day ? 1 : day;
+  if (d <= 1) return t[0] + (t[1] - t[0]) * (d - 1);
+  // d === t.length 는 마지막 일차 그 자체다 (외삽 아님)
+  if (d >= t.length) return t[last] + (t[last] - t[last - 1]) * (d - t.length);
+  const i = Math.floor(d) - 1;
+  const frac = d - Math.floor(d);
+  return frac === 0 ? t[i] : t[i] + (t[i + 1] - t[i]) * frac;
+}
+
+/**
+ * 팀 전투력이 목표치가 되도록 스탯을 가감한다.
+ * 분배는 성장 계수 비율(generateCharacter 와 같은 규칙)을 따르고, 스탯 상한(1~100)에 걸려 남은 몫은
+ * 여유가 있는 스탯에 다시 돌린다. 순회는 members / BASE_STAT_KEYS 고정 순서.
+ */
+function fitTeamPower(team: Team, target: number): void {
+  const members = team.members;
+  if (members.length === 0) return;
+  for (let pass = 0; pass < 4; pass++) {
+    const diff = target - teamPower(team);
+    if (Math.abs(diff) < members.length) return;
+    const per = diff / members.length;
+    for (let i = 0; i < members.length; i++) {
+      const c = members[i];
+      const def = JOBS[c.mainJob];
+      let wSum = 0;
+      for (const k of BASE_STAT_KEYS) {
+        const room = per >= 0 ? STAT_MAX - c.stats[k] : c.stats[k] - STAT_MIN;
+        if (room > 0) wSum += (def.growth[k] ?? 1) * (c.growthVariance[k] ?? 1);
+      }
+      if (wSum <= 0) continue;
+      for (const k of BASE_STAT_KEYS) {
+        const room = per >= 0 ? STAT_MAX - c.stats[k] : c.stats[k] - STAT_MIN;
+        if (room <= 0) continue;
+        const w = (def.growth[k] ?? 1) * (c.growthVariance[k] ?? 1);
+        c.stats[k] = clampStat(c.stats[k] + (per * w) / wSum);
+      }
+    }
+  }
+}
+
+/**
+ * 일차에 맞게 스케일링된 5:5 상대팀 (GDD §7.6 1단계).
+ * - day ≥ 3: 탱커 또는 힐러 1명 이상. 같은 직업 최대 2명.
+ * - day ≥ 6: 전원 세부 직업 분화 (statBonus + grantedSkills)
+ * - floor(day/4) 개의 추가 스킬, 맵 적응도 소폭 훈련, 자동 시너지
+ * - 마지막에 fitTeamPower 로 팀 전투력을 opponentPowerTarget(day) 에 맞춘다.
+ *   (스킬·분화로 얻은 전투력만큼 스탯이 줄어드므로, 강도 곡선은 위 표 하나로 결정된다)
+ */
+export function generateOpponentTeam(rng: Rng, day: number, map: MapType, idPrefix: string): Team {
+  const powerLevel = Math.max(0, Math.min(1, (day - 1) / 9));
 
   const jobs: MainJob[] = [];
-  if (cycle >= 3) jobs.push(rng.pick(['tank', 'healer'] as const));
+  if (day >= 3) jobs.push(rng.pick(['tank', 'healer'] as const));
   let guard = 0;
   while (jobs.length < 5 && guard++ < 200) {
     const j = rng.pick(MAIN_JOBS);
@@ -198,8 +266,8 @@ export function generateOpponentTeam(rng: Rng, cycle: number, map: MapType, idPr
     }
   }
 
-  // 세부 직업 분화 (cycle ≥ 6)
-  if (cycle >= 6) {
+  // 세부 직업 분화 (day ≥ 6)
+  if (day >= 6) {
     for (const c of members) {
       const subs = JOBS[c.mainJob].subJobs;
       if (subs.length === 0) continue;
@@ -208,17 +276,35 @@ export function generateOpponentTeam(rng: Rng, cycle: number, map: MapType, idPr
     }
   }
 
-  // 추가 스킬 구매 (cycle/4: 10사이클 상대는 +2개. 폭딜 성장을 완만하게 해 후반 전투가 초반보다 길어지도록)
-  const extra = Math.floor(cycle / 4);
+  // 추가 스킬 구매 (day/4: 10일차 상대는 +2개. 폭딜 성장을 완만하게 해 후반 전투가 초반보다 길어지도록)
+  const extra = Math.floor(day / 4);
   for (const c of members) {
     for (let k = 0; k < extra; k++) {
       if (!learnRandomFromPool(rng, c)) break;
     }
   }
 
+  // 팀 전투력을 일차 목표치에 맞춘다 (스킬·분화로 오른 만큼 스탯이 줄어든다)
+  fitTeamPower(team, opponentPowerTarget(day));
+
   // 성장으로 인한 등급 갱신 (표시용)
   for (const c of members) c.rarity = computeRarity(c);
 
   team.synergies = autoSynergies(team);
   return team;
+}
+
+// ───────────────────────── 팀 전투력 ─────────────────────────
+
+/**
+ * 팀 전투력 요약값 = 멤버 powerRating(스탯 합 + 스킬 수 × 30) 의 단순 합.
+ * 진행 HUD 표시와 몬스터 강도 스케일링의 공통 기준이다. 순회 순서는 members 배열 순서로 고정.
+ * 몬스터처럼 derivedMult 를 가진 유닛의 실제 강도는 여기에 반영되지 않는다
+ * (몬스터 쪽 보정은 data/monsters.ts 의 monsterTeamPower 가 담당한다).
+ */
+export function teamPower(team: Team): number {
+  let sum = 0;
+  const members = team.members;
+  for (let i = 0; i < members.length; i++) sum += powerRating(members[i]);
+  return sum;
 }
