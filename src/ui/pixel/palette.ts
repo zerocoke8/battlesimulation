@@ -7,7 +7,7 @@
  *  - 마법 계열별 이펙트 색
  * 순수 함수·상수만 있고 DOM 을 쓰지 않는다 (self-check 를 node 에서 돌릴 수 있게).
  */
-import type { MagicSchool, MainJob, SubJobId } from '../../core/types';
+import type { MagicSchool, MainJob, SubJobId, TeamSide } from '../../core/types';
 
 export type RGB = readonly [number, number, number];
 
@@ -122,6 +122,31 @@ export const STONE = '#8f8a80';
 export const STONE_DARK = '#5f5a52';
 export const STONE_LIGHT = '#b8b2a6';
 export const SHADOW_PURPLE = '#2b1740';
+
+// ───────────────────────── 진영 색 (v0.8, 도트 모드 전용) ─────────────────────────
+
+/**
+ * 진영 색. 도트 모드에서 HP 바를 체력 비율이 아니라 진영으로 칠하고, 직업 썸네일의 테두리로도 쓴다.
+ * A = 플레이어(파랑), B = 상대(빨강). 간단 모드는 이 색을 쓰지 않는다 (기존 초록/노랑/빨강 유지).
+ */
+export const SIDE_COLOR: Record<TeamSide, string> = { A: '#3d8bff', B: '#ff4d4d' };
+
+/**
+ * 진영 색 HP 바 아래에 붙는 MP 바 색. 기본 파랑(#6fa8ff)은 A 진영 파랑과 색상(hue)이 사실상 같아
+ * 두 바가 한 덩어리로 보이므로, 색상이 확실히 다른 보라를 쓴다 (간단 모드는 기존 파랑 유지).
+ */
+export const SIDE_MP_COLOR = '#b388ff';
+
+/** 진영 색의 어두운 변형. 직업 썸네일 바탕 (= 글리프 외곽선) 색 */
+export const SIDE_COLOR_DARK: Record<TeamSide, string> = {
+  A: shade(SIDE_COLOR.A, -0.42),
+  B: shade(SIDE_COLOR.B, -0.42),
+};
+
+/** 직업 썸네일 색 묶음: 바탕 = 어두운 진영색, 테두리 = 진영색, 글리프 = 흰색 */
+export const ICON_BG_COLOR: Record<TeamSide, string> = SIDE_COLOR_DARK;
+export const ICON_BORDER_COLOR: Record<TeamSide, string> = SIDE_COLOR;
+export const ICON_FG_COLOR = '#f2f6ff';
 
 // ───────────────────────── 직업 기본 색 ─────────────────────────
 

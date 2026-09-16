@@ -28,6 +28,8 @@ import type {
 } from '../core/types';
 import { MAP_MARGIN_UNITS } from '../core/types';
 import { JOB_GLYPH, MONSTER_GLYPH, fmtRate, isZoneSkillId, skillName, zoneLabel } from './format';
+// 진영 색은 팔레트 한 곳에서만 정의한다 (palette.ts 는 순수 상수·함수 모듈이라 순환 참조가 없다)
+import { SIDE_COLOR } from './pixel/palette';
 
 // ───────────────────────── 공통 인터페이스 ─────────────────────────
 
@@ -46,7 +48,11 @@ export interface IBattleRenderer {
 /** 고정 순회 순서 */
 export const SIDES: readonly TeamSide[] = ['A', 'B'];
 
-export const TEAM_COLOR: Record<TeamSide, string> = { A: '#4f8cff', B: '#ff5a5a' };
+/**
+ * 진영 색. 정의는 `pixel/palette.ts` 의 `SIDE_COLOR` 한 곳뿐이다 (v0.8 수정: 예전에는 거의 같은 색을
+ * 두 곳에서 따로 정의해 같은 프레임 안에서 발밑 마커·영역과 HP 바·썸네일의 진영 색이 미세하게 달랐다).
+ */
+export const TEAM_COLOR: Record<TeamSide, string> = SIDE_COLOR;
 export const TEAM_COLOR_LIGHT: Record<TeamSide, string> = { A: '#a7c4ff', B: '#ffb0b0' };
 export const TEAM_COLOR_DARK: Record<TeamSide, string> = { A: '#1f3f80', B: '#802626' };
 
@@ -513,6 +519,16 @@ export interface UnitBarsOpts {
   /** 0 이면 붕괴 전. 0 보다 크면 붉은 테두리 깜빡임 */
   attritionPct: number;
   now: number;
+  /**
+   * (v0.8) HP 바 색을 고정한다. 주면 체력 비율과 무관하게 이 색으로 칠하고 길이만 줄어든다 (도트 모드의 진영 색).
+   * 없으면 기존대로 비율에 따라 초록/노랑/빨강 (간단 모드).
+   */
+  hpColor?: string;
+  /**
+   * (v0.8) MP 바 색. 진영 색 HP 바를 쓰면 기본 파랑(#6fa8ff)이 A 진영 파랑과 색상이 같아 두 바가 한 덩어리로
+   * 보이므로, 도트 모드는 색상이 다른 색을 넘긴다. 없으면 기존 파랑.
+   */
+  mpColor?: string;
 }
 
 /**
@@ -527,7 +543,7 @@ export function drawUnitBars(ctx: CanvasRenderingContext2D, o: UnitBarsOpts): { 
   const ratio = u.maxHp > 0 ? Math.max(0, Math.min(1, u.hp / u.maxHp)) : 0;
   ctx.fillStyle = 'rgba(0,0,0,0.6)';
   ctx.fillRect(bx, by, barW, barH);
-  ctx.fillStyle = ratio > 0.5 ? '#5bd66b' : ratio > 0.25 ? '#ffc247' : '#ff5252';
+  ctx.fillStyle = o.hpColor ?? (ratio > 0.5 ? '#5bd66b' : ratio > 0.25 ? '#ffc247' : '#ff5252');
   ctx.fillRect(bx, by, barW * ratio, barH);
   let shieldH = 0;
   if (shield && u.maxHp > 0) {
@@ -541,16 +557,25 @@ export function drawUnitBars(ctx: CanvasRenderingContext2D, o: UnitBarsOpts): { 
     const mh = Math.max(1, barH * 0.4);
     ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.fillRect(bx, by + barH, barW, mh);
-    ctx.fillStyle = '#6fa8ff';
+    ctx.fillStyle = o.mpColor ?? '#6fa8ff';
     ctx.fillRect(bx, by + barH, barW * Math.max(0, Math.min(1, u.mp / u.maxMp)), mh);
     bottom += mh;
   }
-  // 전장 붕괴: 붉은 테두리 깜빡임
+  // 전장 붕괴: 테두리 깜빡임.
+  // 진영 색 HP 바(도트 모드)일 때는 B 진영 빨강과 붉은 테두리가 겹쳐 신호가 사라지므로,
+  // 색을 경고 노랑으로 바꾸고 선을 바 바깥쪽에만 그린다 (간단 모드는 예전 그대로 붉은 테두리).
   if (o.attritionPct > 0) {
     const a = 0.35 + 0.65 * attritionPulse(o.now);
-    ctx.strokeStyle = `rgba(255,70,70,${a.toFixed(3)})`;
-    ctx.lineWidth = Math.max(1, barH * 0.35);
-    ctx.strokeRect(bx - 0.5, by - shieldH - 0.5, barW + 1, bottom - by + shieldH + 1);
+    const lw = Math.max(1, barH * 0.35);
+    ctx.lineWidth = lw;
+    if (o.hpColor) {
+      ctx.strokeStyle = `rgba(255,214,64,${a.toFixed(3)})`;
+      const off = lw / 2 + 0.5;
+      ctx.strokeRect(bx - off, by - shieldH - off, barW + off * 2, bottom - by + shieldH + off * 2);
+    } else {
+      ctx.strokeStyle = `rgba(255,70,70,${a.toFixed(3)})`;
+      ctx.strokeRect(bx - 0.5, by - shieldH - 0.5, barW + 1, bottom - by + shieldH + 1);
+    }
   }
   return { dotsY: by - shieldH, bottom };
 }

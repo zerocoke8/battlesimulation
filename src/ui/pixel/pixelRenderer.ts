@@ -64,7 +64,8 @@ import {
   type SpriteMeta,
   type SpriteSheet,
 } from './spriteTypes';
-import { BLIZZARD_COLORS, tintForSubJob } from './palette';
+import { BLIZZARD_COLORS, SIDE_COLOR, SIDE_MP_COLOR, tintForSubJob } from './palette';
+import { drawJobIcon } from './icons';
 import { buildTerrain, createCanvas, ctx2d, hashNoise, makeDitherPattern, type TerrainLayer } from './terrain';
 import { EffectSystem } from './effects';
 
@@ -123,6 +124,25 @@ const FOG_COLOR = 'rgba(4,8,22,0.62)';
 /** 정수 배율로 내렸을 때 원래 배율의 이 비율 이상이면 정수 배율을 쓴다 (그 이하면 소수 배율 최근접 보간) */
 export const INTEGER_SNAP_MIN = 0.9;
 
+/**
+ * (v0.8) 좌우 반전 최소 유지 시간 (시뮬레이션 초). 타겟이 좌우로 흔들려도 스프라이트가 덜덜 떨지 않게,
+ * 마지막 반전 뒤 이 시간이 지나기 전에는 반전을 바꾸지 않는다.
+ */
+export const FLIP_HOLD_SEC = 0.3;
+
+/** (v0.8) 직업 썸네일: HP 바 높이 배수 · 최소 크기 · 바와의 간격(px) */
+const ICON_BAR_MULT = 1.9;
+const ICON_MIN_PX = 9;
+const ICON_BAR_MULT_DENSE = 1.6;
+const ICON_MIN_PX_DENSE = 8;
+const ICON_GAP_PX = 2;
+/**
+ * 밀집 프레임에서 '썸네일이 붙는 유닛'(= 살아있는 캐릭터. 몬스터·소환물은 애초에 썸네일이 없다)이
+ * 이 수 이상이면 썸네일을 생략한다. 몬스터까지 세면 몬스터가 많은 밀집 전투에서 항상 이 수를 넘겨
+ * 밀집 분기가 영영 실행되지 않는다 (v0.8 수정).
+ */
+const ICON_DENSE_SKIP_UNITS = 8;
+
 interface UnitAnimState {
   anim: AnimName;
   startSec: number;
@@ -133,6 +153,9 @@ interface UnitAnimState {
   deathSec: number;
   lastAttackSec: number;
   lastHitSec: number;
+  /** 현재 좌우 반전 상태 (true = 왼쪽을 본다) 와 마지막으로 바뀐 시각 */
+  flip: boolean;
+  lastFlipSec: number;
 }
 
 function newState(u: UnitSnapshot, now: number): UnitAnimState {
@@ -146,6 +169,8 @@ function newState(u: UnitSnapshot, now: number): UnitAnimState {
     deathSec: u.alive ? 0 : now - 100,
     lastAttackSec: -100,
     lastHitSec: -100,
+    flip: Math.cos(u.facing) < 0,
+    lastFlipSec: now - FLIP_HOLD_SEC,
   };
 }
 
@@ -226,6 +251,8 @@ export class PixelRenderer implements IBattleRenderer {
   private readonly states = new Map<string, UnitAnimState>();
   private bossIds: Set<string> | null = null;
   private dense = false;
+  /** 이 프레임에서 직업 썸네일을 그릴지 (밀집 + 유닛 과다면 생략) */
+  private icons = true;
   private lastTick = -1;
   private lastFrame: BattleFrame | null = null;
 
@@ -374,6 +401,14 @@ export class PixelRenderer implements IBattleRenderer {
 
     if (!this.bossIds) this.bossIds = findBossIds(frame, this.monsters);
     this.dense = isDenseFrame(frame);
+    // 썸네일 생략 판정은 실제로 썸네일이 붙는 유닛(살아있는 캐릭터)만 센다.
+    // 죽은 유닛·몬스터·소환물까지 세면 밀집 전투에서는 언제나 한도를 넘어 썸네일이 통째로 사라진다.
+    let iconUnits = 0;
+    for (const u of frame.units) {
+      if (!u.alive || u.job === 'summon' || this.tierOf(u) !== null) continue;
+      iconUnits += 1;
+    }
+    this.icons = !this.dense || iconUnits < ICON_DENSE_SKIP_UNITS;
 
     if (frame.tick !== this.lastTick) {
       this.overlay.ingest(frame.events, byId);
@@ -501,6 +536,14 @@ export class PixelRenderer implements IBattleRenderer {
         desired = 'idle';
       }
       st.wasAlive = u.alive;
+
+      // 좌우 반전: FLIP_HOLD_SEC 이 지나야 바뀐다 (덜덜 떨림 방지)
+      const wantFlip = Math.cos(u.facing) < 0;
+      if (wantFlip !== st.flip && now - st.lastFlipSec >= FLIP_HOLD_SEC) {
+        st.flip = wantFlip;
+        st.lastFlipSec = now;
+      }
+
       if (desired !== st.anim) {
         st.anim = desired;
         st.startSec = start;
@@ -582,7 +625,7 @@ export class PixelRenderer implements IBattleRenderer {
     const sxImg = col * fw;
     const syImg = def.row * fh;
     const m = this.sizeMult(u) * this.overlay.pulseOf(u.id, now);
-    const flip = Math.cos(u.facing) < 0;
+    const flip = st.flip;
 
     const stealthed = u.statuses.some((s) => s.kind === 'stealth');
     const frozen = u.statuses.some((s) => s.kind === 'freeze');
@@ -844,7 +887,18 @@ export class PixelRenderer implements IBattleRenderer {
     const barTop = this.barTopOf(u, px, barH);
     const bars = drawUnitBars(s, {
       cx: x, top: barTop, barW, barH, u, showMp: !isSummon, attritionPct: frame.attritionPctPerSec ?? 0, now: frame.timeSec,
+      hpColor: SIDE_COLOR[u.side], mpColor: SIDE_MP_COLOR,
     });
+
+    // 직업 썸네일 (HP 바 왼쪽 바깥). 캐릭터만 — 소환물·몬스터는 없다
+    if (this.icons && !isSummon && tier === null && u.job !== 'summon') {
+      const iconPx = this.dense
+        ? Math.max(ICON_MIN_PX_DENSE, Math.round(barH * ICON_BAR_MULT_DENSE))
+        : Math.max(ICON_MIN_PX, Math.round(barH * ICON_BAR_MULT));
+      const ix = x - barW / 2 - ICON_GAP_PX - iconPx;
+      const iy = barTop + barH / 2 - iconPx / 2;
+      drawJobIcon(s, u.job, ix, iy, iconPx, u.side);
+    }
 
     // 시전 진행 바 (노랑, MP 바 아래)
     if (u.casting) {

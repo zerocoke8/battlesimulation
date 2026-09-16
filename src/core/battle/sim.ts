@@ -75,14 +75,48 @@ const RETREAT_COOLDOWN_SEC = 8;
 const MAX_RESULT_EVENTS = 5000;
 const HEALER_BACK_DIST = 4;
 const HEALER_FLEE_DIST = 3;
+/** 힐러 도주 해제 거리 (이력현상). 이만큼 벌어져야 도주를 끝낸다 — 경계에서 앞뒤로 떠는 것을 막는다 */
+const HEALER_FLEE_STOP_DIST = 4.5;
 const TEAMWORK_DRIFT_DIST = 8;
-const KITE_RATIO = 0.4;
+// 협동 드리프트도 임계가 하나면 켜졌다 꺼졌다 하며 왕복한다. 시작 8, 종료 5.5 로 벌려 두고 Unit.drifting 으로 기억한다.
+const TEAMWORK_DRIFT_STOP_DIST = 5.5;
 const RANGE_SLACK = 0.5;
 const FREEZE_DAMAGE_MULT = 1.25;
 const SUMMON_DEF_COEF = 0.5;
 const INTERRUPT_COOLDOWN_SEC = 1;
 const ASSASSIN_BACKLINE_SLACK = 2; // 암살자가 후방 딜러를 우선하는 거리 여유 (가장 가까운 적보다 이만큼 멀어도 허용)
+/** 은신 중 암살자는 후방 딜러를 무조건 우선한다 (점수 보너스로 표현) */
+const ASSASSIN_STEALTH_BONUS = 1000;
 const CAPTURE_EVENT_TICKS = TICK_RATE; // 점령 진행 이벤트 간격 (1초)
+
+// 접근/카이팅 이력현상 (v0.8 [B]2). 사거리 대비 비율.
+// 시작 임계와 종료 임계를 벌려 두고 Unit.moveMode 로 상태를 기억한다 (상태가 없으면 이력현상이 성립하지 않는다).
+const APPROACH_START_RATIO = 0.9; // 이보다 멀면 접근 시작
+const APPROACH_STOP_RATIO = 0.75; // 접근은 여기까지 붙어야 끝난다
+const KITE_START_RATIO = 0.35; // 이보다 가까우면 카이팅 시작 (원거리 행동군만)
+const KITE_STOP_RATIO = 0.5; // 카이팅은 여기까지 벌어져야 끝난다
+/** 타겟 고정 (v0.8 [B]3): 새 후보 점수가 현재 타겟보다 이 비율 이상 좋아야 교체한다 */
+const TARGET_SWITCH_MARGIN = 0.15;
+
+// 후퇴·카이팅 방향 보정 (v0.8 [C]). 구석에 박히지 않게 아군 쪽으로 물러나고 벽을 타고 미끄러진다.
+// 아군 당김은 거리에 비례한다: 무게중심에서 멀수록 강해져 '적이 아군과 나 사이에 선' 상황에서도
+// 방향을 아군 쪽으로 돌릴 수 있고, 이미 아군 사이(ALLY_PULL_MIN_DIST 안)면 아예 당기지 않는다
+// (무게중심 위에 서 있으면 한 걸음마다 당김의 부호가 뒤집혀 그 자리에서 떤다).
+const ALLY_PULL_WEIGHT = 1.6; // 아군 무게중심 방향 기본 가중치
+const ALLY_PULL_FULL_DIST = 3; // 무게중심이 이 거리면 가중치 100%
+const ALLY_PULL_MIN_SCALE = 0.5; // 가까워도 이 배수 밑으로는 줄이지 않는다
+const ALLY_PULL_MAX = 1.5; // 거리 비례 상한 배수
+const ALLY_PULL_MIN_DIST = 0.6; // 무게중심이 이보다 가까우면 당기지 않는다 (방향이 의미 없다)
+const WALL_AVOID_DIST = 5; // 경계에서 이 거리 안이면 안쪽으로 미는 힘이 생긴다
+const WALL_PUSH_WEIGHT = 1.2; // 벽 밀어내기 가중치
+const WALL_SLIDE_DIST = 1.5; // 경계에서 이 거리 안이고 바깥 성분이 있으면 접선으로 투영한다
+// 조향력 저역통과 (v0.8 수정). 벽 밀어내기와 도망 방향이 균형을 이루는 지점에서 매 틱 전속력으로
+// 앞뒤로 튀는 것을 막는다: 힘 벡터를 이전 틱과 섞고, 이동 거리를 힘의 크기에 비례시킨다.
+const STEER_SMOOTH = 0.5; // 이전 틱 조향력을 남기는 비율
+const STEER_DEADBAND = 0.35; // 섞은 힘이 이보다 작으면 이번 틱은 움직이지 않는다
+// 힐러 기준 아군(anchor) 고정 (v0.8 수정). 새 후보가 이만큼 더 가깝지 않으면 지금 anchor 를 유지한다.
+// (거의 같은 거리의 아군 둘 사이에서 anchor 가 매 틱 바뀌면 목표점이 반대편으로 튀어 힐러가 떤다)
+const ANCHOR_SWITCH_DIST = 1.5;
 
 // 광역 회피 (GDD §4.4)
 const DODGE_SPEED_MULT = 1.15; // 회피 이동 속도 배율
@@ -196,6 +230,21 @@ interface Unit {
   attackTimer: number;
   targetIdx: number;
   retargetTick: number;
+  /**
+   * 접근/카이팅 이력현상 상태 (v0.8 [B]2). 임계값 두 개(시작/종료)를 오가는 대신 상태를 기억해
+   * 사거리 경계에서 앞뒤로 떠는 것을 막는다. 타겟이 바뀌면 'idle' 로 초기화한다.
+   */
+  moveMode: 'idle' | 'approach' | 'kite';
+  /** 협동 드리프트 진행 중인지 (이력현상용) */
+  drifting: boolean;
+  /**
+   * 직전 틱의 조향력(후퇴·카이팅 전용, 정규화 전 벡터). 저역통과에 쓴다 — 벽 밀어내기와 도망 방향이
+   * 상쇄되는 지점에서 매 틱 방향이 뒤집히며 전속력으로 왕복하는 진동을 막는다. 조향하지 않은 틱에는 0 으로 돌린다.
+   */
+  steerX: number;
+  steerY: number;
+  /** 힐러가 뒤에 설 기준 아군 인덱스 (v0.8 수정: 매 틱 바뀌지 않게 고정). 없으면 -1 */
+  anchorIdx: number;
   retreatUntil: number;
   retreatReadyAt: number;
   summonExpire: number;
@@ -223,6 +272,15 @@ interface Unit {
   focus: number;
 
   stats: UnitBattleStats;
+}
+
+/** 타겟 평가 기준 (updateTarget 이 한 번 만들어 pickTarget·targetScore 가 함께 쓴다) */
+interface TargetCtx {
+  mode: 'nearest' | 'assassin' | 'judge';
+  /** judge: 적 팀 최대 공격력 (0 나눗셈 방지로 최소 1) */
+  maxDanger: number;
+  /** assassin: 시전자가 은신 중인가 */
+  stealth: boolean;
 }
 
 interface TeamRuntime {
@@ -766,6 +824,11 @@ class Battle implements BattleSimulator {
       attackTimer: 0,
       targetIdx: -1,
       retargetTick: 0,
+      moveMode: 'idle',
+      drifting: false,
+      steerX: 0,
+      steerY: 0,
+      anchorIdx: -1,
       retreatUntil: -1,
       retreatReadyAt: 0,
       summonExpire: Infinity,
@@ -850,6 +913,11 @@ class Battle implements BattleSimulator {
       attackTimer: 0.5,
       targetIdx: -1,
       retargetTick: 0,
+      moveMode: 'idle',
+      drifting: false,
+      steerX: 0,
+      steerY: 0,
+      anchorIdx: -1,
       retreatUntil: -1,
       retreatReadyAt: 0,
       summonExpire: this.time + durationSec,
@@ -1147,6 +1215,10 @@ class Battle implements BattleSimulator {
     if (u.dirty) this.recomputeDerived(u);
     this.updateFatigue(u);
 
+    // v0.8 [A]: 마지막 아군이 죽으면 그 즉시 후퇴를 끝낸다. 기절·시전·회피 이동 중이면 아래에서 먼저
+    // 돌아가므로, '혼자 남으면 후퇴 상태가 아니다' 를 언제나 만족하도록 판정을 여기서 한다.
+    if (u.retreatUntil >= this.time && !this.hasLivingAlly(u)) u.retreatUntil = -1;
+
     // 기절/빙결 중에는 행동 불가. 시전은 취소하지 않고 멈춘다 —
     // 시전 중단 여부는 applyStatus 의 집중(focus) 저항 판정이 단일 기준이다.
     if (isDisabled(u)) return;
@@ -1172,12 +1244,14 @@ class Battle implements BattleSimulator {
     // 타겟 선택
     this.updateTarget(u);
 
-    // 후퇴 판단 (용기)
+    // 후퇴 판단 (용기). v0.8 [A]: 물러날 곳(살아있는 아군)이 있을 때만 후퇴를 시작한다
+    // (혼자 남은 유닛이 도망치면 아무도 싸우지 않고 시간만 흐른다). 진행 중인 후퇴를 끊는 것은 위에서 한다.
     if (
       u.retreatUntil < this.time &&
       this.time >= u.retreatReadyAt &&
       u.courage < 50 &&
-      u.hp < u.eff.maxHp * 0.3
+      u.hp < u.eff.maxHp * 0.3 &&
+      this.hasLivingAlly(u)
     ) {
       u.retreatUntil = this.time + RETREAT_SEC;
       u.retreatReadyAt = this.time + RETREAT_SEC + RETREAT_COOLDOWN_SEC;
@@ -1232,13 +1306,13 @@ class Battle implements BattleSimulator {
   }
 
   private updateTarget(u: Unit): void {
-    // 도발: 시전자 강제
+    // 도발: 시전자 강제. 고정(stickiness)의 예외로 즉시 교체한다.
     for (let i = 0; i < u.statuses.length; i++) {
       const s = u.statuses[i];
       if (s.kind === 'taunt' && s.source >= 0) {
         const src = this.units[s.source];
         if (src.alive && src.side !== u.side) {
-          u.targetIdx = src.idx;
+          this.setTarget(u, src.idx);
           return;
         }
       }
@@ -1247,51 +1321,31 @@ class Battle implements BattleSimulator {
     const curValid = cur !== null && this.isTargetable(cur);
     if (curValid && this.tick < u.retargetTick) return;
     u.retargetTick = this.tick + RETARGET_TICKS;
-    const picked = this.pickTarget(u);
-    u.targetIdx = picked ? picked.idx : -1;
+    const ctx = this.targetContext(u);
+    let picked = this.pickTarget(u, ctx);
+    // v0.8 [B]3 타겟 고정: 지금 타겟이 유효하면 새 후보가 '확실히'(15% 이상) 더 좋을 때만 교체한다.
+    // 두 후보의 점수가 엎치락뒤치락하면 유닛이 그 사이에서 방향을 바꾸며 떨기 때문.
+    if (picked && cur && curValid && picked !== cur) {
+      const sNew = this.targetScore(u, picked, ctx);
+      const sCur = this.targetScore(u, cur, ctx);
+      if (sNew > sCur - Math.abs(sCur) * TARGET_SWITCH_MARGIN) picked = cur;
+    }
+    this.setTarget(u, picked ? picked.idx : -1);
   }
 
-  private pickTarget(u: Unit): Unit | null {
+  /** 타겟 교체. 다른 유닛으로 바뀌면 접근/카이팅 이력현상 상태를 초기화한다 (v0.8 [B]2) */
+  private setTarget(u: Unit, idx: number): void {
+    if (u.targetIdx === idx) return;
+    u.targetIdx = idx;
+    u.moveMode = 'idle';
+  }
+
+  /** 역할에 따른 타겟 평가 기준. pickTarget 과 고정 판정이 같은 점수를 쓰도록 한 번만 만든다 */
+  private targetContext(u: Unit): TargetCtx {
+    if (u.isSummon || u.role === 'tank' || u.role === 'healer') return { mode: 'nearest', maxDanger: 1, stealth: false };
+    if (u.role === 'assassin') return { mode: 'assassin', maxDanger: 1, stealth: hasStatus(u, 'stealth') };
+    if (u.judgment < 60) return { mode: 'nearest', maxDanger: 1, stealth: false };
     const enemies = u.side === 'A' ? this.teams.B.all : this.teams.A.all;
-    let nearest: Unit | null = null;
-    let nearestD = Infinity;
-    let anyCandidate = false;
-    for (let i = 0; i < enemies.length; i++) {
-      const e = enemies[i];
-      if (!this.isTargetable(e)) continue;
-      anyCandidate = true;
-      const d = dist(u, e);
-      if (d < nearestD) {
-        nearestD = d;
-        nearest = e;
-      }
-    }
-    if (!anyCandidate) return null;
-
-    if (u.isSummon || u.role === 'tank' || u.role === 'healer') return nearest;
-
-    if (u.role === 'assassin') {
-      // 후방 딜러 우선
-      let best: Unit | null = null;
-      let bestD = Infinity;
-      for (let i = 0; i < enemies.length; i++) {
-        const e = enemies[i];
-        if (e.isSummon || e.job === 'summon' || !BACKLINE_JOB[e.job]) continue;
-        if (!this.isTargetable(e)) continue;
-        const d = dist(u, e);
-        if (d < bestD) {
-          bestD = d;
-          best = e;
-        }
-      }
-      // 은신 중이거나 후방 딜러가 사실상 가장 가까울 때만 후방을 노린다. 아니면 전열을 가로질러 걸어가다 죽으므로 가장 가까운 적.
-      if (best && (hasStatus(u, 'stealth') || bestD <= nearestD + ASSASSIN_BACKLINE_SLACK)) return best;
-      return nearest;
-    }
-
-    if (u.judgment < 60) return nearest;
-
-    // 판단력 높음: 체력 낮고 위험한 적 우선
     let maxDanger = 1;
     for (let i = 0; i < enemies.length; i++) {
       const e = enemies[i];
@@ -1299,22 +1353,47 @@ class Battle implements BattleSimulator {
       const dg = Math.max(e.eff.physAtk, e.eff.magAtk);
       if (dg > maxDanger) maxDanger = dg;
     }
+    return { mode: 'judge', maxDanger, stealth: false };
+  }
+
+  /** 타겟 점수 (낮을수록 좋다) */
+  private targetScore(u: Unit, e: Unit, ctx: TargetCtx): number {
+    const d = dist(u, e);
+    switch (ctx.mode) {
+      case 'nearest':
+        return d;
+      case 'assassin': {
+        // 후방 딜러 우선. 은신 중이면 무조건, 아니면 거리 여유(ASSASSIN_BACKLINE_SLACK) 안일 때만
+        // (그 이상이면 전열을 가로질러 걸어가다 죽는다).
+        const backline = !e.isSummon && e.job !== 'summon' && BACKLINE_JOB[e.job];
+        if (!backline) return d;
+        return d - (ctx.stealth ? ASSASSIN_STEALTH_BONUS : ASSASSIN_BACKLINE_SLACK);
+      }
+      case 'judge': {
+        // 판단력 높음: 체력 낮고 위험한 적 우선
+        const hpRatio = e.hp / e.eff.maxHp;
+        const danger = Math.max(e.eff.physAtk, e.eff.magAtk) / ctx.maxDanger;
+        let score = hpRatio * 100 + (1 - danger) * 40 + d * 1.5;
+        if (e.isSummon) score += 30;
+        return score;
+      }
+    }
+  }
+
+  private pickTarget(u: Unit, ctx: TargetCtx): Unit | null {
+    const enemies = u.side === 'A' ? this.teams.B.all : this.teams.A.all;
     let best: Unit | null = null;
     let bestScore = Infinity;
     for (let i = 0; i < enemies.length; i++) {
       const e = enemies[i];
       if (!this.isTargetable(e)) continue;
-      const hpRatio = e.hp / e.eff.maxHp;
-      const danger = Math.max(e.eff.physAtk, e.eff.magAtk) / maxDanger;
-      const d = dist(u, e);
-      let score = hpRatio * 100 + (1 - danger) * 40 + d * 1.5;
-      if (e.isSummon) score += 30;
+      const score = this.targetScore(u, e, ctx);
       if (score < bestScore) {
         bestScore = score;
         best = e;
       }
     }
-    return best ?? nearest;
+    return best;
   }
 
   // ───────── 이동 ─────────
@@ -1329,9 +1408,15 @@ class Battle implements BattleSimulator {
     let dx = 0;
     let dy = 0;
     let wantMove = false;
+    // 이번 틱 이동 속도 배율. 조향(후퇴·카이팅) 은 힘의 크기에 비례해 움직인다 (1 = 전속력)
+    let speedScale = 1;
+    let steered = false;
 
     const teamworkDrift = (): { x: number; y: number } | null => {
-      if (u.isSummon || u.teamwork < 60) return null;
+      if (u.isSummon || u.teamwork < 60) {
+        u.drifting = false;
+        return null;
+      }
       const members = tr.members;
       let cx = 0;
       let cy = 0;
@@ -1343,20 +1428,48 @@ class Battle implements BattleSimulator {
         cy += m.y;
         n++;
       }
-      if (n <= 1) return null;
+      if (n <= 1) {
+        u.drifting = false;
+        return null;
+      }
       cx /= n;
       cy /= n;
-      if (distXY(u, cx, cy) <= TEAMWORK_DRIFT_DIST) return null;
+      const dc = distXY(u, cx, cy);
+      if (dc <= (u.drifting ? TEAMWORK_DRIFT_STOP_DIST : TEAMWORK_DRIFT_DIST)) {
+        u.drifting = false;
+        return null;
+      }
+      u.drifting = true;
       return { x: cx - u.x, y: cy - u.y };
     };
 
     if (u.retreatUntil >= this.time) {
-      // 후퇴: 자기 스폰 방향
-      const d = distXY(u, tr.spawnCenterX, tr.spawnCenterY);
-      if (d > 1) {
-        dx = tr.spawnCenterX - u.x;
-        dy = tr.spawnCenterY - u.y;
-        wantMove = true;
+      // 후퇴 (v0.8 [C]): 스폰 구석이 아니라 살아있는 아군 무게중심 쪽으로 물러난다. 벽 회피는 steerAway 와 공유.
+      const c = this.allyCentroid(u);
+      if (c) {
+        const cd = distXY(u, c.x, c.y);
+        if (cd > 1) {
+          // 방향만 넘긴다(정규화): 그래야 벽 밀어내기 가중치가 세 호출부에서 똑같이 먹힌다
+          const s = this.avoidWalls(u, (c.x - u.x) / cd, (c.y - u.y) / cd);
+          const sm = this.smoothSteer(u, s);
+          steered = true;
+          if (sm) {
+            dx = sm.dx;
+            dy = sm.dy;
+            speedScale = sm.scale;
+            wantMove = true;
+          }
+        }
+      } else if (target) {
+        // 아군이 없으면 후퇴는 시작되지 않지만([A]), 그래도 안전하게 적 반대 방향으로 물러난다
+        const sm = this.smoothSteer(u, this.steerAway(u, target.x, target.y));
+        steered = true;
+        if (sm) {
+          dx = sm.dx;
+          dy = sm.dy;
+          speedScale = sm.scale;
+          wantMove = true;
+        }
       }
     } else if (u.role === 'healer') {
       // 힐러: 전열 아군 뒤 4유닛
@@ -1380,12 +1493,34 @@ class Battle implements BattleSimulator {
           anyAlly = m;
         }
       }
-      const anchor = front ?? anyAlly;
-      if (target && dist(u, target) < HEALER_FLEE_DIST) {
-        dx = u.x - target.x;
-        dy = u.y - target.y;
-        wantMove = true;
+      // 기준 아군 고정 (v0.8 수정): 거의 같은 거리의 아군 둘 사이에서 매 틱 anchor 가 바뀌면
+      // 목표점이 힐러 반대편으로 튀어 매 틱 방향이 뒤집힌다. 지금 anchor 가 살아 있으면
+      // 새 후보가 ANCHOR_SWITCH_DIST 이상 더 가까울 때만 (또는 전열/비전열 구분이 바뀔 때만) 교체한다.
+      const cand = front ?? anyAlly;
+      let anchor = cand;
+      const prevAnchor = u.anchorIdx >= 0 ? this.units[u.anchorIdx] : null;
+      if (cand && prevAnchor && prevAnchor !== u && prevAnchor !== cand && prevAnchor.alive && prevAnchor.side === u.side) {
+        const prevFront = prevAnchor.job !== 'summon' && FRONTLINE_JOB[prevAnchor.job];
+        const candFront = cand.job !== 'summon' && FRONTLINE_JOB[cand.job];
+        if (prevFront === candFront && dist(u, cand) > dist(u, prevAnchor) - ANCHOR_SWITCH_DIST) anchor = prevAnchor;
+      }
+      u.anchorIdx = anchor ? anchor.idx : -1;
+      // 도주 판정도 이력현상을 준다 ([B]2 와 같은 이유): 임계가 하나면 HEALER_FLEE_DIST 경계에서
+      // '도주(뒤로)'와 '전열 뒤로 복귀(앞으로)'가 매 틱 번갈아 일어나 힐러가 제자리에서 덜덜 떤다.
+      const fleeD = target ? dist(u, target) : Infinity;
+      if (target && (fleeD < HEALER_FLEE_DIST || (u.moveMode === 'kite' && fleeD < HEALER_FLEE_STOP_DIST))) {
+        // 적이 붙었다: 물러난다. 방향은 카이팅과 같은 규칙(아군 쪽 + 벽 회피)이라 구석에 박히지 않는다
+        u.moveMode = 'kite';
+        const sm = this.smoothSteer(u, this.steerAway(u, target.x, target.y));
+        steered = true;
+        if (sm) {
+          dx = sm.dx;
+          dy = sm.dy;
+          speedScale = sm.scale;
+          wantMove = true;
+        }
       } else if (anchor) {
+        u.moveMode = 'idle';
         let bx = tr.spawnCenterX - anchor.x;
         let by = tr.spawnCenterY - anchor.y;
         const bl = Math.sqrt(bx * bx + by * by);
@@ -1404,6 +1539,7 @@ class Battle implements BattleSimulator {
           wantMove = true;
         }
       } else if (target) {
+        u.moveMode = 'idle';
         const d = dist(u, target);
         if (d > u.eff.range * 0.9) {
           dx = target.x - u.x;
@@ -1411,6 +1547,7 @@ class Battle implements BattleSimulator {
           wantMove = true;
         }
       } else {
+        u.moveMode = 'idle';
         const adv = this.advancePoint(u);
         dx = adv.x - u.x;
         dy = adv.y - u.y;
@@ -1420,11 +1557,28 @@ class Battle implements BattleSimulator {
       const d = dist(u, target);
       const range = u.eff.range;
       const ranged = this.isRangedBehavior(u);
-      if (ranged && d < range * KITE_RATIO) {
-        dx = u.x - target.x;
-        dy = u.y - target.y;
-        wantMove = true;
-      } else if (d > range * 0.9) {
+      // v0.8 [B]2 이력현상: 시작 임계와 종료 임계를 벌려 두고 moveMode 로 기억한다.
+      // (임계가 하나면 사거리 경계에서 접근↔후퇴가 매 틱 번갈아 일어나 좌우로 덜덜 떤다)
+      if (u.moveMode === 'approach') {
+        if (d <= range * APPROACH_STOP_RATIO) u.moveMode = 'idle';
+      } else if (u.moveMode === 'kite') {
+        if (!ranged || d >= range * KITE_STOP_RATIO) u.moveMode = 'idle';
+      }
+      if (u.moveMode === 'idle') {
+        if (d > range * APPROACH_START_RATIO) u.moveMode = 'approach';
+        else if (ranged && d < range * KITE_START_RATIO) u.moveMode = 'kite';
+      }
+
+      if (u.moveMode === 'kite') {
+        const sm = this.smoothSteer(u, this.steerAway(u, target.x, target.y));
+        steered = true;
+        if (sm) {
+          dx = sm.dx;
+          dy = sm.dy;
+          speedScale = sm.scale;
+          wantMove = true;
+        }
+      } else if (u.moveMode === 'approach') {
         dx = target.x - u.x;
         dy = target.y - u.y;
         wantMove = true;
@@ -1436,29 +1590,202 @@ class Battle implements BattleSimulator {
           dy = dy / l1 + (drift.y / l2) * 0.7;
         }
       } else {
+        // 유지 구간: 협동 드리프트만 허용
         const drift = teamworkDrift();
         if (drift) {
-          dx = drift.x;
-          dy = drift.y;
-          wantMove = true;
+          let ddx = drift.x;
+          let ddy = drift.y;
+          // 원거리 유닛이 아군 쪽으로 붙다가 다시 카이팅 사거리 안으로 들어가면 물러남↔접근 왕복이 생긴다.
+          // 타겟까지의 거리를 줄이는 성분만 깎아 내고 접선 방향으로 미끄러뜨린다 (아군 쪽으로 돌아 들어간다).
+          if (ranged && d <= range * KITE_STOP_RATIO + 0.5) {
+            const rx = u.x - target.x;
+            const ry = u.y - target.y;
+            const rl = Math.sqrt(rx * rx + ry * ry) || 1;
+            const nx = rx / rl;
+            const ny = ry / rl;
+            const inward = ddx * nx + ddy * ny;
+            if (inward < 0) {
+              ddx -= nx * inward;
+              ddy -= ny * inward;
+            }
+          }
+          if (Math.abs(ddx) > 1e-6 || Math.abs(ddy) > 1e-6) {
+            dx = ddx;
+            dy = ddy;
+            wantMove = true;
+          }
         }
       }
     } else {
+      u.moveMode = 'idle';
       const adv = this.advancePoint(u);
       dx = adv.x - u.x;
       dy = adv.y - u.y;
       wantMove = distXY(u, adv.x, adv.y) > 0.5;
     }
 
+    // 조향하지 않은 틱에는 저역통과 기억을 지운다 (다음 카이팅이 낡은 방향을 이어받지 않게)
+    if (!steered) {
+      u.steerX = 0;
+      u.steerY = 0;
+    }
+
+    // v0.8 [B]1 방향: 유효한 타겟이 있으면 항상 그쪽을 본다. 이동 방향으로 도는 것은 타겟이 없을 때만.
+    const face = this.facingTarget(u);
+    if (face) u.facing = Math.atan2(face.y - u.y, face.x - u.x);
     if (!wantMove) return;
-    this.stepToward(u, dx, dy, 1, Infinity);
+    this.stepToward(u, dx, dy, speedScale, Infinity, face === null);
+  }
+
+  /**
+   * (v0.8 수정) 조향력 저역통과 + 데드밴드.
+   * steerAway/avoidWalls 는 방향과 함께 '힘의 크기'(mag) 를 준다. 예전에는 크기를 버리고 항상 전속력으로
+   * 한 틱을 걸었기 때문에, 벽 밀어내기와 도망 방향이 상쇄되는 지점에서 유닛이 20Hz 로 왕복했다.
+   * 이제 이전 틱 힘과 섞어(STEER_SMOOTH) 매 틱 부호가 뒤집히면 서로 지워지게 하고,
+   * 남은 힘이 STEER_DEADBAND 보다 작으면 그 틱은 아예 움직이지 않는다. 힘이 꾸준하면 전속력으로 수렴한다.
+   * 반환 null = 이번 틱 이동 없음.
+   */
+  private smoothSteer(u: Unit, s: { dx: number; dy: number; mag: number }): { dx: number; dy: number; scale: number } | null {
+    const m = Math.min(1, s.mag);
+    const fx = u.steerX * STEER_SMOOTH + s.dx * m * (1 - STEER_SMOOTH);
+    const fy = u.steerY * STEER_SMOOTH + s.dy * m * (1 - STEER_SMOOTH);
+    u.steerX = fx;
+    u.steerY = fy;
+    const l = Math.sqrt(fx * fx + fy * fy);
+    if (l < STEER_DEADBAND) return null;
+    return { dx: fx, dy: fy, scale: Math.min(1, l) };
+  }
+
+  /** facing 을 맞출 대상: 현재 타겟이 살아있고 공격 가능한 적일 때만 (v0.8 [B]1) */
+  private facingTarget(u: Unit): Unit | null {
+    if (u.targetIdx < 0 || u.targetIdx >= this.units.length) return null;
+    const t = this.units[u.targetIdx];
+    if (t.side === u.side || !this.isTargetable(t)) return null;
+    return t;
+  }
+
+  /** 살아있는 아군(자신·소환물 제외)이 1명 이상인가 (v0.8 [A]) */
+  private hasLivingAlly(u: Unit): boolean {
+    const members = this.teams[u.side].members;
+    for (let i = 0; i < members.length; i++) {
+      const m = members[i];
+      if (m !== u && m.alive) return true;
+    }
+    return false;
+  }
+
+  /** 살아있는 아군(자신·소환물 제외) 무게중심. 없으면 null */
+  private allyCentroid(u: Unit): { x: number; y: number } | null {
+    const members = this.teams[u.side].members;
+    let cx = 0;
+    let cy = 0;
+    let n = 0;
+    for (let i = 0; i < members.length; i++) {
+      const m = members[i];
+      if (m === u || !m.alive) continue;
+      cx += m.x;
+      cy += m.y;
+      n++;
+    }
+    if (n === 0) return null;
+    return { x: cx / n, y: cy / n };
+  }
+
+  /**
+   * (v0.8 [C]) 물러나는 방향 (정규화) + 힘의 크기. 적의 정반대로 직선 후퇴하면 맵 구석에 박히므로
+   *   1) base = normalize(자신 − 적)
+   *   2) + normalize(살아있는 아군 무게중심 − 자신) × 거리 비례 가중치 (아군 쪽으로 물러난다)
+   *      가중치 = ALLY_PULL_WEIGHT × min(거리 / ALLY_PULL_FULL_DIST, ALLY_PULL_MAX). 1 을 넘길 수 있어
+   *      '적이 아군과 나 사이'인 경우에도 방향을 아군 쪽으로 돌릴 수 있다. 무게중심 위(ALLY_PULL_MIN_DIST 안)
+   *      에서는 당기지 않는다 — 한 걸음마다 부호가 뒤집혀 제자리에서 떨기 때문.
+   *   3) + 경계 WALL_AVOID_DIST 안쪽이면 안쪽으로 미는 힘 (변마다 1 − 거리/거리한계, 가중치 WALL_PUSH_WEIGHT)
+   *   4) 그래도 경계를 향하면 그 변의 접선으로 투영해 벽을 타고 미끄러진다 (avoidWalls)
+   * mag 는 정규화 전 합력의 크기다. 호출부(smoothSteer)가 이동 거리를 여기에 비례시킨다.
+   */
+  private steerAway(u: Unit, awayFromX: number, awayFromY: number): { dx: number; dy: number; mag: number } {
+    let dx = u.x - awayFromX;
+    let dy = u.y - awayFromY;
+    let l = Math.sqrt(dx * dx + dy * dy);
+    if (l < 0.0001) {
+      // 완전히 겹쳤다: 바라보는 방향의 반대로
+      dx = -Math.cos(u.facing);
+      dy = -Math.sin(u.facing);
+      l = 1;
+    }
+    dx /= l;
+    dy /= l;
+    const c = this.allyCentroid(u);
+    if (c) {
+      const px = c.x - u.x;
+      const py = c.y - u.y;
+      const pl = Math.sqrt(px * px + py * py);
+      if (pl >= ALLY_PULL_MIN_DIST) {
+        const w = ALLY_PULL_WEIGHT * clamp(pl / ALLY_PULL_FULL_DIST, ALLY_PULL_MIN_SCALE, ALLY_PULL_MAX);
+        dx += (px / pl) * w;
+        dy += (py / pl) * w;
+      }
+    }
+    return this.avoidWalls(u, dx, dy);
+  }
+
+  /**
+   * 벽 밀어내기 + 접선 미끄러짐. 반환은 정규화된 방향 (입력이 0 이면 안쪽 방향) 과
+   * 정규화 전 합력의 크기 mag (힘이 상쇄되면 0 에 가깝다 → 호출부가 이동량을 줄인다).
+   */
+  private avoidWalls(u: Unit, inDx: number, inDy: number): { dx: number; dy: number; mag: number } {
+    const map = this.map;
+    const minX = POS_MARGIN;
+    const maxX = map.width - POS_MARGIN;
+    const minY = POS_MARGIN;
+    const maxY = map.height - POS_MARGIN;
+    const dl = Math.max(0, u.x - minX);
+    const dr = Math.max(0, maxX - u.x);
+    const dt = Math.max(0, u.y - minY);
+    const db = Math.max(0, maxY - u.y);
+    let dx = inDx;
+    let dy = inDy;
+    if (dl < WALL_AVOID_DIST) dx += (1 - dl / WALL_AVOID_DIST) * WALL_PUSH_WEIGHT;
+    if (dr < WALL_AVOID_DIST) dx -= (1 - dr / WALL_AVOID_DIST) * WALL_PUSH_WEIGHT;
+    if (dt < WALL_AVOID_DIST) dy += (1 - dt / WALL_AVOID_DIST) * WALL_PUSH_WEIGHT;
+    if (db < WALL_AVOID_DIST) dy -= (1 - db / WALL_AVOID_DIST) * WALL_PUSH_WEIGHT;
+    let l = Math.sqrt(dx * dx + dy * dy);
+    const mag = l;
+    if (l < 0.0001) {
+      // 밀어내는 힘이 상쇄됐다: 맵 중앙 쪽
+      dx = map.width / 2 - u.x;
+      dy = map.height / 2 - u.y;
+      l = Math.sqrt(dx * dx + dy * dy);
+      if (l < 0.0001) return { dx: 1, dy: 0, mag: 0 };
+    }
+    dx /= l;
+    dy /= l;
+    // 경계 바로 앞에서 바깥을 향하는 성분은 잘라내 '벽을 타고 미끄러지게' 한다
+    if (dl <= WALL_SLIDE_DIST && dx < 0) dx = 0;
+    if (dr <= WALL_SLIDE_DIST && dx > 0) dx = 0;
+    if (dt <= WALL_SLIDE_DIST && dy < 0) dy = 0;
+    if (db <= WALL_SLIDE_DIST && dy > 0) dy = 0;
+    l = Math.sqrt(dx * dx + dy * dy);
+    if (l < 0.0001) {
+      // 구석: 더 가까운 변을 따라 모서리 반대쪽으로 빠져나온다 (여기서는 확실히 빠져나와야 하므로 전속력)
+      if (Math.min(dl, dr) <= Math.min(dt, db)) {
+        dx = 0;
+        dy = dt <= db ? 1 : -1;
+      } else {
+        dy = 0;
+        dx = dl <= dr ? 1 : -1;
+      }
+      return { dx, dy, mag: 1 };
+    }
+    // 접선 투영으로 잘려 나간 만큼은 실제로 갈 수 있는 힘이 아니므로 크기에도 반영한다
+    return { dx: dx / l, dy: dy / l, mag: mag * l };
   }
 
   /**
    * (dx,dy) 방향으로 한 틱 이동. speedMult 는 이동속도 배율(회피 1.15), maxLen 은 이번 틱 최대 이동 거리.
    * 둔화·맵 이동속도 배율·빙하 미끄러짐·경계 클램프를 여기서 한 번에 처리한다.
+   * faceMove 가 true 일 때만 이동 방향으로 facing 을 바꾼다 (v0.8 [B]1: 타겟이 있으면 호출부가 타겟을 보게 한다).
    */
-  private stepToward(u: Unit, dx: number, dy: number, speedMult: number, maxLen: number): void {
+  private stepToward(u: Unit, dx: number, dy: number, speedMult: number, maxLen: number, faceMove: boolean): void {
     const map = this.map;
     const len = Math.sqrt(dx * dx + dy * dy);
     if (len < 0.0001) return;
@@ -1482,7 +1809,7 @@ class Battle implements BattleSimulator {
     }
     u.x = clamp(nx, POS_MARGIN, map.width - POS_MARGIN);
     u.y = clamp(ny, POS_MARGIN, map.height - POS_MARGIN);
-    u.facing = Math.atan2(dy, dx);
+    if (faceMove) u.facing = Math.atan2(dy, dx);
   }
 
   /** 회피 이동: 탈출점으로 이동속도 × 1.15. 도착하면 그 자리에서 예고가 끝나길 기다린다 */
@@ -1491,7 +1818,9 @@ class Battle implements BattleSimulator {
     const dy = u.dodgeY - u.y;
     const len = Math.sqrt(dx * dx + dy * dy);
     if (len < 0.05) return;
-    this.stepToward(u, dx, dy, DODGE_SPEED_MULT, len);
+    const face = this.facingTarget(u);
+    if (face) u.facing = Math.atan2(face.y - u.y, face.x - u.x);
+    this.stepToward(u, dx, dy, DODGE_SPEED_MULT, len, face === null);
   }
 
   /** 보이는 적이 없을 때 향할 지점 */
@@ -1632,6 +1961,13 @@ class Battle implements BattleSimulator {
       killerId = killer.id;
     }
     this.pushEvent({ t: this.time, kind: 'kill', killer: killerId, victim: victim.id });
+    // v0.8 [A]: 이 죽음으로 혼자 남은 아군은 '그 즉시' 후퇴를 끝낸다 (물러날 곳이 없다).
+    // tickUnit 에서도 같은 판정을 하지만, 그러면 죽음이 난 틱 동안은 후퇴 상태가 남는다. 순회 순서는 고정.
+    const mates = this.teams[victim.side].all;
+    for (let i = 0; i < mates.length; i++) {
+      const m = mates[i];
+      if (m.alive && m.retreatUntil >= this.time && !this.hasLivingAlly(m)) m.retreatUntil = -1;
+    }
   }
 
   private heal(src: Unit | null, target: Unit, amount: number, emit: boolean): number {
