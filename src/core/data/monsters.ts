@@ -8,7 +8,7 @@
  *  - 스탯 상한(100) 때문에 후반 일차에서 강도를 더 못 올리는 문제는 Character.derivedMult 로 해결한다.
  *    buildMonsterTeam 은 먼저 스탯을 스케일하고, 상한에 걸려 모자란 만큼만 derivedMult 로 채운다.
  *  - 강도 기준값(monsterPowerTarget)은
- *      expectedPlayerPower(day) × dayDifficulty(tier, day, 종별 지수 보정) × earlyDayRelief(day)
+ *      expectedPlayerPower(day) × dayDifficulty(tier, day, 종별 지수 보정) × earlyDayRelief(tier, day)
  *      × TIER_POWER_RATIO[tier] × MonsterDef.powerScale × countPowerFactor(인원).
  *    밸런싱에서 건드릴 값은 이 일곱 가지뿐이다: EXPECTED_TEAM_POWER_BY_DAY, DAY_DIFFICULTY_EXPONENT,
  *    SPECIES_DAY_EXPONENT_ADJUST(종별 일차 지수 보정), EARLY_DAY_RELIEF, TIER_POWER_RATIO,
@@ -32,6 +32,14 @@
  *   일차별 고급 41.7~57.5%, 중급 76.7~84.2%. 평균 전투 시간 54 / 61 / 72초.
  *   주의: 3~4명 구간은 난이도마다 종이 1~2개뿐이라 시드 그룹 하나(40회)에서는 구간 표본이 60판 안팎(표준오차 ±6p)이다.
  *   시드 4242 하나만 보면 고급 구간 편차가 18.9p 로 나왔지만 세 그룹 합산은 6.3p 였다. 구간 편차는 반드시 여러 그룹 합산으로 판정할 것.
+ * 보정 현황 (v0.6, 2026-09-16. 스킬 위력 상향(단일 ×1.6 / 광역 ×1.5 / 장판 ×1.4) 뒤 재보정. `--runs 40`, 시드 1 / 4242 / 9001 합산 1,200판/난이도)
+ *   상향 직후 실측: 하급 98.7% (중앙값 32초, 하한 40초 미달) / 중급 86.3% / 고급 57.4%. 고급 인원 구간 47.4 / 49.7 / 76.4 (편차 29p):
+ *   6~7기 떼(리치 82%, 심연 71%)가 광역에 녹고, 1일차(플레이어 스킬 1개)는 전 난이도에서 8~20p 더 어려웠다(중급 66%, 고급 45%).
+ *   조치: ① EXPECTED_TEAM_POWER_BY_DAY 실측 교체 ② EARLY_DAY_RELIEF 0.985→0.925 ③ 하급 비율 0.76→0.82 + 빠른 하급 떼 템플릿에
+ *   HP 편중 derivedMult(maxHp 1.3~1.7 / physAtk 0.75~0.85: 전투 시간을 늘리되 치명적이지 않게) ④ 중급 비율 0.830→0.849
+ *   ⑤ 고급 지수 0.48→0.37 + 비율 0.980→1.011 (2~4일차가 5~10일차보다 10p 쉬운 혹을 편다) ⑥ 종별 powerScale (아래 메모).
+ *   결과: 하급 97.6 / 중급 82.0 / 고급 50.4%. 인원 구간 하급 95.9 / 96.8 / 100.0 (4.1p), 중급 82.1 / 81.9 / 82.2 (0.3p),
+ *   고급 49.8 / 49.2 / 51.9 (2.6p). 고급 일차별 43~59% (1일차 49.2). 전투 시간 중앙값 43 / 41 / 50초, 평균 49 / 47 / 54초.
  *   보정 순서: ① EXPECTED_TEAM_POWER_BY_DAY 를 실측치로 교체 → ② 난이도별 TIER_POWER_RATIO / DAY_DIFFICULTY_EXPONENT
  *   → ③ 종별 powerScale(전체 승률) 과 SPECIES_DAY_EXPONENT_ADJUST(일차 기울기) 를 번갈아 수렴.
  *   같은 난이도 안에서 1기 보스와 8기 떼의 승률 편차 목표는 ±8%p (GDD §11).
@@ -80,20 +88,20 @@ import { clampStat, powerRating } from '../stats';
 
 /**
  * 표준 성장 플레이어(TEAM_SIZE = 4명)의 일차별 팀 전투력 (charGen.teamPower 와 같은 척도: 스탯 합 + 스킬 수 × 30).
- * v0.5 헤드리스(`--monster --runs 60`, 시드 1~60)가 매 일차 3스텝(몬스터 전투 직전)에서 측정한 평균 실측치.
- * 시드 3001~3060 그룹도 ±20 안에서 같다. 인덱스 0 이 1일차. 육성 정책·선택지 크기가 바뀌면 다시 측정한다.
+ * v0.6 헤드리스(`--monster --runs 40`, 시드 1 / 4242 / 9001 세 그룹 평균)가 매 일차 3스텝(몬스터 전투 직전)에서 측정한 평균 실측치.
+ * 세 그룹은 서로 ±15 안에서 같고 v0.5 표(시드 1~60)와도 ±25 안에서 같다. 인덱스 0 이 1일차. 육성 정책·선택지 크기가 바뀌면 다시 측정한다.
  */
 export const EXPECTED_TEAM_POWER_BY_DAY: readonly number[] = [
-  3781, // 1일차
-  3925, // 2일차
-  4074, // 3일차
-  4253, // 4일차
-  4432, // 5일차 (분화 시작)
-  4599, // 6일차
-  4723, // 7일차
-  4872, // 8일차
-  4997, // 9일차
-  5111, // 10일차
+  3774, // 1일차
+  3921, // 2일차
+  4073, // 3일차
+  4249, // 4일차
+  4421, // 5일차 (분화 시작)
+  4580, // 6일차
+  4702, // 7일차
+  4841, // 8일차
+  4967, // 9일차
+  5088, // 10일차
 ];
 
 /** 일차를 1..TOTAL_DAYS 로 클램프 */
@@ -135,13 +143,15 @@ export function expectedPlayerPower(day: number): number {
  * (4인 팀은 하급을 30초대에 정리해 버려 전투 시간 하한 40초를 밑돌았다. 0.76 에서 평균 54초, 승률 98.5%).
  * 중급·고급은 v0.5 보정에서 0.845 / 0.993 → 0.830 / 0.980 으로 내렸다: 보정에 쓴 시드군(1~60)에서만 목표에 들고
  * 다른 시드군(9001~, 5001~)에서는 중급 -8p / 고급 -7p 였다. 세 시드군(각 난이도 600판) 평균으로 맞춘 값이다.
+ * v0.6 (스킬 위력 상향 뒤): 하급 0.76→0.82 (전투 시간 중앙값 32→43초, 승률 98.7→97.6%), 중급 0.830→0.849 (86.3→82.0%),
+ * 고급 0.980→1.011 (고급 지수를 0.48→0.37 로 내린 몫을 10일차 기준으로 되돌린 값. 지수와 세트로 움직인다).
  * 전투력 점수는 스탯 합이라 편성 형태를 모른다. 인원 차이는 countPowerFactor 가, 종별 효율 차이는
  * 각 MonsterDef.powerScale 이 흡수한다.
  */
 export const TIER_POWER_RATIO: Record<MonsterTier, number> = {
-  low: 0.76,
-  mid: 0.830,
-  high: 0.980,
+  low: 0.82,
+  mid: 0.855,
+  high: 1.011,
 };
 
 /**
@@ -153,11 +163,14 @@ export const TIER_POWER_RATIO: Record<MonsterTier, number> = {
  * 중급 0.25 / 고급 0.44 에서는 1~5일차 대비 6~10일차 승률이 고급 +6~11p, 중급 +5p 로 올라가 지수를 0.03~0.04 올렸다
  * (세 시드군 합산 1~5일차 46.1% / 6~10일차 47.4%).
  * 4인 팀은 후반 스킬·분화의 비중이 커서 v0.4 보다 지수가 크다. 종별 편차는 SPECIES_DAY_EXPONENT_ADJUST 가 맡는다.
+ * v0.6: 고급 0.48→0.37. 스킬 상향 뒤 고급 2~4일차가 5~10일차보다 10p 쉬웠다(67/62/58 vs 51). 지수를 내리고 TIER_POWER_RATIO.high 를
+ * 0.980→1.011 로 올려 10일차 강도는 그대로 두고 2~4일차만 1~2% 올렸다 (결과 2~4일차 59/51/43, 5~10일차 44~55).
+ * 하급·중급은 1일차를 뺀 곡선이 평평해 그대로 두었다 (1일차는 EARLY_DAY_RELIEF 가 맡는다).
  */
 export const DAY_DIFFICULTY_EXPONENT: Record<MonsterTier, number> = {
   low: 0.30,
   mid: 0.28,
-  high: 0.48,
+  high: 0.37,
 };
 
 /**
@@ -199,12 +212,23 @@ function dayDifficulty(tier: MonsterTier, day: number, dayExpAdjust: number = 0)
  * 초반 일차 완화 배율. 인덱스 0 이 1일차이고, 표 길이를 넘는 일차는 1.0 이다.
  * 1일차는 스킬·분화가 하나도 없어 같은 전투력이라도 실제 강도가 낮다. v0.5 실측 0.985 (0.975 에서는 1일차 고급이 57%,
  * 0.96 에서는 73% 까지 올라갔다. 1.5% 가 승률 5~8%p 를 움직인다).
+ * v0.6: 0.985→0.925. 스킬 위력이 ×1.5~1.6 오르자 스킬 2~4개를 가진 몬스터와 스킬 1개뿐인 1일차 플레이어의 격차가 커져
+ * 1일차가 전 난이도에서 더 어려워졌다 (하급 92 / 중급 66 / 고급 45%). 0.925 에서 하급 91 / 중급 78 / 고급 49% (하급 1일차는
+ * 스킬 없는 팀이 거대 슬라임·독버섯 장판을 못 피해 생기는 손실이라 비율로는 더 안 오른다).
+ * 보정B: 난이도별로 나눴다. 하급 1일차가 세 시드 그룹 합산 90~92.5% 로 95% 하한 아래에 남아 하급만 0.925→0.90.
+ * 중급 1일차는 합산 75.8~82% 로 하한 근처라 공통 값을 내리면 안 되므로 고급은 0.925 그대로. 중급은 TIER_POWER_RATIO.mid 와
+ * 하피·망령 powerScale 을 올린 뒤 1일차가 합산 70.8% (67.5 / 77.5 / 67.5) 로 내려가 0.925→0.91 (73.3%) →0.89 (2~10일차는 목표 안이라 그대로).
  */
-const EARLY_DAY_RELIEF: readonly number[] = [0.985];
+const EARLY_DAY_RELIEF: Record<MonsterTier, readonly number[]> = {
+  low: [0.9],
+  mid: [0.89],
+  high: [0.925],
+};
 
-function earlyDayRelief(day: number): number {
+function earlyDayRelief(tier: MonsterTier, day: number): number {
+  const table = EARLY_DAY_RELIEF[tier];
   const i = clampDay(day) - 1;
-  return i < EARLY_DAY_RELIEF.length ? EARLY_DAY_RELIEF[i] : 1;
+  return i < table.length ? table[i] : 1;
 }
 
 /**
@@ -236,7 +260,7 @@ export function monsterPowerTarget(
   return (
     expectedPlayerPower(d) *
     dayDifficulty(tier, d, dayExpAdjust) *
-    earlyDayRelief(d) *
+    earlyDayRelief(tier, d) *
     TIER_POWER_RATIO[tier] *
     powerScale *
     countPowerFactor(unitCount)
@@ -345,39 +369,44 @@ function tpl(
 }
 
 // ───────────────────────── 하급 ─────────────────────────
+//
+// v0.6: 슬라임·들개·고블린·박쥐 템플릿에 HP 편중 derivedMult(maxHp 1.3~1.7 / physAtk 0.75~0.85)를 붙였다.
+// 스킬 상향 뒤 하급 전투가 30초대(중앙값 32초)로 끝나 하한 40초를 밑돌았는데, 비율만 올리면 승률이 먼저 떨어진다.
+// HP 를 두껍게 하고 공격을 깎으면 같은 목표 전투력에서 전투가 길어지되 치명적이지 않다 (mixFactor 가 배율을 전투력에 반영하므로
+// 스탯 배율은 그만큼 낮아진다). 결과 하급 중앙값 43초 / 승률 97.6%. 들개(가장 빨리 녹는 6기 떼)만 1.7 / 0.75 로 더 세게 기울였다.
 
 const T_SLIME = tpl('tank', '슬라임', {
   vitality: 52, strength: 28, agility: 14, moveSpeed: 14, stamina: 56,
   judgment: 16, courage: 55, composure: 40, teamwork: 20, focus: 14,
   accuracy: 36, evasion: 8, defenseTech: 40, critical: 10, mastery: 20,
   magicPower: 12,
-}, ['mon_acid_splash', 'mon_tough_hide']);
+}, ['mon_acid_splash', 'mon_tough_hide'], { maxHp: 1.3, physAtk: 0.85 });
 
 const T_WILD_DOG = tpl('berserker', '들개', {
   vitality: 40, strength: 42, agility: 62, moveSpeed: 70, stamina: 40,
   courage: 60, composure: 26, focus: 30,
   accuracy: 46, evasion: 30, defenseTech: 16, critical: 40, mastery: 24,
   magicPower: 8, mana: 12,
-}, ['mon_bite', 'mon_swarm_instinct']);
+}, ['mon_bite', 'mon_swarm_instinct'], { maxHp: 1.7, physAtk: 0.75 });
 
 const T_GOBLIN_ARCHER = tpl('archer', '고블린 사수', {
   vitality: 38, strength: 34, agility: 48, moveSpeed: 48, stamina: 36,
   accuracy: 52, evasion: 28, defenseTech: 16, critical: 34, mastery: 34,
   magicPower: 10,
-}, ['mon_crude_arrow', 'mon_swarm_instinct']);
+}, ['mon_crude_arrow', 'mon_swarm_instinct'], { maxHp: 1.5, physAtk: 0.8 });
 
 const T_GOBLIN_FIGHTER = tpl('swordsman', '고블린 전사', {
   vitality: 44, strength: 42, agility: 40, moveSpeed: 44, stamina: 38,
   courage: 44, accuracy: 42, evasion: 20, defenseTech: 28, critical: 26, mastery: 30,
   magicPower: 10,
-}, ['mon_rusty_slash', 'mon_tough_hide']);
+}, ['mon_rusty_slash', 'mon_tough_hide'], { maxHp: 1.5, physAtk: 0.8 });
 
 const T_CAVE_BAT = tpl('assassin', '동굴 박쥐', {
   vitality: 36, strength: 32, agility: 72, moveSpeed: 76, stamina: 36,
   judgment: 26, courage: 34, focus: 32,
   accuracy: 42, evasion: 62, defenseTech: 12, critical: 32, mastery: 26,
   magicPower: 8,
-}, ['mon_bite', 'mon_screech', 'mon_erratic_flight']);
+}, ['mon_bite', 'mon_screech', 'mon_erratic_flight'], { maxHp: 1.5, physAtk: 0.8 });
 
 const T_TOXIC_MUSHROOM = tpl('healer', '독버섯', {
   vitality: 40, strength: 10, agility: 8, moveSpeed: 6, stamina: 46,
@@ -437,14 +466,14 @@ const T_HARPY_ARCHER = tpl('archer', '하피 사수', {
   judgment: 48, focus: 50,
   accuracy: 62, evasion: 46, defenseTech: 22, critical: 48, mastery: 44,
   magicPower: 12,
-}, ['mon_crude_arrow', 'mon_wing_gust', 'mon_erratic_flight']);
+}, ['mon_crude_arrow', 'mon_wing_gust', 'mon_erratic_flight'], { maxHp: 1.4, physAtk: 0.8 });
 
 const T_HARPY_RAIDER = tpl('assassin', '하피 습격자', {
   vitality: 36, strength: 48, agility: 66, moveSpeed: 72, stamina: 42,
   focus: 52,
   accuracy: 54, evasion: 54, defenseTech: 20, critical: 56, mastery: 42,
   magicPower: 12,
-}, ['mon_dive_strike', 'mon_backstab', 'mon_erratic_flight']);
+}, ['mon_dive_strike', 'mon_backstab', 'mon_erratic_flight'], { maxHp: 1.4, physAtk: 0.8 });
 
 const T_LIVING_ARMOR = tpl('tank', '리빙 아머', {
   vitality: 80, strength: 58, agility: 24, moveSpeed: 28, stamina: 74,
@@ -493,7 +522,7 @@ const T_WRAITH = tpl('mage', '망령', {
   judgment: 52, composure: 52, focus: 50,
   accuracy: 44, evasion: 46, defenseTech: 16, critical: 36, mastery: 48,
   magicPower: 66, mana: 58, manaRegen: 54, castSpeed: 58, resistance: 50,
-}, ['mon_haunting_bolt', 'mon_wail_of_woe']);
+}, ['mon_haunting_bolt', 'mon_wail_of_woe'], { maxHp: 1.4, magAtk: 0.8 });
 
 const T_SORROW_PRIEST = tpl('healer', '비탄의 사제', {
   vitality: 38, strength: 12, agility: 28, moveSpeed: 40, stamina: 42,
@@ -504,7 +533,7 @@ const T_SORROW_PRIEST = tpl('healer', '비탄의 사제', {
 
 // ───────────────────────── 고급 ─────────────────────────
 
-/** 고급 단독 보스. 대지진(반경 5, 예고 1.4초, 3초 장판)과 대지 강타. 이동속도·판단력이 낮은 팀은 장판에서 못 벗어난다 */
+/** 고급 단독 보스. 대지진(반경 5, 예고 1.4초, 3초 장판)과 대지 분쇄. 이동속도·판단력이 낮은 팀은 장판에서 못 벗어난다 */
 const T_ANCIENT_GOLEM = tpl('tank', '고대 골렘', {
   vitality: 96, strength: 84, agility: 22, moveSpeed: 24, stamina: 92,
   judgment: 46, courage: 90, composure: 84, teamwork: 30, focus: 40,
@@ -602,6 +631,15 @@ const T_FALLEN_PRIEST = tpl('healer', '타락 사제', {
 //    (countPowerFactor 1.25 / 1.12 가 따로 곱해진다). 이 값에서 스탯 배율은 0.7~1.0 근처에 온다.
 //  - 승률은 powerScale 에 매우 민감하다: 1% 가 중급 4~6%p, 고급 6~8%p 를 움직인다. 0.005 단위로만 다듬을 것.
 //  - 실측 종별 승률 (시드 1~60 / 3001~3060, 도구 기준): 하급 전 종 96~100%, 중급 72~88%, 고급 41~58%.
+//  - v0.6 (스킬 위력 상향 뒤, 시드 1 / 4242 / 9001 합산): 광역 ×1.5 에 6~7기 떼가 녹아 리치 0.907→1.000, 심연 1.110→1.180 으로
+//    크게 올렸고, 중급은 비율 상향과 함께 하피 1.272→1.335, 오크 전사대 1.000→1.040, 도적단 1.183→1.205, 리빙 아머 0.633→0.643,
+//    망령 1.051→1.030, 대족장 0.364→0.358. 고급 보스는 골렘 0.280→0.276, 드래곤 0.312→0.311, 화염 거인 0.495→0.479.
+//    하급은 거대 슬라임 0.336→0.330, 독버섯 1.113→1.100 (둘 다 1일차 손실이라 승률은 거의 안 움직였다).
+//    결과 종별 승률: 하급 93.5~100%, 중급 80.3~83.8%, 고급 49.0~52.2%.
+//  - 보정B (2026-09-16, 검증 지적 반영): 거대 슬라임 0.330→0.315 (합산 88.4% → 95% 이상). 하피 사수·습격자·망령 템플릿에
+//    HP 편중 derivedMult(maxHp 1.4 / 공격 0.8)를 붙여 중급 전투 시간을 늘렸는데 mixFactor 보정만으로는 승률이 90% 대로 올라
+//    하피 1.335→1.43, 망령 1.030→1.06 으로 되돌렸다 (하피는 derivedMult 뒤 powerScale 1% 당 승률 1p 정도만 움직여 크게 올렸다). 스킬 계수 보정B(플레이어 광역·주력기 상향)로 중급 전체가 86.5% 가 되어
+//    TIER_POWER_RATIO.mid 0.849→0.855.
 
 const MONSTER_LIST: MonsterDef[] = [
   // ══════════ 하급 ══════════
@@ -654,7 +692,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_TOXIC_MUSHROOM, count: 2 },
     ],
     preferredMaps: ['dark', 'plains'],
-    powerScale: 1.113,
+    powerScale: 1.100,
   },
   {
     id: 'giant_slime',
@@ -663,7 +701,7 @@ const MONSTER_LIST: MonsterDef[] = [
     desc: '집채만 한 슬라임 한 마리. 느리지만 점액 파도(예고 1.2초, 반경 4 장판)로 전열을 통째로 덮는다. 예고를 보고 비켜야 한다.',
     units: [{ template: T_GIANT_SLIME, count: 1 }],
     preferredMaps: ['desert', 'plains'],
-    powerScale: 0.336,
+    powerScale: 0.315,
   },
 
   // ══════════ 중급 ══════════
@@ -678,7 +716,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_ORC_BERSERKER, count: 1 },
     ],
     preferredMaps: ['plains', 'desert'],
-    powerScale: 1.000,
+    powerScale: 1.040,
   },
   {
     id: 'harpy_flock',
@@ -690,19 +728,19 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_HARPY_RAIDER, count: 2 },
     ],
     preferredMaps: ['plains', 'glacier'],
-    powerScale: 1.272,
+    powerScale: 1.43,
   },
   {
     id: 'living_armor',
     name: '리빙 아머',
     tier: 'mid',
-    desc: '주인 없는 갑옷 하나와 저절로 움직이는 대검 하나. 둘뿐이지만 대단히 단단하고 대검은 대지 강타로 광역 기절을 건다.',
+    desc: '주인 없는 갑옷 하나와 저절로 움직이는 대검 하나. 둘뿐이지만 대단히 단단하고 대검은 대지 분쇄로 광역 기절을 건다.',
     units: [
       { template: T_LIVING_ARMOR, count: 1 },
       { template: T_AWAKENED_GREATSWORD, count: 1 },
     ],
     preferredMaps: ['dark', 'glacier'],
-    powerScale: 0.633,
+    powerScale: 0.643,
   },
   {
     id: 'bandit_crew',
@@ -716,7 +754,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_FIELD_SHAMAN, count: 1 },
     ],
     preferredMaps: ['dark', 'desert'],
-    powerScale: 1.183,
+    powerScale: 1.205,
   },
   {
     id: 'wraith_choir',
@@ -728,7 +766,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_SORROW_PRIEST, count: 1 },
     ],
     preferredMaps: ['dark', 'glacier'],
-    powerScale: 1.051,
+    powerScale: 1.06,
   },
   {
     id: 'orc_chieftain',
@@ -737,7 +775,7 @@ const MONSTER_LIST: MonsterDef[] = [
     desc: '부족을 홀로 이끄는 거대한 오크. 충격파(예고 1.2초, 반경 4)로 뭉친 적을 밀어내고 흔들리는 땅이 장판으로 남는다.',
     units: [{ template: T_ORC_CHIEFTAIN, count: 1 }],
     preferredMaps: ['plains', 'desert'],
-    powerScale: 0.364,
+    powerScale: 0.358,
   },
 
   // ══════════ 고급 ══════════
@@ -745,10 +783,10 @@ const MONSTER_LIST: MonsterDef[] = [
     id: 'ancient_golem',
     name: '고대 골렘',
     tier: 'high',
-    desc: '태고의 바위 거인 1기. 대지진(예고 1.4초, 반경 5, 3초 장판)과 대지 강타로 전열을 통째로 부순다. 예고를 보고 흩어지는 팀만 살아남는다.',
+    desc: '태고의 바위 거인 1기. 대지진(예고 1.4초, 반경 5, 3초 장판)과 대지 분쇄로 전열을 통째로 부순다. 예고를 보고 흩어지는 팀만 살아남는다.',
     units: [{ template: T_ANCIENT_GOLEM, count: 1 }],
     preferredMaps: ['desert', 'plains'],
-    powerScale: 0.280,
+    powerScale: 0.276,
   },
   {
     id: 'frost_dragon',
@@ -757,7 +795,7 @@ const MONSTER_LIST: MonsterDef[] = [
     desc: '홀로 하늘을 덮는 용. 빙하 감옥(예고 1.3초, 반경 4.5, 4초 냉기 장판)과 서리 숨결로 뭉친 적을 얼린다.',
     units: [{ template: T_FROST_DRAGON, count: 1 }],
     preferredMaps: ['glacier'],
-    powerScale: 0.312,
+    powerScale: 0.311,
   },
   {
     id: 'inferno_lord',
@@ -769,7 +807,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_DEMON_GUARD, count: 1 },
     ],
     preferredMaps: ['desert', 'dark'],
-    powerScale: 0.495,
+    powerScale: 0.479,
   },
   {
     id: 'lich_host',
@@ -782,7 +820,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_WRAITH_PRIEST, count: 1 },
     ],
     preferredMaps: ['dark', 'glacier'],
-    powerScale: 0.907,
+    powerScale: 1.000,
   },
   {
     id: 'abyss_pack',
@@ -794,7 +832,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_SHADOW_TENDRIL, count: 5 },
     ],
     preferredMaps: ['dark'],
-    powerScale: 1.110,
+    powerScale: 1.180,
   },
   {
     id: 'demon_legion',

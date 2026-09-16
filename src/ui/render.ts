@@ -8,9 +8,15 @@
  *  - active: 장판. 반투명 채움 + 가장자리 흐름
  *  - 'dodge' 이벤트: 해당 유닛 위에 '회피!'
  * 한 팀이 6명 이상(몬스터 1~8인 대열)이면 이름 글씨와 HP 바를 줄여 겹침을 줄인다.
+ *
+ * v0.6: 스킬명 외치기 연출.
+ *  - 'skill' 이벤트가 오면 시전자 머리 위에 말풍선(「메테오!」)을 띄운다. 시뮬레이션 시간 기준 SHOUT_LIFE_SEC 유지,
+ *    처음 SHOUT_POP_SEC 동안 확대(팝) 후 서서히 위로 떠오르며 사라진다. 배속과 무관하게 sim 시간으로만 진행한다.
+ *  - 흰 바탕 둥근 사각형 + 시전자 팀 색 테두리 + 굵은 글씨. 광역·장판 스킬은 글씨가 더 크고 테두리가 두껍다.
+ *  - 시전자 원은 PULSE_SEC 동안 PULSE_MULT 배로 커졌다 돌아온다. 같은 유닛이 연속 시전하면 이전 말풍선을 즉시 교체한다.
  */
 import type { BattleEvent, BattleFrame, BattleInput, MapDef, MonsterTier, StatusKind, Team, TeamSide, UnitSnapshot, ZoneSnapshot } from '../core/types';
-import { JOB_GLYPH, MONSTER_GLYPH, skillName } from './format';
+import { JOB_GLYPH, MONSTER_GLYPH, isZoneSkillId, skillName } from './format';
 
 /** 고정 순회 순서 */
 const SIDES: readonly TeamSide[] = ['A', 'B'];
@@ -90,6 +96,38 @@ function denseLabel(name: string): string {
 /** '회피!' 텍스트 색 */
 const DODGE_COLOR = '#8ef0ff';
 
+/** 스킬명 말풍선 유지 시간 (시뮬레이션 초) */
+const SHOUT_LIFE_SEC = 1.2;
+/** 말풍선 팝(확대) 구간 (시뮬레이션 초) */
+const SHOUT_POP_SEC = 0.15;
+/** 시전자 원 펄스 지속 시간 (시뮬레이션 초) 과 최대 배율 */
+const PULSE_SEC = 0.2;
+const PULSE_MULT = 1.25;
+/** 말풍선 글씨 크기 (맵 단위 배율): 일반 / 광역 */
+const SHOUT_FONT_SCALE = 0.5;
+const SHOUT_FONT_SCALE_ZONE = 0.68;
+/** 말풍선 테두리 두께 (맵 단위 배율): 일반 / 광역 */
+const SHOUT_BORDER_SCALE = 0.08;
+const SHOUT_BORDER_SCALE_ZONE = 0.16;
+/** 말풍선이 떠오르는 거리 (맵 단위) */
+const SHOUT_RISE = 1.1;
+/** 말풍선 바탕 / 글씨 색 */
+const SHOUT_BG = '#ffffff';
+const SHOUT_TEXT = '#1a1f2b';
+
+/** 시전자별 스킬명 외치기 상태. 한 시전자에 하나만 유지된다 */
+interface Shout {
+  casterId: string;
+  skillId: string;
+  text: string;
+  /** 시전 시각 (시뮬레이션 초) */
+  startTime: number;
+  isZone: boolean;
+  /** 시전자를 못 찾을 때 쓰는 위치 (맵 단위) */
+  x: number;
+  y: number;
+}
+
 interface FloatText {
   x: number;
   y: number;
@@ -103,6 +141,8 @@ interface FloatText {
 export class BattleRenderer {
   private readonly ctx: CanvasRenderingContext2D;
   private floats: FloatText[] = [];
+  /** 스킬명 말풍선. 시전자당 최대 1개. 배열 순서 = 최근 시전 순 (표시 전용) */
+  private shouts: Shout[] = [];
   private lastTick = -1;
   private summonIds = new Set<string>();
   /** 팀별 보스(몬스터 중 최대 HP) 유닛 id. 첫 draw 에서 한 번 계산한다 */
@@ -178,11 +218,12 @@ export class BattleRenderer {
     this.dense = isDenseFrame(frame);
 
     if (frame.tick !== this.lastTick) {
-      this.ingestEvents(frame.events, byId, frame.timeSec);
+      this.ingestEvents(frame.events, byId);
       this.lastTick = frame.tick;
     }
-    // 오래된 플로팅 텍스트 제거
+    // 오래된 플로팅 텍스트·말풍선 제거 (시뮬레이션 시간 기준. 리플레이·배속에서도 동일)
     this.floats = this.floats.filter((f) => frame.timeSec - f.born < FLOAT_LIFE_SEC);
+    this.shouts = this.shouts.filter((sh) => frame.timeSec - sh.startTime < SHOUT_LIFE_SEC && frame.timeSec >= sh.startTime);
 
     ctx.save();
     this.drawBackground(s);
@@ -207,13 +248,14 @@ export class BattleRenderer {
     for (const z of zones) if (z.phase === 'flash') this.drawFlash(z, s);
 
     this.drawFloats(frame.timeSec, s);
+    this.drawShouts(frame.timeSec, s, byId);
     this.drawOverlay(frame, s);
     ctx.restore();
   }
 
   // ───────────── 이벤트 → 플로팅 텍스트 ─────────────
 
-  private ingestEvents(events: BattleEvent[], byId: Map<string, UnitSnapshot>, t: number): void {
+  private ingestEvents(events: BattleEvent[], byId: Map<string, UnitSnapshot>): void {
     let n = 0;
     for (const e of events) {
       n++;
@@ -223,31 +265,30 @@ export class BattleRenderer {
           const u = byId.get(e.to);
           if (!u) break;
           if (e.miss) {
-            this.pushFloat(u.x, u.y, '회피', '#cfd8dc', false, t, jitter);
+            this.pushFloat(u.x, u.y, '회피', '#cfd8dc', false, e.t, jitter);
           } else {
             const txt = e.crit ? `${Math.round(e.damage)}!` : `${Math.round(e.damage)}`;
             const color = e.school === 'magic' ? '#c9a6ff' : '#ffffff';
-            this.pushFloat(u.x, u.y, txt, e.crit ? '#ffd54a' : color, e.crit, t, jitter);
+            this.pushFloat(u.x, u.y, txt, e.crit ? '#ffd54a' : color, e.crit, e.t, jitter);
           }
           break;
         }
         case 'heal': {
           const u = byId.get(e.to);
           if (!u) break;
-          this.pushFloat(u.x, u.y, `+${Math.round(e.amount)}`, '#7cf59a', false, t, jitter);
+          this.pushFloat(u.x, u.y, `+${Math.round(e.amount)}`, '#7cf59a', false, e.t, jitter);
           break;
         }
         case 'skill': {
+          // 스킬명 외치기: 플로팅 텍스트 대신 시전자 머리 위 말풍선 + 원 펄스
           const u = byId.get(e.from);
-          const x = u ? u.x : e.x;
-          const y = u ? u.y - 0.4 : e.y;
-          this.pushFloat(x, y, skillName(e.skillId), '#ffe9a8', false, t, jitter);
+          this.pushShout(e.from, e.skillId, u ? u.x : e.x, u ? u.y : e.y, e.t);
           break;
         }
         case 'kill': {
           const u = byId.get(e.victim);
           if (!u) break;
-          this.pushFloat(u.x, u.y - 0.8, '격파', '#ff8a80', true, t, 0);
+          this.pushFloat(u.x, u.y - 0.8, '격파', '#ff8a80', true, e.t, 0);
           break;
         }
         case 'status': {
@@ -255,19 +296,19 @@ export class BattleRenderer {
           const u = byId.get(e.to);
           if (!u) break;
           const label = STATUS_LABEL[e.status];
-          if (label) this.pushFloat(u.x, u.y + 0.6, label, STATUS_DOT[e.status] ?? '#ffffff', false, t, jitter);
+          if (label) this.pushFloat(u.x, u.y + 0.6, label, STATUS_DOT[e.status] ?? '#ffffff', false, e.t, jitter);
           break;
         }
         case 'summon': {
           const u = byId.get(e.unitId) ?? byId.get(e.owner);
           if (!u) break;
-          this.pushFloat(u.x, u.y, '소환', '#b3e5fc', false, t, jitter);
+          this.pushFloat(u.x, u.y, '소환', '#b3e5fc', false, e.t, jitter);
           break;
         }
         case 'dodge': {
           const u = byId.get(e.unit);
           if (!u) break;
-          this.pushFloat(u.x, u.y - 0.5, '회피!', DODGE_COLOR, true, t, 0);
+          this.pushFloat(u.x, u.y - 0.5, '회피!', DODGE_COLOR, true, e.t, 0);
           break;
         }
         case 'zone':
@@ -282,6 +323,26 @@ export class BattleRenderer {
   private pushFloat(x: number, y: number, text: string, color: string, big: boolean, born: number, jitter: number): void {
     this.floats.push({ x, y, text, color, born, big, jitter });
     if (this.floats.length > MAX_FLOATS) this.floats.splice(0, this.floats.length - MAX_FLOATS);
+  }
+
+  /** 시전자의 말풍선을 새로 만든다. 같은 시전자의 이전 말풍선은 즉시 교체된다 */
+  private pushShout(casterId: string, skillId: string, x: number, y: number, startTime: number): void {
+    for (let i = this.shouts.length - 1; i >= 0; i--) {
+      if (this.shouts[i].casterId === casterId) this.shouts.splice(i, 1);
+    }
+    this.shouts.push({ casterId, skillId, text: `${skillName(skillId)}!`, startTime, isZone: isZoneSkillId(skillId), x, y });
+  }
+
+  /** 시전 직후 원 펄스 배율 (1 → PULSE_MULT → 1, PULSE_SEC 동안). 시전 중이 아니면 1 */
+  private pulseOf(unitId: string, now: number): number {
+    for (let i = this.shouts.length - 1; i >= 0; i--) {
+      const sh = this.shouts[i];
+      if (sh.casterId !== unitId) continue;
+      const age = now - sh.startTime;
+      if (age < 0 || age >= PULSE_SEC) return 1;
+      return 1 + (PULSE_MULT - 1) * Math.sin(Math.PI * (age / PULSE_SEC));
+    }
+    return 1;
   }
 
   // ───────────── 배경 ─────────────
@@ -483,7 +544,8 @@ export class BattleRenderer {
     const isBoss = tier !== null && !!this.bossIds?.has(u.id);
     const x = u.x * s;
     const y = u.y * s;
-    const r = this.radiusOf(u, s);
+    // 스킬 시전 직후 PULSE_SEC 동안 원이 커졌다 돌아온다 (시뮬레이션 시간 기준)
+    const r = this.radiusOf(u, s) * this.pulseOf(u.id, frame.timeSec);
 
     const stealthed = u.statuses.some((st) => st.kind === 'stealth');
     const shield = u.statuses.find((st) => st.kind === 'shield');
@@ -624,7 +686,6 @@ export class BattleRenderer {
     }
 
     ctx.restore();
-    void frame;
   }
 
   // ───────────── 광역 영역 (Zone) ─────────────
@@ -782,6 +843,118 @@ export class BattleRenderer {
     ctx.restore();
   }
 
+  // ───────────── 스킬명 말풍선 ─────────────
+
+  /**
+   * 시전자 머리 위(HP 바·상태 점 위)에 스킬명 말풍선을 그린다.
+   *  - 0 ~ SHOUT_POP_SEC: 작게 시작해 살짝 넘치게 커진다 (팝)
+   *  - 이후: 위로 떠오르며 서서히 사라진다
+   * 말풍선은 캔버스 안에 들어오도록 위치를 보정한다.
+   */
+  private drawShouts(now: number, s: number, byId: Map<string, UnitSnapshot>): void {
+    if (this.shouts.length === 0) return;
+    const ctx = this.ctx;
+    const W = this.canvas.width;
+    const H = this.canvas.height;
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const sh of this.shouts) {
+      const age = now - sh.startTime;
+      if (age < 0 || age >= SHOUT_LIFE_SEC) continue;
+      const u = byId.get(sh.casterId);
+      const ux = u ? u.x : sh.x;
+      const uy = u ? u.y : sh.y;
+      const side: TeamSide = u ? u.side : 'A';
+      const r = u ? this.radiusOf(u, s) : UNIT_RADIUS * s;
+
+      // 팝: 0.55 → 약 1.12 → 1.0. 이후 1.0 유지
+      let scale: number;
+      if (age < SHOUT_POP_SEC) {
+        const p = age / SHOUT_POP_SEC;
+        scale = 0.55 + 0.45 * Math.sin((Math.PI / 2) * p) + 0.12 * Math.sin(Math.PI * p);
+      } else {
+        scale = 1;
+      }
+      // 떠오름·페이드: 팝 뒤부터 남은 시간 동안
+      const driftP = age <= SHOUT_POP_SEC ? 0 : (age - SHOUT_POP_SEC) / (SHOUT_LIFE_SEC - SHOUT_POP_SEC);
+      const rise = SHOUT_RISE * s * driftP;
+      const alpha = driftP < 0.45 ? 1 : Math.max(0, 1 - ((driftP - 0.45) / 0.55) ** 1.5);
+      if (alpha <= 0) continue;
+
+      const fontPx = Math.max(10, s * (sh.isZone ? SHOUT_FONT_SCALE_ZONE : SHOUT_FONT_SCALE)) * scale;
+      const border = Math.max(1, s * (sh.isZone ? SHOUT_BORDER_SCALE_ZONE : SHOUT_BORDER_SCALE)) * scale;
+      ctx.font = `bold ${fontPx}px sans-serif`;
+      const textW = ctx.measureText(sh.text).width;
+      const padX = fontPx * 0.5;
+      const padY = fontPx * 0.28;
+      const bw = textW + padX * 2;
+      const bh = fontPx + padY * 2;
+      const tail = Math.max(2, s * 0.22) * scale;
+      const radius = Math.min(bh / 2, fontPx * 0.45);
+
+      // 말풍선 바닥(꼬리 끝)이 HP 바·보호막 바·상태 점 위에 오게. drawUnit 과 같은 기하로 계산한다
+      // (HP 바 위치·상태 점 줄 높이는 밀집 모드에서도 바뀌지 않으므로 dense 와 무관하게 같은 값).
+      const barH = Math.max(2, s * 0.28);
+      const barY = uy * s - r - barH - s * 0.25;
+      const hasShield = u ? u.statuses.some((st) => st.kind === 'shield') : false;
+      const dotsTop = barY - s * 0.3 - (hasShield ? barH * 0.4 : 0) - Math.max(1.5, s * 0.16);
+      const anchorY = dotsTop - s * 0.08 - rise;
+      let cx = ux * s;
+      let bottom = anchorY - tail;
+      let top = bottom - bh;
+      // 캔버스 안으로 보정
+      const margin = border + 1;
+      if (cx - bw / 2 < margin) cx = margin + bw / 2;
+      if (cx + bw / 2 > W - margin) cx = W - margin - bw / 2;
+      if (top < margin) {
+        top = margin;
+        bottom = top + bh;
+      }
+      if (bottom + tail > H - margin) {
+        bottom = H - margin - tail;
+        top = bottom - bh;
+      }
+
+      ctx.globalAlpha = alpha;
+      const color = TEAM_COLOR[side];
+
+      // 바탕 (그림자 포함) + 테두리
+      ctx.beginPath();
+      roundRectPath(ctx, cx - bw / 2, top, bw, bh, radius);
+      ctx.fillStyle = SHOUT_BG;
+      ctx.shadowColor = 'rgba(0,0,0,0.45)';
+      ctx.shadowBlur = Math.max(2, s * 0.25);
+      ctx.shadowOffsetY = Math.max(1, s * 0.06);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetY = 0;
+      ctx.lineWidth = border;
+      ctx.strokeStyle = color;
+      ctx.stroke();
+
+      // 꼬리: 아래로 향하는 작은 삼각형 (시전자 쪽을 가리킨다). 바탕과 이어지도록 위쪽 변은 그리지 않는다
+      const tailX = Math.max(cx - bw / 2 + radius + tail, Math.min(cx + bw / 2 - radius - tail, ux * s));
+      ctx.beginPath();
+      ctx.moveTo(tailX - tail, bottom - border);
+      ctx.lineTo(tailX, bottom + tail);
+      ctx.lineTo(tailX + tail, bottom - border);
+      ctx.closePath();
+      ctx.fillStyle = SHOUT_BG;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(tailX - tail, bottom);
+      ctx.lineTo(tailX, bottom + tail);
+      ctx.lineTo(tailX + tail, bottom);
+      ctx.stroke();
+
+      // 글씨
+      ctx.fillStyle = SHOUT_TEXT;
+      ctx.fillText(sh.text, cx, top + bh / 2 + fontPx * 0.04);
+    }
+    ctx.restore();
+  }
+
   // ───────────── 오버레이 ─────────────
 
   private drawOverlay(frame: BattleFrame, s: number): void {
@@ -858,6 +1031,21 @@ function lineCorners(z: ZoneSnapshot, frac0: number, frac1: number): { x: number
     { x: ex - nx, y: ey - ny },
     { x: sx - nx, y: sy - ny },
   ];
+}
+
+/** 둥근 사각형 경로 (현재 path 에 추가). 브라우저 roundRect 지원에 의존하지 않는다 */
+function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number): void {
+  const rr = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
 }
 
 function hexToRgba(hex: string, alpha: number): string {

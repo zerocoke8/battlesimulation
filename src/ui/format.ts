@@ -28,7 +28,7 @@ import {
   type VictoryRule,
 } from '../core/types';
 import { SUBJOBS } from '../core/data/jobs';
-import { getSkill } from '../core/data/skills';
+import { getSkill, isZoneSkill } from '../core/data/skills';
 import { powerRating, statTotal } from '../core/stats';
 import { expectedPlayerPower } from '../core/data/monsters';
 
@@ -147,6 +147,20 @@ export function skillName(id: string): string {
     return getSkill(id).name;
   } catch {
     return id;
+  }
+}
+
+/**
+ * 광역(영역)을 만드는 스킬인지: enemy_area / line / ally_area 대상이거나 장판(linger)이 있는 스킬.
+ * 모르는 id 면 false. 예외를 던지지 않는다 (스킬명 외치기 연출의 크기 결정용).
+ */
+export function isZoneSkillId(id: string): boolean {
+  if (isZoneSkill(id)) return true;
+  try {
+    // 아군 광역(광역 치유 등)도 표시용 영역을 남기므로 말풍선은 광역으로 취급한다
+    return getSkill(id).target === 'ally_area';
+  } catch {
+    return false;
   }
 }
 

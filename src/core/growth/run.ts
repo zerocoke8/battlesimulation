@@ -18,7 +18,7 @@ import type {
   RunState, StepKind, SynergyDef, Team,
 } from '../types';
 import {
-  BASE_STAT_KEYS, BATTLE_STEP, MAP_TYPES, MONSTER_STEP, MONSTER_TIER_NAME_KO,
+  BASE_STAT_KEYS, BATTLE_STEP, CHOICE_STEPS, MAP_TYPES, MONSTER_STEP, MONSTER_TIER_NAME_KO,
   STAT_MAX, STEPS_PER_DAY, STEP_KIND_NAME_KO, SUBJOB_DAY_MAX, SUBJOB_DAY_MIN,
   TEAM_SIZE, TOTAL_DAYS, stepKindOf,
 } from '../types';
@@ -203,24 +203,61 @@ export function stepLabel(state: RunState): string {
 
 // ───────────────────────── 분화 예정 ─────────────────────────
 
-/** 미분화 캐릭터의 분화 예정 일차를 보장한다 (직업 변경 등으로 생긴 누락/지연분 보정). */
+/**
+ * 미분화 캐릭터의 분화 예정 일차를 보장한다 (직업 변경 등으로 생긴 누락/지연분 보정).
+ *
+ * 하루의 선택 스텝은 CHOICE_STEPS.length 개뿐이고 분화 세트는 스텝당 한 명이므로, 같은 날에 예정된 미분화 인원이
+ * 그날 남은 선택 스텝 수를 넘지 않게 한다 (넘치면 원래 예정일을 지키던 캐릭터까지 다음 날로 밀렸다).
+ *  1) 예정일이 이미 지난(이월) 캐릭터는 오늘부터 빈 슬롯이 있는 첫 날을 잡는다.
+ *  2) 예정이 없는(직업 변경 직후) 캐릭터는 [max(오늘, SUBJOB_DAY_MIN), SUBJOB_DAY_MAX] 중 빈 슬롯이 남은 날에서 고른다.
+ *     남은 날이 없으면 그 뒤 첫 빈 날. 이 함수는 항상 다음 선택지 세트를 만들기 직전에 불리므로 현재 스텝도 남은 슬롯으로 센다.
+ */
 function ensureSubJobSchedule(state: RunState): void {
   const team = requireTeam(state);
   const rng = rngFor(state, 'subjob_schedule', state.history.length);
+  const maxPerDay = CHOICE_STEPS.length;
+  let remainingToday = 0;
+  for (const s of CHOICE_STEPS) if (s >= state.step) remainingToday++;
+  if (remainingToday < 1) remainingToday = 1;
+  const capOf = (day: number): number => (day === state.day ? remainingToday : maxPerDay);
+
+  const counts = new Map<number, number>();
+  const countOf = (day: number): number => counts.get(day) ?? 0;
+  const assign = (id: string, day: number): void => {
+    state.subJobChoiceDay[id] = day;
+    counts.set(day, countOf(day) + 1);
+  };
+  const firstFreeFrom = (from: number): number => {
+    let d = from;
+    while (d < TOTAL_DAYS && countOf(d) >= capOf(d)) d++;
+    return d;
+  };
+
+  const carried: Character[] = [];
+  const unscheduled: Character[] = [];
   for (const c of team.members) {
     if (c.subJob !== null || JOBS[c.mainJob].subJobs.length === 0) {
       delete state.subJobChoiceDay[c.id];
       continue;
     }
     const due = state.subJobChoiceDay[c.id];
-    if (due !== undefined && due >= state.day) continue;
-    if (due !== undefined && due < state.day) {
-      // 같은 날에 여러 명이 몰려 밀린 경우: 오늘로 이월
-      state.subJobChoiceDay[c.id] = state.day;
+    if (due === undefined) unscheduled.push(c);
+    else if (due < state.day) carried.push(c);
+    else counts.set(due, countOf(due) + 1);
+  }
+  // 1) 이월: 오늘부터 빈 슬롯이 있는 첫 날 (팀 순서 고정)
+  for (const c of carried) assign(c.id, firstFreeFrom(state.day));
+  // 2) 미배정: 보장 구간 안에서 빈 슬롯이 남은 날 중 하나
+  for (const c of unscheduled) {
+    if (state.day >= SUBJOB_DAY_MAX) {
+      assign(c.id, firstFreeFrom(state.day));
       continue;
     }
-    if (state.day >= SUBJOB_DAY_MAX) state.subJobChoiceDay[c.id] = state.day;
-    else state.subJobChoiceDay[c.id] = rng.int(Math.max(state.day, SUBJOB_DAY_MIN), SUBJOB_DAY_MAX);
+    const lo = Math.max(state.day, SUBJOB_DAY_MIN);
+    const candidates: number[] = [];
+    for (let d = lo; d <= SUBJOB_DAY_MAX; d++) if (countOf(d) < capOf(d)) candidates.push(d);
+    if (candidates.length > 0) assign(c.id, candidates[rng.int(0, candidates.length - 1)]);
+    else assign(c.id, firstFreeFrom(SUBJOB_DAY_MAX + 1));
   }
 }
 

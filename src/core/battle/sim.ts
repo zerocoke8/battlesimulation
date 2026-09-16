@@ -1122,7 +1122,9 @@ class Battle implements BattleSimulator {
         // 죽은 유닛은 행동하지 않는다: 시전자가 죽었으면 지속 피해의 딜량/킬 공적을 주지 않는다
         const srcRaw = s.source >= 0 ? this.units[s.source] : null;
         const src = srcRaw && srcRaw.alive ? srcRaw : null;
-        this.dealDamage(src, u, s.value * dt, s.kind === 'burn' ? 'magic' : 'phys', false, false);
+        const ev = { t: this.time, kind: 'dot' as const, from: src ? src.id : null, to: u.id, status: s.kind, damage: 0 };
+        this.pushEvent(ev);
+        ev.damage = this.dealDamage(src, u, s.value * dt, s.kind === 'burn' ? 'magic' : 'phys', false, false);
         if (!u.alive) return;
       } else if (s.kind === 'regen') {
         this.heal(s.source >= 0 ? this.units[s.source] : null, u, s.value * dt, false);
@@ -1520,7 +1522,9 @@ class Battle implements BattleSimulator {
 
   private applyReflect(attacker: Unit, victim: Unit, amount: number): void {
     if (amount <= 0 || !attacker.alive || attacker === victim) return;
-    this.dealDamage(victim, attacker, amount, 'phys', false, false);
+    const ev = { t: this.time, kind: 'reflect' as const, from: victim.id, to: attacker.id, damage: 0 };
+    this.pushEvent(ev);
+    ev.damage = Math.round(this.dealDamage(victim, attacker, amount, 'phys', false, false));
   }
 
   private kill(victim: Unit, killer: Unit | null): void {
@@ -1687,13 +1691,28 @@ class Battle implements BattleSimulator {
   // ───────── 스킬 ─────────
 
   private trySkills(u: Unit): boolean {
+    // 사용 가능한 스킬이 여럿이면 슬롯 순서가 아니라 MP 소모가 가장 큰(=가장 강한) 스킬을 먼저 쓴다.
+    // 슬롯 순서대로 첫 스킬을 쓰면 메테오 같은 비싼 대표기가 MP 가 모이기 전에 싼 스킬에 밀려 거의 발동하지 않는다.
+    // 동률이면 슬롯 순서. 후보 탐색 순서가 고정이므로 결정론은 유지된다.
+    let bestI = -1;
+    let bestTgt: { idx: number; x: number; y: number } | null = null;
+    let bestCost = -1;
     for (let i = 0; i < u.activeSkills.length; i++) {
       if (u.cooldowns[i] > 0) continue;
       const sk = u.activeSkills[i];
       if (u.mp < sk.mpCost) continue;
+      if (sk.mpCost <= bestCost) continue;
       const tgt = this.findSkillTarget(u, sk);
       if (!tgt) continue;
       if (!this.checkCondition(u, sk, tgt.idx)) continue;
+      bestI = i;
+      bestTgt = tgt;
+      bestCost = sk.mpCost;
+    }
+    if (bestI >= 0 && bestTgt) {
+      const i = bestI;
+      const sk = u.activeSkills[i];
+      const tgt = bestTgt;
       if (sk.castTimeSec > 0) {
         // MP 와 쿨타임은 시전 완료(executeSkill) 시점에 소모된다. 그래서 시전이 취소되면 자연히 환불·미시작 상태다.
         u.cast = { skillIdx: i, targetIdx: tgt.idx, tx: tgt.x, ty: tgt.y, progress: 0, total: sk.castTimeSec };
@@ -1986,7 +2005,7 @@ class Battle implements BattleSimulator {
             const t = targets[ti];
             if (!t.alive) continue;
             if (e.school === 'phys' && !this.hitRollAcc(src.accuracy, t)) {
-              this.pushEvent({ t: this.time, kind: 'attack', from: u.id, to: t.id, damage: 0, crit: false, school: 'phys', miss: true });
+              this.pushEvent({ t: this.time, kind: 'attack', from: u.id, to: t.id, damage: 0, crit: false, school: 'phys', miss: true, skillId: sk.id });
               continue;
             }
             const def = (e.school === 'phys' ? t.eff.physDef : t.eff.magDef) * (1 - ignore);
@@ -1995,7 +2014,8 @@ class Battle implements BattleSimulator {
             if (crit) dmg *= src.critMult / 100;
             const reflect = this.reflectAmount(t, dmg, e.school);
             // 공격 이벤트 → 피해(킬) → 반사 순서 유지: 이벤트를 먼저 넣고 피해량을 채운다
-            const ev = { t: this.time, kind: 'attack' as const, from: u.id, to: t.id, damage: 0, crit, school: e.school };
+            // skillId 를 실어 기본 공격과 구분한다 (헤드리스 스킬 피해 비중 측정)
+            const ev = { t: this.time, kind: 'attack' as const, from: u.id, to: t.id, damage: 0, crit, school: e.school, skillId: sk.id };
             this.pushEvent(ev);
             ev.damage = Math.round(this.dealDamage(u, t, dmg, e.school, false, true));
             this.applyReflect(u, t, reflect);
@@ -2417,7 +2437,10 @@ class Battle implements BattleSimulator {
       if (base > 0) {
         const def = z.lingerSchool === 'phys' ? e.eff.physDef : e.eff.magDef;
         const dmg = base * (100 / (100 + Math.max(0, def)));
-        this.dealDamage(caster, e, dmg, z.lingerSchool, false, false);
+        // 이벤트 → 피해(킬) 순서 유지: 이벤트를 먼저 넣고 실제 HP 감소량을 채운다
+        const ev = { t: this.time, kind: 'zone_damage' as const, from: caster.id, to: e.id, skillId: z.skill.id, damage: 0, school: z.lingerSchool };
+        this.pushEvent(ev);
+        ev.damage = this.dealDamage(caster, e, dmg, z.lingerSchool, false, false);
         if (!e.alive) continue;
       }
       if (st) {
@@ -2578,6 +2601,8 @@ class Battle implements BattleSimulator {
 
   private pushEvent(e: BattleEvent): void {
     this.events.push(e);
+    // 틱 단위 이벤트(장판·지속 피해)는 프레임에만 싣는다. 결과 이벤트 상한을 그것들이 채우면 킬·종료 같은 이벤트가 잘린다
+    if (e.kind === 'zone_damage' || e.kind === 'dot') return;
     if (this.allEvents.length < MAX_RESULT_EVENTS) this.allEvents.push(e);
   }
 

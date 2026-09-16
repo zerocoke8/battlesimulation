@@ -1,6 +1,11 @@
 /**
  * 직업 9종 × 세부 직업 3종 정의 (GDD §3.1).
  * 스킬 id 는 문자열로만 참조한다 (skills.ts 가 이 파일을 import 하므로 순환 방지).
+ *
+ * v0.6 풀 규약:
+ *  - 모든 메인 직업의 기본 풀(skillPool)에는 적 광역 피해 스킬이 최소 1개 있다 (검사 회전 베기, 탱커 충격파, 버서커 대지 강타,
+ *    암살자 연막 단검, 궁수 화살비, 저격수 폭발탄, 마법사 마력 폭발·비전 폭풍·메테오, 소환사 정령 폭발, 힐러 심판의 빛).
+ *  - 마법사 starterSkills 는 둘 다 광역이다. 기본 풀 5~7개, 세부 직업 풀 2~4개를 유지한다.
  */
 import type { BaseStatKey, JobDef, MainJob, SubJobDef, SubJobId } from '../types';
 import { MAIN_JOBS } from '../types';
@@ -200,7 +205,7 @@ const MAGE_SUBJOBS: SubJobDef[] = [
     statBonus: { magicPower: 10, mana: 5, courage: 4 },
     growthMod: { magicPower: 1.3, mana: 1.1, courage: 1.1 },
     grantedSkills: ['mage_fire_fireball'],
-    skillPool: ['mage_fire_storm', 'mage_fire_armor'],
+    skillPool: ['mage_fire_storm', 'mage_fire_rain', 'mage_fire_armor'],
   },
   {
     id: 'mage_lightning',
@@ -209,7 +214,7 @@ const MAGE_SUBJOBS: SubJobDef[] = [
     statBonus: { castSpeed: 10, focus: 6, magicPower: 4 },
     growthMod: { castSpeed: 1.3, focus: 1.15, magicPower: 1.1 },
     grantedSkills: ['mage_lightning_chain'],
-    skillPool: ['mage_lightning_field'],
+    skillPool: ['mage_lightning_field', 'mage_lightning_storm'],
   },
   {
     id: 'mage_ice',
@@ -218,7 +223,7 @@ const MAGE_SUBJOBS: SubJobDef[] = [
     statBonus: { composure: 8, resistance: 8, magicPower: 4 },
     growthMod: { composure: 1.2, resistance: 1.2, magicPower: 1.1 },
     grantedSkills: ['mage_ice_shard'],
-    skillPool: ['mage_ice_nova'],
+    skillPool: ['mage_ice_nova', 'mage_ice_blizzard'],
   },
 ];
 
@@ -378,7 +383,7 @@ export const JOBS: Record<MainJob, JobDef> = {
     growth: growthFromProfile(TANK_PROFILE, { vitality: 1.5, defenseTech: 1.45, courage: 1.35, agility: 0.7, magicPower: 0.5 }),
     hpBonus: 150,
     starterSkills: ['tank_bash', 'tank_endurance'],
-    skillPool: ['tank_bash', 'tank_fortify', 'tank_shield_wall', 'tank_endurance', 'tank_bulwark'],
+    skillPool: ['tank_bash', 'tank_shockwave', 'tank_fortify', 'tank_shield_wall', 'tank_endurance', 'tank_bulwark'],
     subJobs: TANK_SUBJOBS,
   },
   berserker: {
@@ -392,7 +397,7 @@ export const JOBS: Record<MainJob, JobDef> = {
     growth: growthFromProfile(BERSERKER_PROFILE, { strength: 1.5, courage: 1.45, critical: 1.3, judgment: 0.7, composure: 0.7, magicPower: 0.5 }),
     hpBonus: 90,
     starterSkills: ['berserker_smash', 'berserker_thick_skin'],
-    skillPool: ['berserker_rage', 'berserker_smash', 'berserker_leap', 'berserker_reckless', 'berserker_thick_skin'],
+    skillPool: ['berserker_rage', 'berserker_smash', 'berserker_ground_slam', 'berserker_leap', 'berserker_reckless', 'berserker_thick_skin'],
     subJobs: BERSERKER_SUBJOBS,
   },
   assassin: {
@@ -407,7 +412,7 @@ export const JOBS: Record<MainJob, JobDef> = {
     // v0.5 보정: 100 → 140. 10일차 암살자 승률 36% (하한 35%)·생존율 19% 로 전 직업 최저였다
     hpBonus: 140,
     starterSkills: ['assassin_ambush', 'assassin_smoke'],
-    skillPool: ['assassin_stealth', 'assassin_ambush', 'assassin_shadowstep', 'assassin_smoke', 'assassin_lethal'],
+    skillPool: ['assassin_stealth', 'assassin_ambush', 'assassin_smoke_daggers', 'assassin_shadowstep', 'assassin_smoke', 'assassin_lethal'],
     subJobs: ASSASSIN_SUBJOBS,
   },
   archer: {
@@ -421,7 +426,7 @@ export const JOBS: Record<MainJob, JobDef> = {
     growth: growthFromProfile(ARCHER_PROFILE, { accuracy: 1.4, agility: 1.3, critical: 1.2, defenseTech: 0.8, magicPower: 0.6 }),
     hpBonus: 0,
     starterSkills: ['archer_power_shot', 'archer_quick_draw'],
-    skillPool: ['archer_power_shot', 'archer_multishot', 'archer_retreat_shot', 'archer_eagle_eye', 'archer_quick_draw'],
+    skillPool: ['archer_power_shot', 'archer_multishot', 'archer_arrow_rain', 'archer_retreat_shot', 'archer_eagle_eye', 'archer_quick_draw'],
     subJobs: ARCHER_SUBJOBS,
   },
   sniper: {
@@ -435,7 +440,7 @@ export const JOBS: Record<MainJob, JobDef> = {
     growth: growthFromProfile(SNIPER_PROFILE, { accuracy: 1.5, critical: 1.45, focus: 1.4, vitality: 0.7, defenseTech: 0.7, magicPower: 0.6 }),
     hpBonus: -30,
     starterSkills: ['sniper_snipe', 'sniper_steady'],
-    skillPool: ['sniper_snipe', 'sniper_kneecap', 'sniper_finisher', 'sniper_steady', 'sniper_long_barrel'],
+    skillPool: ['sniper_snipe', 'sniper_kneecap', 'sniper_explosive_shot', 'sniper_finisher', 'sniper_steady', 'sniper_long_barrel'],
     subJobs: SNIPER_SUBJOBS,
   },
   mage: {
@@ -448,8 +453,9 @@ export const JOBS: Record<MainJob, JobDef> = {
     statProfile: MAGE_PROFILE,
     growth: growthFromProfile(MAGE_PROFILE, { magicPower: 1.5, mana: 1.4, castSpeed: 1.4, manaRegen: 1.3, strength: 0.5, defenseTech: 0.7 }),
     hpBonus: -20,
-    starterSkills: ['mage_bolt', 'mage_meditation'],
-    skillPool: ['mage_bolt', 'mage_blast', 'mage_barrier', 'mage_meditation', 'mage_arcane_mind'],
+    // v0.6: 시작 스킬은 광역 2종 중 하나. 분화 전에도 광역 장판(비전 폭풍·메테오)을 쓸 수 있게 기본 풀에 넣는다
+    starterSkills: ['mage_blast', 'mage_arcane_storm'],
+    skillPool: ['mage_bolt', 'mage_blast', 'mage_arcane_storm', 'mage_meteor', 'mage_barrier', 'mage_meditation', 'mage_arcane_mind'],
     subJobs: MAGE_SUBJOBS,
   },
   summoner: {
@@ -463,7 +469,7 @@ export const JOBS: Record<MainJob, JobDef> = {
     growth: growthFromProfile(SUMMONER_PROFILE, { mana: 1.45, manaRegen: 1.4, magicPower: 1.3, teamwork: 1.3, strength: 0.6, agility: 0.8 }),
     hpBonus: 0,
     starterSkills: ['summoner_call_beast', 'summoner_bond'],
-    skillPool: ['summoner_call_beast', 'summoner_drain', 'summoner_empower', 'summoner_bond', 'summoner_deep_well'],
+    skillPool: ['summoner_call_beast', 'summoner_drain', 'summoner_spirit_burst', 'summoner_empower', 'summoner_bond', 'summoner_deep_well'],
     subJobs: SUMMONER_SUBJOBS,
   },
   healer: {
@@ -477,7 +483,7 @@ export const JOBS: Record<MainJob, JobDef> = {
     growth: growthFromProfile(HEALER_PROFILE, { magicPower: 1.4, teamwork: 1.45, composure: 1.3, castSpeed: 1.3, strength: 0.5, critical: 0.6 }),
     hpBonus: 20,
     starterSkills: ['healer_heal', 'healer_blessing'],
-    skillPool: ['healer_heal', 'healer_group_heal', 'healer_smite', 'healer_blessing', 'healer_serenity'],
+    skillPool: ['healer_heal', 'healer_group_heal', 'healer_smite', 'healer_judgment', 'healer_blessing', 'healer_serenity'],
     subJobs: HEALER_SUBJOBS,
   },
 };

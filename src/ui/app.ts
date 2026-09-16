@@ -95,6 +95,7 @@ import {
   safePower,
   skillName,
   skillTypeKo,
+  isZoneSkillId,
   stars,
   statsOfCategory,
   stepLabel,
@@ -107,6 +108,17 @@ import {
 type View = 'start' | 'run' | 'pvp_setup' | 'battle' | 'result';
 /** 'run' = 4:4 전투, 'monster' = 몬스터 전투, 'pvp' = 완성팀 대전 */
 type BattleMode = 'run' | 'monster' | 'pvp';
+
+/** 전투 화면 하단 로그 한 줄. seq 는 발생 순서 (표시 정렬용) */
+interface KillLogLine {
+  seq: number;
+  kind: 'kill' | 'skill';
+  html: string;
+}
+/** 킬 로그에 보이는 격파·점령·종료 줄 수 */
+const KILL_LOG_KILL_MAX = 6;
+/** 킬 로그에 남기는 스킬 줄 수 (로그가 넘치지 않게 최근 것만) */
+const KILL_LOG_SKILL_MAX = 3;
 
 interface BattleSession {
   mode: BattleMode;
@@ -121,7 +133,8 @@ interface BattleSession {
   raf: number;
   renderer: BattleRenderer | null;
   frame: BattleFrame;
-  killLog: string[];
+  /** 킬 로그 줄 (HTML). kill = 격파·점령·종료, skill = '이름: 스킬명!' (최근 KILL_LOG_SKILL_MAX 개만 유지) */
+  killLog: KillLogLine[];
   hud: {
     time: HTMLElement | null;
     hpA: HTMLElement | null;
@@ -1123,6 +1136,27 @@ function loop(ts: number): void {
   b.raf = requestAnimationFrame(loop);
 }
 
+/** 로그 줄을 추가한다. 스킬 줄은 최근 KILL_LOG_SKILL_MAX 개만 남기고, 격파 줄은 영향을 받지 않는다 */
+function pushKillLog(b: BattleSession, kind: KillLogLine['kind'], html: string): void {
+  const seq = b.killLog.length > 0 ? b.killLog[b.killLog.length - 1].seq + 1 : 1;
+  b.killLog.push({ seq, kind, html });
+  if (kind === 'skill') {
+    let n = 0;
+    for (let i = b.killLog.length - 1; i >= 0; i--) {
+      if (b.killLog[i].kind !== 'skill') continue;
+      n++;
+      if (n > KILL_LOG_SKILL_MAX) b.killLog.splice(i, 1);
+    }
+  }
+}
+
+/** 화면에 보일 로그 줄: 최근 격파 줄 KILL_LOG_KILL_MAX 개 + 스킬 줄 (최대 KILL_LOG_SKILL_MAX 개), 발생 순서대로 */
+function visibleKillLog(b: BattleSession): KillLogLine[] {
+  const kills = b.killLog.filter((l) => l.kind === 'kill').slice(-KILL_LOG_KILL_MAX);
+  const skills = b.killLog.filter((l) => l.kind === 'skill').slice(-KILL_LOG_SKILL_MAX);
+  return kills.concat(skills).sort((a, c) => a.seq - c.seq);
+}
+
 function handleEvents(b: BattleSession, events: BattleEvent[], frame: BattleFrame): void {
   let touched = false;
   for (const e of events) {
@@ -1131,22 +1165,29 @@ function handleEvents(b: BattleSession, events: BattleEvent[], frame: BattleFram
       const victim = frame.units.find((x) => x.id === e.victim);
       const ks = killer ? `<span class="side-${killer.side}-text">${escapeHtml(killer.name)}</span>` : escapeHtml(e.killer);
       const vs = victim ? `<span class="side-${victim.side}-text">${escapeHtml(victim.name)}</span>` : escapeHtml(e.victim);
-      b.killLog.push(`[${fmtSec(e.t)}] ${ks} → ${vs} 격파`);
+      pushKillLog(b, 'kill', `[${fmtSec(e.t)}] ${ks} → ${vs} 격파`);
       touched = true;
     } else if (e.kind === 'capture' && e.progress >= 1) {
-      b.killLog.push(`[${fmtSec(e.t)}] ${e.side === 'A' ? b.input.teamA.name : b.input.teamB.name} 거점 점령!`);
+      pushKillLog(b, 'kill', `[${fmtSec(e.t)}] ${e.side === 'A' ? b.input.teamA.name : b.input.teamB.name} 거점 점령!`);
       touched = true;
     } else if (e.kind === 'end') {
-      b.killLog.push(`[${fmtSec(e.t)}] 전투 종료 — ${e.winner === 'draw' ? '무승부' : `${winnerLabel(b.input, e.winner)} 승리`} (${reasonKo(e.reason)})`);
+      pushKillLog(b, 'kill', `[${fmtSec(e.t)}] 전투 종료 — ${e.winner === 'draw' ? '무승부' : `${winnerLabel(b.input, e.winner)} 승리`} (${reasonKo(e.reason)})`);
+      touched = true;
+    } else if (e.kind === 'skill') {
+      // 스킬명 외치기: '이름: 스킬명!' (모르는 스킬 id 는 id 그대로. 예외 없음)
+      const caster = frame.units.find((x) => x.id === e.from);
+      const cs = caster ? `<span class="side-${caster.side}-text">${escapeHtml(caster.name)}</span>` : escapeHtml(e.from);
+      const zone = isZoneSkillId(e.skillId) ? ' zone' : '';
+      pushKillLog(b, 'skill', `[${fmtSec(e.t)}] ${cs}: <span class="skill-shout${zone}">${escapeHtml(skillName(e.skillId))}!</span>`);
       touched = true;
     }
   }
   if (touched && b.hud.kills) {
     clear(b.hud.kills);
-    const last = b.killLog.slice(-6);
-    for (const line of last) {
+    for (const line of visibleKillLog(b)) {
       const li = document.createElement('li');
-      li.innerHTML = line;
+      if (line.kind === 'skill') li.className = 'skill-line';
+      li.innerHTML = line.html;
       b.hud.kills.appendChild(li);
     }
   }

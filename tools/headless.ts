@@ -1,7 +1,8 @@
 /**
- * 헤드리스 대량 시뮬레이션 / 밸런싱 CLI (v0.5 — 4:4, 몬스터 1~8인, 광역 예고·회피·장판).
+ * 헤드리스 대량 시뮬레이션 / 밸런싱 CLI (v0.6 — 4:4, 몬스터 1~8인, 광역 예고·회피·장판, 스킬 피해 비중).
  *
  *   npm run headless -- --games 200 --seed 1 [--map plains] [--day 5] [--json]
+ *   npm run headless -- --skills [--games 200] [--seed 1] [--day 10] [--json]
  *   npm run headless -- --determinism [--seed 1] [--map dark] [--day 5]
  *   npm run headless -- --growth [--policy greedy|first|random] [--seed 1] [--json]
  *   npm run headless -- --monster [--runs 60] [--seed 1] [--json]
@@ -74,7 +75,7 @@ import * as simModule from '../src/core/battle/sim';
 import { createBattle } from '../src/core/battle/sim';
 import { generateOpponentTeam } from '../src/core/gen/charGen';
 import { computeDerived, powerRating, statTotal } from '../src/core/stats';
-import { SKILLS, skillPoolFor } from '../src/core/data/skills';
+import { SKILLS, UTILITY_SKILL_IDS, skillPoolFor } from '../src/core/data/skills';
 import { JOBS } from '../src/core/data/jobs';
 
 // ───────────────────────── 모듈 어댑터 ─────────────────────────
@@ -281,6 +282,8 @@ interface CliOptions {
   monster: boolean;
   rarity: boolean;
   dodge: boolean;
+  /** --skills: 스킬 피해 비중·주력기 1회 피해 표와 직업별 기본 풀 광역 검사 */
+  skills: boolean;
   /** --dodge: 유닛당 판정 횟수 */
   trials: number;
   /** --dodge: 시험 광역 스킬 id */
@@ -308,6 +311,7 @@ function parseArgs(argv: string[]): CliOptions {
     monster: false,
     rarity: false,
     dodge: false,
+    skills: false,
     trials: DEFAULT_DODGE_TRIALS,
     skill: DEFAULT_DODGE_SKILL,
     telegraph: null,
@@ -416,6 +420,9 @@ function parseArgs(argv: string[]): CliOptions {
       case '--dodge':
         opts.dodge = true;
         break;
+      case '--skills':
+        opts.skills = true;
+        break;
       case '--json':
         opts.json = true;
         break;
@@ -437,7 +444,8 @@ function printHelp(): void {
       '',
       '사용법: npm run headless -- [옵션]',
       '',
-      '  --games N        시뮬레이션 판 수 (기본 100, 기본 모드). 광역·회피 통계도 함께 집계',
+      '  --games N        시뮬레이션 판 수 (기본 100, 기본 모드). 광역·회피 통계, 스킬 피해 비중, 주력기 1회 피해 표도 함께 집계',
+      '  --skills         --games N 판을 돌려 스킬 피해 비중·주력기 표를 스킬별 전체 목록으로 뽑고, 직업별 기본 풀에 광역 피해 스킬이 있는지 검사 (PASS/FAIL)',
       '  --seed S         루트 시드 (기본 1)',
       '  --map M          plains | dark | desert | glacier | random (기본 random)',
       '  --day D          양 팀을 생성할 육성 일차 1~10 (기본 5). --cycle 은 같은 뜻의 옛 이름',
@@ -679,6 +687,176 @@ interface TrackedZone {
 interface TrackedBattle {
   result: BattleResult;
   zones: ZoneStats;
+  damage: DamageStats;
+}
+
+// ───────────────────────── 피해 출처 분류 (스킬 vs 기본 공격) — v0.6 [3] ─────────────────────────
+//
+// sim 이 프레임 이벤트에 출처를 실어 준다 (types.ts BattleEvent):
+//  - 'attack' 에 skillId 가 있으면 스킬 피해 효과(즉시 또는 광역 impact), 없으면 기본 공격 (시전자 스냅샷의 job 이 'summon' 이면 소환물).
+//  - 'zone_damage' = 장판 한 틱의 피해 (skillId 포함). 'dot' = 화상·중독 한 틱. 'reflect' = 반사.
+// 그래서 추정 규칙 없이 이벤트만 더한다. 전체 피해 = Σ unitStats.damageTaken (양 팀).
+// 스킬 피해 비중 = (전체 − 캐릭터 기본 공격 − 소환물 기본 공격) / 전체.
+// 분류 합과 전체의 차이('미분류')는 attack/reflect 이벤트 피해량의 반올림(이벤트당 ±0.5)뿐이다.
+// 화상·중독은 어느 스킬이 걸었는지 이벤트에 없어(상태에 skillId 가 없다) 전체 비중에는 들어가지만 스킬별 합에는 들어가지 않는다.
+
+interface SkillDamageAgg {
+  skillId: string;
+  /** 'skill' 이벤트 수 */
+  uses: number;
+  /** 스킬로 분류된 비-miss attack 이벤트 수 (즉시 + impact) */
+  hits: number;
+  misses: number;
+  directDamage: number;
+  /** Σ (1회 피해 / 그 순간 대상 최대 HP) — hits 로 나누면 평균 % */
+  hitPctSum: number;
+  /** 장판 zone_damage 이벤트 피해 */
+  lingerDamage: number;
+  /** 단독 장판 표본: Σ (틱 잔여 / 대상 최대 HP) */
+  lingerPctSum: number;
+  /** 단독 장판 표본의 Σ dt (초) */
+  lingerSec: number;
+}
+
+interface DamageStats {
+  /** Σ unitStats.damageTaken (양 팀 전부) */
+  total: number;
+  /** 캐릭터 기본 공격 attack 이벤트 피해 */
+  basic: number;
+  basicHits: number;
+  /** 소환물 기본 공격 */
+  summon: number;
+  /** 스킬 attack 이벤트 피해 (즉시 + 광역 impact) */
+  skillDirect: number;
+  /** 장판 zone_damage 이벤트 피해 (perSkill.lingerDamage 합) */
+  linger: number;
+  /** 화상·중독 dot 이벤트 피해 */
+  dot: number;
+  /** 반사 reflect 이벤트 피해 */
+  other: number;
+  /** 스킬 id → 집계 (등장 순서 고정) */
+  perSkill: Map<string, SkillDamageAgg>;
+}
+
+function emptyDamageStats(): DamageStats {
+  return { total: 0, basic: 0, basicHits: 0, summon: 0, skillDirect: 0, linger: 0, dot: 0, other: 0, perSkill: new Map() };
+}
+
+function skillAggOf(stats: DamageStats, skillId: string): SkillDamageAgg {
+  let a = stats.perSkill.get(skillId);
+  if (!a) {
+    a = { skillId, uses: 0, hits: 0, misses: 0, directDamage: 0, hitPctSum: 0, lingerDamage: 0, lingerPctSum: 0, lingerSec: 0 };
+    stats.perSkill.set(skillId, a);
+  }
+  return a;
+}
+
+function addDamageStats(into: DamageStats, s: DamageStats): void {
+  into.total += s.total;
+  into.basic += s.basic;
+  into.basicHits += s.basicHits;
+  into.summon += s.summon;
+  into.skillDirect += s.skillDirect;
+  into.linger += s.linger;
+  into.dot += s.dot;
+  into.other += s.other;
+  for (const [id, a] of s.perSkill) {
+    const t = skillAggOf(into, id);
+    t.uses += a.uses;
+    t.hits += a.hits;
+    t.misses += a.misses;
+    t.directDamage += a.directDamage;
+    t.hitPctSum += a.hitPctSum;
+    t.lingerDamage += a.lingerDamage;
+    t.lingerPctSum += a.lingerPctSum;
+    t.lingerSec += a.lingerSec;
+  }
+}
+
+/** 적에게 피해를 주는 장판이 있는 광역인지 */
+function isLingerSkill(def: SkillDef): boolean {
+  if (def.target !== 'enemy_area' && def.target !== 'line') return false;
+  return def.linger !== undefined && def.linger.dpsCoef > 0;
+}
+
+/** 적 광역 피해 스킬 (enemy_area / line + 피해 효과 또는 장판 피해). 직업 기본 풀 검사와 표의 분류에 쓴다 */
+function isAoeDamageSkill(def: SkillDef): boolean {
+  return def.type === 'active' && isDamageAoe(def);
+}
+
+/** 피해를 주는 액티브 스킬인지 (단일·광역·장판 어느 것이든) */
+function isDamageSkill(def: SkillDef): boolean {
+  if (def.type !== 'active') return false;
+  for (const e of def.effects) if (e.kind === 'damage') return true;
+  return isLingerSkill(def);
+}
+
+/**
+ * 한 틱(프레임)의 이벤트를 출처별로 나눠 stats 에 더한다. sim 이 출처를 이벤트에 실어 주므로 추정 없이 합산만 한다.
+ */
+function attributeFrameDamage(f: BattleFrame, stats: DamageStats): void {
+  const events = f.events;
+  const unitById = new Map<string, UnitSnapshot>();
+  for (const u of f.units) unitById.set(u.id, u);
+  /** 이번 틱에 장판 피해를 받은 유닛 → 장판(스킬) 목록. 하나뿐이면 '단독 장판 표본' 으로 초당 % 를 잰다 */
+  const lingerHits = new Map<string, { skillId: string; damage: number }[]>();
+  for (const ev of events) {
+    switch (ev.kind) {
+      case 'skill':
+        skillAggOf(stats, ev.skillId).uses++;
+        break;
+      case 'attack': {
+        if (ev.skillId) {
+          const agg = skillAggOf(stats, ev.skillId);
+          if (ev.miss) agg.misses++;
+          else {
+            agg.hits++;
+            agg.directDamage += ev.damage;
+            const victim = unitById.get(ev.to);
+            if (victim && victim.maxHp > 0) agg.hitPctSum += ev.damage / victim.maxHp;
+          }
+          stats.skillDirect += ev.damage;
+          break;
+        }
+        const from = unitById.get(ev.from);
+        if (from && from.job === 'summon') {
+          stats.summon += ev.damage;
+        } else {
+          stats.basic += ev.damage;
+          if (!ev.miss) stats.basicHits++;
+        }
+        break;
+      }
+      case 'zone_damage': {
+        if (ev.damage <= 0) break;
+        skillAggOf(stats, ev.skillId).lingerDamage += ev.damage;
+        stats.linger += ev.damage;
+        let list = lingerHits.get(ev.to);
+        if (!list) {
+          list = [];
+          lingerHits.set(ev.to, list);
+        }
+        list.push({ skillId: ev.skillId, damage: ev.damage });
+        break;
+      }
+      case 'dot':
+        stats.dot += ev.damage;
+        break;
+      case 'reflect':
+        stats.other += ev.damage;
+        break;
+      default:
+        break;
+    }
+  }
+  for (const [uid, list] of lingerHits) {
+    if (list.length !== 1) continue; // 여러 장판이 겹친 틱은 표본에서 제외
+    const victim = unitById.get(uid);
+    if (!victim || victim.maxHp <= 0) continue;
+    const agg = skillAggOf(stats, list[0].skillId);
+    agg.lingerPctSum += list[0].damage / victim.maxHp;
+    agg.lingerSec += TICK_DT;
+  }
 }
 
 /**
@@ -694,6 +872,7 @@ function runBattleTracked(
 ): TrackedBattle {
   const sim = createBattle(input);
   const stats = emptyZoneStats();
+  const damage = emptyDamageStats();
   const tracked = new Map<string, TrackedZone>();
   let prevIds = new Set<string>();
   const maxTicks = 1_000_000;
@@ -704,6 +883,9 @@ function runBattleTracked(
     ticks++;
     const zones = f.zones ?? [];
     const ids = new Set<string>();
+
+    // 0) 피해 출처 분류 (스킬 / 기본 공격 / 장판 / 지속 피해 / 반사) — 이벤트의 skillId 와 zone_damage/dot/reflect 로 합산
+    attributeFrameDamage(f, damage);
 
     // 1) 이번 틱에 새로 나타난 영역: 예고 중이면 안에 있는 적 유닛을 기록한다
     for (const z of zones) {
@@ -778,7 +960,8 @@ function runBattleTracked(
       stats.dodgeEvents++;
     }
   }
-  return { result, zones: stats };
+  for (const us of result.unitStats) damage.total += us.damageTaken;
+  return { result, zones: stats, damage };
 }
 
 // ───────────────────────── 전투 입력 생성 ─────────────────────────
@@ -835,6 +1018,243 @@ interface ZoneSummary {
   totals: ZoneStats;
 }
 
+// ───────────────────────── 스킬 피해 비중 요약 — v0.6 [3] ─────────────────────────
+
+/** 스킬 피해 비중 목표 (10일차 기준, v0.6 [3]) */
+const SKILL_SHARE_MIN = 0.55;
+const SKILL_SHARE_MAX = 0.7;
+/** 단일 대상 주력기 1회 피해 / 대상 최대 HP 목표 */
+const SINGLE_HIT_PCT_MIN = 0.18;
+const SINGLE_HIT_PCT_MAX = 0.3;
+/** 광역 즉발 대상당 1회 피해 / 대상 최대 HP 목표 (+ 장판) */
+const AOE_HIT_PCT_MIN = 0.12;
+const AOE_HIT_PCT_MAX = 0.2;
+/** 주력기 표에 올리는 최소 사용 횟수 */
+const MAIN_SKILL_MIN_USES = 20;
+/** 보조기(UTILITY_SKILL_IDS) 1회 피해 참고치. 판정하지 않고 표시만 한다 */
+const UTILITY_HIT_PCT_MIN = 0.08;
+const UTILITY_HIT_PCT_MAX = 0.13;
+const UTILITY_SKILL_SET: ReadonlySet<string> = new Set<string>(UTILITY_SKILL_IDS);
+
+type SkillCategory = '단일' | '광역';
+
+interface SkillDamageRow {
+  skillId: string;
+  name: string;
+  job: MainJob;
+  /** 단일(비광역) / 광역(enemy_area·line) */
+  category: SkillCategory;
+  /** 피해 효과가 있는지 (장판만 있는 스킬은 false) */
+  hasDirect: boolean;
+  hasLinger: boolean;
+  /** 보조기(기절·둔화·이동이 본체). 주력기 목표로 판정하지 않는다 */
+  utility: boolean;
+  lingerDurationSec: number;
+  uses: number;
+  usesPerGame: number;
+  hits: number;
+  misses: number;
+  /** 평균 1회 피해 (비-miss) */
+  avgHit: number;
+  /** 평균 1회 피해 / 그 순간 대상 최대 HP (0~1) */
+  avgHitPct: number;
+  /** 장판 초당 피해 / 대상 최대 HP (0~1, 단독 장판 표본) */
+  lingerDpsPct: number;
+  /** 장판 표본 초 */
+  lingerSampleSec: number;
+  /** 장판 총량(풀히트) = 초당 % × 지속 초 */
+  lingerFullPct: number;
+  directDamage: number;
+  lingerDamage: number;
+  totalDamage: number;
+  /** 전체 피해 대비 비중 */
+  share: number;
+  target: { min: number; max: number } | null;
+  /** 목표 판정 (표본 부족·목표 없음이면 null) */
+  ok: boolean | null;
+}
+
+interface DamageSummary {
+  games: number;
+  total: number;
+  totalPerGame: number;
+  basic: number;
+  summon: number;
+  skillDirect: number;
+  linger: number;
+  dot: number;
+  /** 반사 */
+  other: number;
+  /** 전체 − (분류된 전부). 이벤트 피해량 반올림 차이뿐이어야 한다 */
+  unexplained: number;
+  /** (전체 − 기본 공격 − 소환물) / 전체 */
+  skillShare: number;
+  basicShare: number;
+  summonShare: number;
+  skillShareTarget: { min: number; max: number; day: number; judged: boolean; ok: boolean | null };
+  /** 사용된 액티브 스킬 전부 (비중 내림차순) */
+  skills: SkillDamageRow[];
+  /** 그중 피해 스킬이고 사용 ≥ MAIN_SKILL_MIN_USES */
+  mainSkills: SkillDamageRow[];
+}
+
+function skillCategoryOf(def: SkillDef): SkillCategory {
+  return def.target === 'enemy_area' || def.target === 'line' ? '광역' : '단일';
+}
+
+function damageSummaryOf(totals: DamageStats, games: number, day: number): DamageSummary {
+  const total = totals.total;
+  const classified = totals.basic + totals.summon + totals.skillDirect + totals.linger + totals.dot + totals.other;
+  const skillShare = total > 0 ? (total - totals.basic - totals.summon) / total : 0;
+  const judged = day >= TOTAL_DAYS;
+  const rows: SkillDamageRow[] = [];
+  for (const [id, a] of totals.perSkill) {
+    const def = skillDefOf(id);
+    if (!def || def.type !== 'active') continue;
+    let hasDirect = false;
+    for (const e of def.effects) if (e.kind === 'damage') hasDirect = true;
+    const hasLinger = isLingerSkill(def);
+    const utility = UTILITY_SKILL_SET.has(id);
+    const category = skillCategoryOf(def);
+    const avgHitPct = a.hits > 0 ? a.hitPctSum / a.hits : 0;
+    const lingerDpsPct = a.lingerSec > 0 ? a.lingerPctSum / a.lingerSec : 0;
+    const lingerDurationSec = hasLinger && def.linger ? def.linger.durationSec : 0;
+    const totalDamage = a.directDamage + a.lingerDamage;
+    let target: SkillDamageRow['target'] = null;
+    if (hasDirect && !utility) {
+      target = category === '단일' ? { min: SINGLE_HIT_PCT_MIN, max: SINGLE_HIT_PCT_MAX } : { min: AOE_HIT_PCT_MIN, max: AOE_HIT_PCT_MAX };
+    }
+    const ok = target && a.hits >= MAIN_SKILL_MIN_USES ? avgHitPct >= target.min && avgHitPct <= target.max : null;
+    rows.push({
+      skillId: id,
+      name: def.name,
+      job: def.job,
+      category,
+      hasDirect,
+      hasLinger,
+      utility,
+      lingerDurationSec,
+      uses: a.uses,
+      usesPerGame: games > 0 ? a.uses / games : 0,
+      hits: a.hits,
+      misses: a.misses,
+      avgHit: a.hits > 0 ? a.directDamage / a.hits : 0,
+      avgHitPct,
+      lingerDpsPct,
+      lingerSampleSec: a.lingerSec,
+      lingerFullPct: lingerDpsPct * lingerDurationSec,
+      directDamage: a.directDamage,
+      lingerDamage: a.lingerDamage,
+      totalDamage,
+      share: total > 0 ? totalDamage / total : 0,
+      target,
+      ok,
+    });
+  }
+  rows.sort((x, y) => y.share - x.share || y.uses - x.uses || (x.skillId < y.skillId ? -1 : x.skillId > y.skillId ? 1 : 0));
+  const mainSkills = rows.filter((r) => (r.hasDirect || r.hasLinger) && r.uses >= MAIN_SKILL_MIN_USES);
+  return {
+    games,
+    total,
+    totalPerGame: games > 0 ? total / games : 0,
+    basic: totals.basic,
+    summon: totals.summon,
+    skillDirect: totals.skillDirect,
+    linger: totals.linger,
+    dot: totals.dot,
+    other: totals.other,
+    unexplained: Math.max(0, total - classified),
+    skillShare,
+    basicShare: total > 0 ? totals.basic / total : 0,
+    summonShare: total > 0 ? totals.summon / total : 0,
+    skillShareTarget: {
+      min: SKILL_SHARE_MIN,
+      max: SKILL_SHARE_MAX,
+      day,
+      judged,
+      ok: judged ? skillShare >= SKILL_SHARE_MIN && skillShare <= SKILL_SHARE_MAX : null,
+    },
+    skills: rows,
+    mainSkills,
+  };
+}
+
+function hitTargetLabel(r: SkillDamageRow): string {
+  if (r.utility) return `보조 (참고 ${Math.round(UTILITY_HIT_PCT_MIN * 100)}~${Math.round(UTILITY_HIT_PCT_MAX * 100)}%)`;
+  if (!r.target) return r.hasLinger ? '장판만' : '-';
+  const base = `${Math.round(r.target.min * 100)}~${Math.round(r.target.max * 100)}%`;
+  return r.hasLinger ? `${base} + 장판` : base;
+}
+
+function hitJudgeLabel(r: SkillDamageRow): string {
+  if (r.utility) return '보조';
+  if (r.ok === null) return r.target ? '표본 부족' : '-';
+  return r.ok ? 'OK' : r.avgHitPct < (r.target ? r.target.min : 0) ? '약함' : '강함';
+}
+
+function skillRowCells(r: SkillDamageRow): string[] {
+  return [
+    r.name,
+    r.skillId,
+    JOB_NAME_KO[r.job],
+    r.hasDirect || r.hasLinger ? r.category + (r.hasLinger ? '+장판' : '') : '피해 없음',
+    String(r.uses),
+    fixed(r.usesPerGame, 2),
+    String(r.hits),
+    r.hits > 0 ? fixed(r.avgHit, 0) : '-',
+    r.hits > 0 ? pctOf(r.avgHitPct) : '-',
+    r.hasLinger ? (r.lingerSampleSec > 0 ? `${pctOf(r.lingerDpsPct)}/초` : '표본 없음') : '-',
+    r.hasLinger ? (r.lingerSampleSec > 0 ? `${pctOf(r.lingerFullPct)} (${fixed(r.lingerDurationSec, 1)}초)` : '-') : '-',
+    hitTargetLabel(r),
+    hitJudgeLabel(r),
+  ];
+}
+
+const SKILL_ROW_HEADERS = ['스킬', 'id', '직업', '분류', '사용', '판당', '피격', '평균 1회 피해', '대상 HP 대비', '장판 초당', '장판 총량(풀히트)', '목표', '판정'];
+const SKILL_ROW_ALIGNS: Align[] = ['l', 'l', 'l', 'l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'l'];
+
+function printDamageShare(d: DamageSummary): void {
+  section('스킬 피해 비중 (v0.6 [3]. 전체 피해 = 양 팀 damageTaken 합)');
+  console.log(`전체 피해 ${fixed(d.total, 0)} (판당 ${fixed(d.totalPerGame, 0)})`);
+  const share = (n: number): string => pct(n, d.total);
+  printTable(
+    ['출처', '피해', '비중', '설명'],
+    [
+      ['스킬 즉시·광역 즉발', fixed(d.skillDirect, 0), share(d.skillDirect), "skillId 가 있는 'attack' 이벤트"],
+      ['장판', fixed(d.linger, 0), share(d.linger), "'zone_damage' 이벤트 (틱당 피해)"],
+      ['지속 피해 (화상·중독)', fixed(d.dot, 0), share(d.dot), "'dot' 이벤트 (어느 스킬인지는 모름)"],
+      ['반사', fixed(d.other, 0), share(d.other), "'reflect' 이벤트"],
+      ['미분류', fixed(d.unexplained, 0), share(d.unexplained), '이벤트 피해량 반올림 차이'],
+      ['캐릭터 기본 공격', fixed(d.basic, 0), share(d.basic), "skillId 없는 'attack' 이벤트"],
+      ['소환물 기본 공격', fixed(d.summon, 0), share(d.summon), "소환물의 'attack' 이벤트"],
+    ],
+    ['l', 'r', 'r', 'l'],
+  );
+  const t = d.skillShareTarget;
+  const judge = t.judged ? (t.ok ? 'OK' : '조정 필요') : `참고 (목표는 ${TOTAL_DAYS}일차 기준, 지금은 ${t.day}일차)`;
+  console.log(
+    `스킬 피해 비중 ${pctOf(d.skillShare)} (= 전체 − 기본 공격 − 소환물)  목표 ${Math.round(t.min * 100)}~${Math.round(t.max * 100)}%: ${judge}`,
+  );
+  console.log(
+    `기본 공격 비중 ${pctOf(d.basicShare)} (목표 ${Math.round((1 - t.max) * 100)}~${Math.round((1 - t.min) * 100)}%)  소환물 기본 공격 ${pctOf(d.summonShare)}`,
+  );
+  if (d.total > 0 && d.unexplained / d.total > 0.1) {
+    console.log('주의: 미분류 비중이 10% 를 넘습니다. sim 의 피해 경로 중 이벤트를 내지 않는 곳이 있는지 확인하세요 (반올림만으로는 이만큼 나올 수 없습니다).');
+  }
+}
+
+function printMainSkillTable(d: DamageSummary): void {
+  section(`주력기 1회 피해 / 대상 최대 HP (사용 ${MAIN_SKILL_MIN_USES}회 이상 피해 스킬. 단일 ${Math.round(SINGLE_HIT_PCT_MIN * 100)}~${Math.round(SINGLE_HIT_PCT_MAX * 100)}% / 광역 즉발 대상당 ${Math.round(AOE_HIT_PCT_MIN * 100)}~${Math.round(AOE_HIT_PCT_MAX * 100)}% + 장판)`);
+  if (d.mainSkills.length === 0) {
+    console.log(`(사용 ${MAIN_SKILL_MIN_USES}회 이상인 피해 스킬 없음 — 판 수를 늘리세요)`);
+    return;
+  }
+  printTable(SKILL_ROW_HEADERS, d.mainSkills.map(skillRowCells), SKILL_ROW_ALIGNS);
+  console.log("'대상 HP 대비' 는 비-miss 1회 피해 / 그 순간 대상의 최대 HP 평균. '장판 초당' 은 장판 하나만 맞고 있던 틱의 zone_damage 로 잰 초당 % (여러 장판이 겹친 틱은 제외).");
+  console.log("판정 '약함' 은 목표 하한 미만, '강함' 은 상한 초과. 몬스터 전용(mon_) 스킬도 같은 기준으로 표시합니다.");
+  console.log("'보조' 는 기절·둔화·이동·MP 회복이 본체인 보조기(skills.ts UTILITY_SKILL_IDS)라 주력기 목표로 판정하지 않습니다 (참고 8~13%).");
+}
+
 interface BatchSummary {
   mode: 'batch';
   games: number;
@@ -852,6 +1272,8 @@ interface BatchSummary {
   topSkills: { skillId: string; name: string; uses: number }[];
   reasons: Record<string, number>;
   zones: ZoneSummary;
+  /** 스킬 피해 비중·주력기 표 (v0.6 [3]) */
+  damage: DamageSummary;
 }
 
 function emptyJobAgg(): JobAgg {
@@ -888,6 +1310,7 @@ function runBatch(opts: CliOptions): BatchSummary {
   const skillUses = new Map<string, number>();
   const reasons: Record<string, number> = {};
   const zoneTotals = emptyZoneStats();
+  const damageTotals = emptyDamageStats();
   let winsA = 0;
   let winsB = 0;
   let draws = 0;
@@ -901,6 +1324,7 @@ function runBatch(opts: CliOptions): BatchSummary {
     const tracked = runBattleTracked(input);
     const result: BattleResult = tracked.result;
     addZoneStats(zoneTotals, tracked.zones);
+    addDamageStats(damageTotals, tracked.damage);
 
     // 승패 집계
     if (result.winner === 'A') winsA++;
@@ -1017,6 +1441,7 @@ function runBatch(opts: CliOptions): BatchSummary {
     topSkills,
     reasons,
     zones: zoneSummaryOf(zoneTotals, opts.games),
+    damage: damageSummaryOf(damageTotals, opts.games, opts.day),
   };
 }
 
@@ -1105,6 +1530,8 @@ function printBatch(s: BatchSummary): void {
   }
 
   printZoneSummary(s.zones, total);
+  printDamageShare(s.damage);
+  printMainSkillTable(s.damage);
 
   section('종료 사유');
   const reasonKeys = Object.keys(s.reasons).sort();
@@ -3076,6 +3503,137 @@ function printDodge(r: DodgeReport): void {
   }
 }
 
+// ───────────────────────── --skills (스킬 피해 비중 · 광역 없는 직업 검사) ─────────────────────────
+
+interface AoeJobCheck {
+  job: MainJob;
+  name: string;
+  /** 기본 풀 = starterSkills ∪ skillPool (분화 전, 순서 고정) */
+  basePool: string[];
+  /** 그중 적 광역 피해 스킬 (enemy_area / line + 피해 또는 장판 피해) */
+  aoeSkills: string[];
+  starterSkills: string[];
+  /** 시작 스킬 후보 중 광역 피해 스킬 */
+  starterAoe: string[];
+  /** 기본 풀에 광역 피해 스킬이 1개 이상 */
+  pass: boolean;
+}
+
+interface AoeCheckReport {
+  jobs: AoeJobCheck[];
+  /** 모든 직업의 기본 풀에 광역 피해 스킬이 있음 */
+  pass: boolean;
+  /** v0.6 [1]: 마법사 시작 스킬 후보가 전부 광역 피해 스킬 */
+  mageStarterAllAoe: boolean;
+  /** 위 두 조건 모두 */
+  passAll: boolean;
+}
+
+/** 직업별 기본 풀(분화 전)에 광역 피해 스킬이 있는지 검사한다 (v0.6 [2]). 마법사는 시작 스킬 후보가 전부 광역인지도 본다 (v0.6 [1]). */
+function checkJobAoe(): AoeCheckReport {
+  const jobs: AoeJobCheck[] = MAIN_JOBS.map((job) => {
+    const def = JOBS[job];
+    const basePool: string[] = [];
+    for (const id of def.starterSkills) if (!basePool.includes(id)) basePool.push(id);
+    for (const id of def.skillPool) if (!basePool.includes(id)) basePool.push(id);
+    const aoeSkills = basePool.filter((id) => {
+      const sk = skillDefOf(id);
+      return sk !== null && isAoeDamageSkill(sk);
+    });
+    const starterAoe = def.starterSkills.filter((id) => {
+      const sk = skillDefOf(id);
+      return sk !== null && isAoeDamageSkill(sk);
+    });
+    return { job, name: def.name, basePool, aoeSkills, starterSkills: def.starterSkills.slice(), starterAoe, pass: aoeSkills.length > 0 };
+  });
+  const pass = jobs.every((j) => j.pass);
+  const mage = jobs.find((j) => j.job === 'mage');
+  const mageStarterAllAoe = !!mage && mage.starterSkills.length > 0 && mage.starterAoe.length === mage.starterSkills.length;
+  return { jobs, pass, mageStarterAllAoe, passAll: pass && mageStarterAllAoe };
+}
+
+interface SkillsReport {
+  mode: 'skills';
+  games: number;
+  seed: number;
+  day: number;
+  teamSize: number;
+  mapOption: string;
+  avgDurationSec: number;
+  damage: DamageSummary;
+  aoeCheck: AoeCheckReport;
+  pass: boolean;
+}
+
+function runSkills(opts: CliOptions): SkillsReport {
+  const damageTotals = emptyDamageStats();
+  let durationSum = 0;
+  const showProgress = opts.games >= 20 && !opts.json;
+  const progressEvery = Math.max(1, Math.floor(opts.games / 10));
+  for (let g = 0; g < opts.games; g++) {
+    const input = buildInput(opts.seed, g, opts);
+    const tracked = runBattleTracked(input);
+    addDamageStats(damageTotals, tracked.damage);
+    durationSum += tracked.result.durationSec;
+    if (showProgress && ((g + 1) % progressEvery === 0 || g + 1 === opts.games)) progress('진행', g + 1, opts.games, true);
+  }
+  const aoeCheck = checkJobAoe();
+  return {
+    mode: 'skills',
+    games: opts.games,
+    seed: opts.seed,
+    day: opts.day,
+    teamSize: TEAM_SIZE,
+    mapOption: opts.map,
+    avgDurationSec: opts.games > 0 ? durationSum / opts.games : 0,
+    damage: damageSummaryOf(damageTotals, opts.games, opts.day),
+    aoeCheck,
+    pass: aoeCheck.passAll,
+  };
+}
+
+function printSkills(r: SkillsReport): void {
+  section(
+    `스킬 피해 측정 (${r.games}판, 시드 ${r.seed}, ${r.day}일차, ${VS_LABEL}, 맵 ${r.mapOption === 'random' ? '랜덤' : MAP_NAME_KO[r.mapOption as MapType]}, 평균 전투 시간 ${fixed(r.avgDurationSec)}초)`,
+  );
+  console.log('판마다의 입력은 --games 모드와 같다 (같은 시드·판 번호 → 같은 전투).');
+
+  printDamageShare(r.damage);
+  printMainSkillTable(r.damage);
+
+  section('스킬별 전체 목록 (비중 내림차순. 사용된 액티브 스킬 전부)');
+  if (r.damage.skills.length === 0) {
+    console.log('(스킬 사용 이벤트 없음)');
+  } else {
+    printTable(
+      [...SKILL_ROW_HEADERS.slice(0, 11), '총 피해', '비중', '목표', '판정'],
+      r.damage.skills.map((s) => {
+        const cells = skillRowCells(s);
+        return [...cells.slice(0, 11), fixed(s.totalDamage, 0), pctOf(s.share), cells[11], cells[12]];
+      }),
+      [...SKILL_ROW_ALIGNS.slice(0, 11), 'r', 'r', 'r', 'l'],
+    );
+    console.log("'총 피해' = 즉시·광역 즉발 이벤트 피해 + 장판 잔여 추정. 화상·중독 지속 피해는 어느 스킬이 걸었는지 알 수 없어 스킬별 합에 들어가지 않는다.");
+  }
+
+  section('광역 없는 직업 검사 (기본 풀 = 시작 스킬 후보 ∪ 메인 직업 풀, 분화 전)');
+  printTable(
+    ['직업', '기본 풀 광역 피해 스킬', '시작 스킬 후보', '시작 후보 중 광역', '판정'],
+    r.aoeCheck.jobs.map((j) => [
+      j.name,
+      j.aoeSkills.length > 0 ? j.aoeSkills.map((id) => `${skillName(id)}(${id})`).join(', ') : '없음',
+      j.starterSkills.map((id) => skillName(id)).join(', '),
+      j.starterAoe.length > 0 ? j.starterAoe.map((id) => skillName(id)).join(', ') : '없음',
+      j.pass ? 'PASS' : 'FAIL',
+    ]),
+    ['l', 'l', 'l', 'l', 'l'],
+  );
+  console.log('');
+  console.log(`모든 직업의 기본 풀에 광역 피해 스킬 있음 (v0.6 [2]): ${r.aoeCheck.pass ? 'PASS' : 'FAIL'}`);
+  console.log(`마법사 시작 스킬 후보가 전부 광역 피해 스킬 (v0.6 [1]): ${r.aoeCheck.mageStarterAllAoe ? 'PASS' : 'FAIL'}`);
+  console.log(r.pass ? '결과: PASS' : '결과: FAIL');
+}
+
 // ───────────────────────── 진입점 ─────────────────────────
 
 async function main(): Promise<number> {
@@ -3104,6 +3662,13 @@ async function main(): Promise<number> {
       const rep = runDodge(opts);
       if (opts.json) console.log(JSON.stringify(rep, null, 2));
       else printDodge(rep);
+      return rep.pass ? 0 : 1;
+    }
+
+    if (opts.skills) {
+      const rep = runSkills(opts);
+      if (opts.json) console.log(JSON.stringify(rep, null, 2));
+      else printSkills(rep);
       return rep.pass ? 0 : 1;
     }
 

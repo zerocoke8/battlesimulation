@@ -43,3 +43,14 @@
 - `BattleFrame.zones: ZoneSnapshot[]` (`phase: 'telegraph' | 'active' | 'flash'`, `progress 0~1`, `remainingSec`). 렌더러는 이것만 보고 그린다.
 - `BattleEvent` 에 `{ kind: 'zone'; from; skillId; x; y }`, `{ kind: 'dodge'; unit; skillId }` 추가. 렌더는 회피 성공 유닛 위에 '회피!'.
 - 저장: `SAVE_VERSION = 3`. 인원이 `TEAM_SIZE` 가 아닌 저장 팀·고스트는 버전이 맞아도 버린다.
+
+## v0.6 계약 (types.ts)
+- 피해 출처 이벤트 (헤드리스 스킬 피해 비중 측정용. 렌더러는 `attack`/`heal`/`skill` 등만 그리고 나머지는 무시한다):
+  - `attack` 에 `skillId?: string`. 있으면 스킬 피해 효과(즉시·광역 impact), 없으면 기본 공격.
+  - `{ kind: 'zone_damage'; from; to; skillId; damage; school }` 장판 한 틱, `{ kind: 'dot'; from: string | null; to; status: 'burn' | 'poison'; damage }` 화상·중독 한 틱.
+    이 둘은 **프레임 이벤트에만** 실리고 `BattleResult.events` 에는 넣지 않는다 (틱 단위라 결과 이벤트 상한 5000 을 채운다).
+  - `{ kind: 'reflect'; from; to; damage }` 반사 (from = 반사한 피격자).
+  - 피해를 주는 경로를 sim 에 새로 만들면 반드시 이 중 하나를 내야 한다. `tools/headless.ts` 는 '미분류' 가 10% 를 넘으면 경고한다.
+- 스킬 데이터: `isZoneSkill(id)` (skills.ts) = enemy_area/line 이거나 예고·장판이 있는 스킬. UI 의 스킬명 외치기 말풍선 크기에 쓴다.
+  모든 메인 직업 기본 풀에 광역 피해 스킬 1개 이상, 마법사 `starterSkills` 는 전부 광역 (`npm run headless -- --skills` 가 검사, 종료 코드 반영).
+- 스킬 `desc` 는 손으로 쓰지 않는다. `describeActive`/`describePassive` 가 스펙 숫자로 문장을 만든다.

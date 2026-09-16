@@ -258,6 +258,10 @@ button, input, select { font: inherit; }
 .kill-card { min-height: 60px; }
 .kill-log li { font-size: 12px; padding: 2px 0; border-bottom: 1px dashed var(--line); font-variant-numeric: tabular-nums; }
 .kill-log li:last-child { border-bottom: none; }
+/* 스킬명 외치기 줄: 격파 줄보다 옅게, 스킬명만 강조 */
+.kill-log li.skill-line { color: var(--muted); }
+.kill-log .skill-shout { color: #ffe9a8; font-weight: 700; }
+.kill-log .skill-shout.zone { color: var(--warn); font-size: 13px; }
 
 /* 결과 */
 .result-banner { text-align: center; padding: 18px; }

@@ -43,6 +43,22 @@ export function hitChancePct(accuracy: number, evasion: number): number {
 
 export const COOLDOWN_REDUCTION_CAP = 40;
 
+/**
+ * 기본 공격 속도 기준값 (초당 타격 수, 민첩 0 기준). v0.5 까지 1.0.
+ * v0.6: 스킬 위력을 크게 올리면서 전투 시간(60~120초)을 지키려면 기본 공격이 차지하던 피해 몫을 스킬에 넘겨야 한다.
+ * HP 를 올리면 스킬 1회 피해가 상대 HP 대비 작아져 "맞는 체감" 목표(단일 18~30%)와 충돌하므로, 기본 공격 빈도를 낮춰
+ * 기본 공격 비중 30~45% · 스킬 비중 55~70% 를 맞춘다. 스킬 시전·쿨타임에는 영향이 없다 (소환물은 자체 공격 간격을 쓴다).
+ */
+export const BASIC_ATTACK_SPEED_BASE = 0.6;
+
+/**
+ * 최대 HP 공식 상수: HP_BASE + 체력² × HP_VIT_SQ + 직업 보정 × 3.
+ * v0.5: 900 + 체력² × 0.8. v0.6: 600 + 체력² × 0.95 — 체력 45(1일차)에서는 거의 같고(2520 → 2524), 체력 60~70(10일차)에서는 6~9% 높다.
+ * 스킬 위력을 올린 뒤 1일차 전투가 10일차보다 길어지는 문제를, 성장한 팀의 HP 만 더 늘리는 방식으로 풀었다 (1일차 < 10일차 목표).
+ */
+export const HP_BASE = 600;
+export const HP_VIT_SQ = 0.95;
+
 /** 맵 보정이 곱해지는 파생 수치 */
 const MAP_SCALED: readonly DerivedStatKey[] = ['maxHp', 'physAtk', 'magAtk', 'physDef', 'magDef', 'atkSpeed', 'moveSpeed'];
 
@@ -89,12 +105,12 @@ export function computeDerived(c: Character, map: MapType, pctMods?: Partial<Rec
     // 고정항 300 → 900: 체력이 낮은 편성(하급 몬스터, 초반 4:4)의 전투가 목표 하한 40초를 크게 밑돌았다.
     // 고정항은 양 팀에 똑같이 더해지므로 승률은 그대로 두고 짧은 쪽 꼬리만 끌어올린다.
     // 체력 40 ≈ 2180, 체력 55 ≈ 3320 (+직업 보정 × 3).
-    maxHp: (900 + vitality * vitality * 0.8 + hpBonus * 3) * mapMod,
+    maxHp: (HP_BASE + vitality * vitality * HP_VIT_SQ + hpBonus * 3) * mapMod,
     physAtk: (strength * 1.0 + mastery * 0.3) * mapMod,
     magAtk: (magicPower * 1.0 + mastery * 0.3) * mapMod,
     physDef: (defenseTech * 0.8 + vitality * 0.2) * mapMod,
     magDef: (resistance * 0.8 + composure * 0.2) * mapMod,
-    atkSpeed: 1.0 * (1 + agility / 200) * mapMod,
+    atkSpeed: BASIC_ATTACK_SPEED_BASE * (1 + agility / 200) * mapMod,
     moveSpeed: 3.0 * (1 + moveSpeed / 150) * mapMod,
     critChance: focus * 0.4,
     critMult: 150 + critical * 0.5,

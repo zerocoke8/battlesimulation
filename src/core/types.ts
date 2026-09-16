@@ -394,7 +394,20 @@ export interface UnitSnapshot {
 }
 
 export type BattleEvent =
-  | { t: number; kind: 'attack'; from: string; to: string; damage: number; crit: boolean; school: 'phys' | 'magic'; miss?: boolean }
+  /**
+   * 한 번의 타격. skillId 가 있으면 스킬 피해 효과(즉시 또는 광역 impact), 없으면 기본 공격.
+   * damage 는 실제 HP 감소량(반올림). 보호막에 흡수된 양은 포함하지 않는다.
+   */
+  | { t: number; kind: 'attack'; from: string; to: string; damage: number; crit: boolean; school: 'phys' | 'magic'; miss?: boolean; skillId?: string }
+  /**
+   * 장판(linger) 한 틱의 피해. 틱마다 안의 적 유닛당 1개. damage 는 실제 HP 감소량(반올림 없음).
+   * 프레임 이벤트(BattleFrame.events)에만 실리고 BattleResult.events 에는 넣지 않는다 (틱 단위라 너무 많다).
+   */
+  | { t: number; kind: 'zone_damage'; from: string; to: string; skillId: string; damage: number; school: 'phys' | 'magic' }
+  /** 화상·중독 한 틱의 피해. from 은 상태를 건 유닛(죽었으면 null). 프레임 이벤트에만 실린다 */
+  | { t: number; kind: 'dot'; from: string | null; to: string; status: 'burn' | 'poison'; damage: number }
+  /** 반사 피해. from 은 반사한 유닛(피격자), to 는 원래 공격자 */
+  | { t: number; kind: 'reflect'; from: string; to: string; damage: number }
   | { t: number; kind: 'skill'; from: string; skillId: string; to: string | null; x: number; y: number }
   | { t: number; kind: 'heal'; from: string; to: string; amount: number }
   | { t: number; kind: 'kill'; killer: string; victim: string }
