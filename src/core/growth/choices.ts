@@ -9,6 +9,10 @@
  *  - estimatePowerDelta: 카드에 표시할 예상 전투력 상승치
  *
  * 난수는 인자로 받은 Rng 만 쓴다. Math.random / Date 금지. 순회는 항상 상수 배열 순서.
+ *
+ * 팀 인원은 TEAM_SIZE(4) 기준이다. 다수 대상 카드는 실제 team.members.length 로 인원을 잡되
+ * (합동 훈련 2~3명, 편중 훈련 TEAM_SIZE-1 명 상승 + 1명 하락 = 4인 팀에서 3+1, 희생 = 나머지 전원)
+ * 희귀도별 총 스탯 상승량 기준(RARITY_BUDGET)은 인원과 무관하게 유지한다 (GDD §7.4.2).
  */
 import { Rng, hashSeed } from '../rng';
 import type {
@@ -18,7 +22,7 @@ import type {
 import {
   BASE_STAT_KEYS, CHOICES_PER_SET, CHOICE_KIND_NAME_KO, CHOICE_RARITY_NAME_KO, CHOICE_RARITY_ORDER,
   CHOICE_RARITY_RANK, JOB_NAME_KO, MAIN_JOBS, MAP_NAME_KO, MAP_TYPES, MAX_ACTIVE_SKILLS, MAX_PASSIVE_SKILLS,
-  STAT_CATEGORY, STAT_CATEGORY_NAME_KO, STAT_MAX, STAT_NAME_KO, TOTAL_DAYS,
+  STAT_CATEGORY, STAT_CATEGORY_NAME_KO, STAT_MAX, STAT_NAME_KO, TEAM_SIZE, TOTAL_DAYS,
 } from '../types';
 import { JOBS, getSubJob } from '../data/jobs';
 import { getSkill, skillPoolFor } from '../data/skills';
@@ -75,6 +79,16 @@ const RISK_MULT = 1.4;
 
 /** 희생 카드 한 장이 줄 수 있는 보너스 포인트 상한 (하루 벌이를 넘지 않게) */
 const SACRIFICE_MAX_POINTS = 150;
+
+/**
+ * 편중 훈련(tradeoff)의 상승 인원. 팀에서 1명이 하락하고 나머지가 상승하되 최대 3명.
+ * TEAM_SIZE = 4 → 3명 상승 + 1명 하락 (팀 전원 관여). TEAM_SIZE = 3 이면 2 + 1.
+ */
+const TRADEOFF_MAX_GAINERS = Math.max(2, Math.min(3, TEAM_SIZE - 1));
+
+/** 합동 훈련(small_multi)의 대상 인원 범위. 전설은 팀 전원까지 갈 수 있다 */
+const SMALL_MULTI_MIN = 2;
+const SMALL_MULTI_MAX = Math.min(3, TEAM_SIZE);
 
 /** 스킬 습득 카드의 등급은 스킬 가격으로 본다 (skills.ts 의 cost 는 60~150) */
 const SKILL_COST_BAND: Record<ChoiceRarity, [number, number]> = {
@@ -366,7 +380,9 @@ function buildBigSingle(ctx: Ctx, rarity: ChoiceRarity): Choice {
 function buildSmallMulti(ctx: Ctx, rarity: ChoiceRarity): Choice {
   const { rng, team } = ctx;
   const budget = budgetFor(rng, rarity);
-  const want = rarity === 'legendary' ? rng.int(4, 5) : rarity === 'epic' ? rng.int(3, 4) : rng.int(2, 3);
+  // 일반·레어·에픽 2~3명, 전설은 3명~팀 전원(TEAM_SIZE). 총 상승량(budget)은 인원과 무관하게 희귀도 기준을 따른다.
+  const want =
+    rarity === 'legendary' ? rng.int(Math.min(3, TEAM_SIZE), TEAM_SIZE) : rng.int(SMALL_MULTI_MIN, SMALL_MULTI_MAX);
   const n = Math.max(1, Math.min(team.members.length, want));
   const chars = rng.sample(team.members, n);
   const stat = pickStat(rng, chars[0]);
@@ -392,7 +408,8 @@ function buildTradeoff(ctx: Ctx, rarity: ChoiceRarity): Choice | null {
   if (team.members.length < 3) return null;
   const budget = budgetFor(rng, rarity);
   const gainTotal = Math.round(budget * RISK_MULT);
-  const gainerCount = Math.min(team.members.length - 1, 3);
+  // 4인 팀: 3명 상승 + 1명 하락 (GDD §7.5). 인원이 더 적은 팀이면 (인원 − 1)명 상승.
+  const gainerCount = Math.min(team.members.length - 1, TRADEOFF_MAX_GAINERS);
   const picked = rng.sample(team.members, gainerCount + 1);
   const gainers = picked.slice(0, gainerCount);
   const loser = picked[gainerCount];
@@ -592,6 +609,7 @@ function buildSacrifice(ctx: Ctx, rarity: ChoiceRarity): Choice {
     costValue = -delta * n;
   }
 
+  // 희생의 보상은 '나머지 팀원 전원' (TEAM_SIZE − 1 명) 에게 간다
   const others = team.members.filter((m) => m.id !== c.id);
   const reward = budget + costValue;
   let rewardText: string;

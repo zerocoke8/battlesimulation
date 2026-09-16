@@ -1,15 +1,24 @@
 /**
- * 팀 시너지 정의 생성기 (GDD §7.5).
+ * 팀 시너지 정의 생성기 (GDD §7.8, v0.5).
  *  - generateSynergyCandidates: 로그라이크 선택지용 후보 (인접 / 직업 수 / 맵)
  *  - autoSynergies: 직업 조합으로 자동 부여되는 시너지
  * id 는 결정론적 문자열. 후보 목록은 항상 같은 순서로 만든 뒤 rng.sample 로 뽑는다.
+ *
+ * v0.5: 팀 인원이 TEAM_SIZE(4)로 줄어 직업 수(job_count) 조건은 JOB_COUNT_MIN(2)명 이상 기준이다.
+ *  3명 이상 조건은 팀에 실제로 그 직업이 3명 있을 때만 후보로 나온다 (발동 확률이 매우 낮으므로 보정치를 더 준다).
+ *  1명 조건(항상 발동)은 만들지 않는다. 인접 시너지는 인원과 무관하므로 그대로다.
  */
 import type { Character, DerivedStatKey, MainJob, MapType, SynergyDef, Team } from '../types';
-import { JOB_NAME_KO, MAIN_JOBS, MAP_NAME_KO, MAP_TYPES, DERIVED_NAME_KO } from '../types';
+import { JOB_NAME_KO, MAIN_JOBS, MAP_NAME_KO, MAP_TYPES, DERIVED_NAME_KO, TEAM_SIZE } from '../types';
 import type { Rng } from '../rng';
 
 /** 인접 시너지 반경 (맵 단위) */
 export const ADJ_RADIUS = 4;
+
+/** 직업 수 시너지의 최소 인원 조건 (4인 팀 기준 2명) */
+export const JOB_COUNT_MIN = 2;
+/** 직업 수 시너지의 최대 인원 조건. TEAM_SIZE 를 넘을 수 없다 */
+export const JOB_COUNT_MAX = Math.min(3, TEAM_SIZE);
 
 // ───────────────────────── 인접 시너지 ─────────────────────────
 
@@ -73,14 +82,21 @@ const JOB_COUNT_MODS: Record<MainJob, { key: DerivedStatKey; base: number; label
   healer: [{ key: 'magAtk', base: 6, label: '성가대' }, { key: 'castSpeed', base: 8, label: '기도의 합창' }],
 };
 
+/**
+ * 직업 수 시너지. count 는 JOB_COUNT_MIN~JOB_COUNT_MAX 로 클램프된다.
+ * 보정치 = base + 3 × count (2명 = base+6, 3명 = base+9). 3명 조건은 4인 팀에서 드물어 더 준다.
+ */
 export function makeJobCountSynergy(job: MainJob, count: number, modIndex: number): SynergyDef {
   const mod = JOB_COUNT_MODS[job][modIndex];
-  const pct = mod.base + 2 * count;
+  let n = Math.round(count);
+  if (n !== n || n < JOB_COUNT_MIN) n = JOB_COUNT_MIN;
+  if (n > JOB_COUNT_MAX) n = JOB_COUNT_MAX;
+  const pct = mod.base + 3 * n;
   return {
-    id: `syn_job_${job}_${count}_${mod.key}`,
-    name: `${mod.label} (${JOB_NAME_KO[job]} ${count}인)`,
-    desc: `${JOB_NAME_KO[job]}가 ${count}명 이상이면 ${JOB_NAME_KO[job]} 전원의 ${DERIVED_NAME_KO[mod.key]} +${pct}%.`,
-    condition: { kind: 'job_count', job, count },
+    id: `syn_job_${job}_${n}_${mod.key}`,
+    name: `${mod.label} (${JOB_NAME_KO[job]} ${n}인)`,
+    desc: `${JOB_NAME_KO[job]}가 ${n}명 이상이면 ${JOB_NAME_KO[job]} 전원의 ${DERIVED_NAME_KO[mod.key]} +${pct}%.`,
+    condition: { kind: 'job_count', job, count: n },
     scope: 'involved',
     mods: { [mod.key]: pct },
   };
@@ -136,12 +152,15 @@ export function allSynergyCandidates(team: Team): SynergyDef[] {
     }
   }
 
-  // 직업 수: 실제 보유 수 기준
+  // 직업 수: 팀에 실제로 JOB_COUNT_MIN(2)명 이상 있는 직업만. 2명 조건을 만들고, 3명 이상이면 3명 조건도 추가
   const counts = jobCounts(team);
   for (const job of MAIN_JOBS) {
     const n = counts[job];
-    if (n <= 0) continue;
-    for (let k = 0; k < JOB_COUNT_MODS[job].length; k++) push(makeJobCountSynergy(job, n, k));
+    if (n < JOB_COUNT_MIN) continue;
+    const maxCount = n < JOB_COUNT_MAX ? n : JOB_COUNT_MAX;
+    for (let c = JOB_COUNT_MIN; c <= maxCount; c++) {
+      for (let k = 0; k < JOB_COUNT_MODS[job].length; k++) push(makeJobCountSynergy(job, c, k));
+    }
   }
 
   // 맵
@@ -176,7 +195,7 @@ export function generateSynergyCandidates(team: Team, rng: Rng, count: number): 
 
 // ───────────────────────── 자동 시너지 (직업 조합) ─────────────────────────
 
-/** 직업 조합으로 자동 부여되는 시너지 (GDD 7.5). 팀 구성만으로 결정되므로 난수 없음 */
+/** 직업 조합으로 자동 부여되는 시너지 (GDD §7.8). 팀 구성만으로 결정되므로 난수 없음. 직업 수 조건은 전부 2명 기준 */
 export function autoSynergies(team: Team): SynergyDef[] {
   const out: SynergyDef[] = [];
   const counts = jobCounts(team);
@@ -196,13 +215,13 @@ export function autoSynergies(team: Team): SynergyDef[] {
     });
   }
 
-  // 마법사 3인 이상 시전속도 +15%
-  if (counts.mage >= 3) {
+  // 마법사 2인 이상 시전속도 +15% (v0.5: 4인 팀에 맞춰 3명 → 2명)
+  if (counts.mage >= JOB_COUNT_MIN) {
     out.push({
       id: 'syn_auto_mage_circle',
       name: '대마법진',
-      desc: '마법사가 3명 이상이면 마법사 전원의 시전 속도 +15%.',
-      condition: { kind: 'job_count', job: 'mage', count: 3 },
+      desc: `마법사가 ${JOB_COUNT_MIN}명 이상이면 마법사 전원의 시전 속도 +15%.`,
+      condition: { kind: 'job_count', job: 'mage', count: JOB_COUNT_MIN },
       scope: 'involved',
       mods: { castSpeed: 15 },
     });
@@ -222,12 +241,12 @@ export function autoSynergies(team: Team): SynergyDef[] {
   }
 
   // 소환사 2인 이상: 소환 결속
-  if (counts.summoner >= 2) {
+  if (counts.summoner >= JOB_COUNT_MIN) {
     out.push({
       id: 'syn_auto_summoner_pact',
       name: '소환 계약',
-      desc: '소환사가 2명 이상이면 소환사 전원의 최대 HP +10%, MP 회복 +10%.',
-      condition: { kind: 'job_count', job: 'summoner', count: 2 },
+      desc: `소환사가 ${JOB_COUNT_MIN}명 이상이면 소환사 전원의 최대 HP +10%, MP 회복 +10%.`,
+      condition: { kind: 'job_count', job: 'summoner', count: JOB_COUNT_MIN },
       scope: 'involved',
       mods: { maxHp: 10, mpRegen: 10 },
     });
@@ -246,8 +265,8 @@ export function autoSynergies(team: Team): SynergyDef[] {
     });
   }
 
-  // 원거리 딜러(궁수+저격수) 2인 이상: 평원 맵 사거리
-  if (counts.archer + counts.sniper >= 2) {
+  // 원거리 딜러(궁수+저격수) 2인 이상: 평원 맵 사거리 (직업이 섞이므로 map 조건으로 표현)
+  if (counts.archer + counts.sniper >= JOB_COUNT_MIN) {
     out.push({
       id: 'syn_auto_ranged_plains',
       name: '사선 확보',
@@ -267,6 +286,30 @@ export function autoSynergies(team: Team): SynergyDef[] {
       condition: { kind: 'map', map: 'glacier' },
       scope: 'team',
       mods: { moveSpeed: 8 },
+    });
+  }
+
+  // 검사 2인 이상: 검진 (v0.5 추가. 4인 팀에서 같은 직업 2명은 흔하므로 자동 시너지로 보상)
+  if (counts.swordsman >= JOB_COUNT_MIN) {
+    out.push({
+      id: 'syn_auto_sword_formation',
+      name: '쌍검진',
+      desc: `검사가 ${JOB_COUNT_MIN}명 이상이면 검사 전원의 물리 공격 +8%, 물리 방어 +5%.`,
+      condition: { kind: 'job_count', job: 'swordsman', count: JOB_COUNT_MIN },
+      scope: 'involved',
+      mods: { physAtk: 8, physDef: 5 },
+    });
+  }
+
+  // 힐러 2인 이상: 이중 기도
+  if (counts.healer >= JOB_COUNT_MIN) {
+    out.push({
+      id: 'syn_auto_healer_choir',
+      name: '이중 기도',
+      desc: `힐러가 ${JOB_COUNT_MIN}명 이상이면 힐러 전원의 이능 공격 +8%, 시전 속도 +8%.`,
+      condition: { kind: 'job_count', job: 'healer', count: JOB_COUNT_MIN },
+      scope: 'involved',
+      mods: { magAtk: 8, castSpeed: 8 },
     });
   }
 

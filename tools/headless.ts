@@ -1,14 +1,17 @@
 /**
- * 헤드리스 대량 시뮬레이션 / 밸런싱 CLI (v0.4 — 10일 × 5스텝 구조).
+ * 헤드리스 대량 시뮬레이션 / 밸런싱 CLI (v0.5 — 4:4, 몬스터 1~8인, 광역 예고·회피·장판).
  *
  *   npm run headless -- --games 200 --seed 1 [--map plains] [--day 5] [--json]
  *   npm run headless -- --determinism [--seed 1] [--map dark] [--day 5]
  *   npm run headless -- --growth [--policy greedy|first|random] [--seed 1] [--json]
  *   npm run headless -- --monster [--runs 60] [--seed 1] [--json]
  *   npm run headless -- --rarity  [--runs 60] [--seed 1] [--json]
+ *   npm run headless -- --dodge   [--trials 400] [--skill mage_blast] [--telegraph 0.8] [--radius 2.5] [--move 50] [--json]
  *
  * 외부 의존성 없음. 난수는 전부 시드에서 파생한다 (Math.random / Date 금지).
  * DOM 을 쓰지 않으므로 node(tsx) 에서 그대로 실행된다.
+ *
+ * 팀 인원은 숫자로 박지 않는다. 플레이어·상대·검증팀은 TEAM_SIZE, 몬스터는 MONSTER_TEAM_MIN~MAX.
  *
  * 육성 상태 머신(run.ts)·선택지(choices.ts) 는 이름이 조금씩 달라도 동작하도록
  * 아래 "모듈 어댑터" 에서 후보 이름을 순서대로 찾아 연결한다. 찾지 못하면
@@ -22,6 +25,13 @@ import {
   STAT_MAX,
   JOB_NAME_KO,
   MAP_NAME_KO,
+  TEAM_SIZE,
+  MONSTER_TEAM_MIN,
+  MONSTER_TEAM_MAX,
+  TICK_RATE,
+  TICK_DT,
+  DEFAULT_TELEGRAPH_SEC,
+  SHORT_TELEGRAPH_SEC,
   TOTAL_DAYS,
   STEPS_PER_DAY,
   CHOICE_STEPS,
@@ -37,7 +47,9 @@ import {
   CHOICE_KIND_NAME_KO,
   STEP_KIND_NAME_KO,
   stepKindOf,
+  type Adaptation,
   type BaseStatKey,
+  type BattleEvent,
   type BattleFrame,
   type BattleInput,
   type BattleResult,
@@ -50,23 +62,28 @@ import {
   type MonsterEncounter,
   type MonsterTier,
   type RunState,
+  type SkillDef,
+  type StatBlock,
   type Team,
   type TeamSide,
+  type UnitSnapshot,
+  type ZoneSnapshot,
 } from '../src/core/types';
 import { Rng, hashSeed } from '../src/core/rng';
+import * as simModule from '../src/core/battle/sim';
 import { createBattle } from '../src/core/battle/sim';
 import { generateOpponentTeam } from '../src/core/gen/charGen';
-import { powerRating, statTotal } from '../src/core/stats';
+import { computeDerived, powerRating, statTotal } from '../src/core/stats';
 import { SKILLS, skillPoolFor } from '../src/core/data/skills';
 import { JOBS } from '../src/core/data/jobs';
 
 // ───────────────────────── 모듈 어댑터 ─────────────────────────
 //
-// run.ts / choices.ts 는 v0.4 재설계와 함께 다시 쓰이는 중이라 함수 이름이 확정되지
+// run.ts / choices.ts 는 재설계와 함께 다시 쓰이는 중이라 함수 이름이 확정되지
 // 않았다. 이 도구는 후보 이름을 순서대로 찾아 붙인다. 타입 계약(types.ts)만 지키면
 // 이름이 달라도 CLI 는 그대로 동작한다.
 // 또한 육성 모듈은 육성 모드에서만 동적으로 불러온다. 전투 전용 모드(--games /
-// --determinism)는 육성 모듈이 깨져 있어도 그대로 돌아간다.
+// --determinism / --dodge)는 육성 모듈이 깨져 있어도 그대로 돌아간다.
 
 type AnyFn = (...args: unknown[]) => unknown;
 
@@ -188,13 +205,13 @@ function apiBattleInput(state: RunState): BattleInput {
       }
     }
   }
-  const r = require_(runApi, NAMES.battleInput, '5:5 전투 입력 함수')(state);
+  const r = require_(runApi, NAMES.battleInput, '4:4 전투 입력 함수')(state);
   if (!isBattleInput(r)) throw new Error('전투 입력 함수가 BattleInput 을 돌려주지 않았습니다.');
   return r;
 }
 
 function apiFinishBattle(state: RunState, result: BattleResult): void {
-  require_(runApi, NAMES.finishBattle, '5:5 전투 종료 함수')(state, result);
+  require_(runApi, NAMES.finishBattle, '4:4 전투 종료 함수')(state, result);
 }
 
 function apiBuySkill(state: RunState, charId: string, skillId: string): boolean {
@@ -247,6 +264,11 @@ const POLICY_NAME_KO: Record<PolicyName, string> = {
   random: '무작위',
 };
 
+/** --dodge 기본 시험 스킬: 반경 2.5, 사거리 7, 예고 기본값 0.8초인 마법사 광역 */
+const DEFAULT_DODGE_SKILL = 'mage_blast';
+const DEFAULT_DODGE_TRIALS = 400;
+const DEFAULT_DODGE_MOVE = 50;
+
 interface CliOptions {
   games: number;
   seed: number;
@@ -258,6 +280,17 @@ interface CliOptions {
   growth: boolean;
   monster: boolean;
   rarity: boolean;
+  dodge: boolean;
+  /** --dodge: 유닛당 판정 횟수 */
+  trials: number;
+  /** --dodge: 시험 광역 스킬 id */
+  skill: string;
+  /** --dodge: 예고 시간 덮어쓰기 (null 이면 스킬 정의/기본값) */
+  telegraph: number | null;
+  /** --dodge: 반경 덮어쓰기 (null 이면 스킬 정의) */
+  radius: number | null;
+  /** --dodge: 두 시험 유닛의 이동속도 스탯 */
+  move: number;
   json: boolean;
   help: boolean;
 }
@@ -274,6 +307,12 @@ function parseArgs(argv: string[]): CliOptions {
     growth: false,
     monster: false,
     rarity: false,
+    dodge: false,
+    trials: DEFAULT_DODGE_TRIALS,
+    skill: DEFAULT_DODGE_SKILL,
+    telegraph: null,
+    radius: null,
+    move: DEFAULT_DODGE_MOVE,
     json: false,
     help: false,
   };
@@ -288,6 +327,13 @@ function parseArgs(argv: string[]): CliOptions {
     const n = Number(raw);
     if (!Number.isFinite(n) || !Number.isInteger(n)) {
       throw new Error(`옵션 ${name} 값이 정수가 아닙니다: ${raw}`);
+    }
+    return n;
+  };
+  const parseNumStrict = (raw: string, name: string): number => {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) {
+      throw new Error(`옵션 ${name} 값이 숫자가 아닙니다: ${raw}`);
     }
     return n;
   };
@@ -337,6 +383,24 @@ function parseArgs(argv: string[]): CliOptions {
         opts.policy = p as PolicyName;
         break;
       }
+      case '--trials':
+        opts.trials = Math.max(1, parseIntStrict(value(key), key));
+        break;
+      case '--skill': {
+        const s = value(key);
+        if (!SKILLS[s]) throw new Error(`알 수 없는 스킬 id: ${s}`);
+        opts.skill = s;
+        break;
+      }
+      case '--telegraph':
+        opts.telegraph = Math.max(0, parseNumStrict(value(key), key));
+        break;
+      case '--radius':
+        opts.radius = Math.max(0.1, parseNumStrict(value(key), key));
+        break;
+      case '--move':
+        opts.move = Math.min(STAT_MAX, Math.max(1, parseIntStrict(value(key), key)));
+        break;
       case '--determinism':
         opts.determinism = true;
         break;
@@ -348,6 +412,9 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case '--rarity':
         opts.rarity = true;
+        break;
+      case '--dodge':
+        opts.dodge = true;
         break;
       case '--json':
         opts.json = true;
@@ -366,20 +433,26 @@ function parseArgs(argv: string[]): CliOptions {
 function printHelp(): void {
   console.log(
     [
-      '헤드리스 전투 / 육성 시뮬레이션 CLI (10일 × 5스텝)',
+      `헤드리스 전투 / 육성 시뮬레이션 CLI (10일 × 5스텝, ${TEAM_SIZE}:${TEAM_SIZE} 전투, 몬스터 ${MONSTER_TEAM_MIN}~${MONSTER_TEAM_MAX}인)`,
       '',
       '사용법: npm run headless -- [옵션]',
       '',
-      '  --games N        시뮬레이션 판 수 (기본 100, 기본 모드)',
+      '  --games N        시뮬레이션 판 수 (기본 100, 기본 모드). 광역·회피 통계도 함께 집계',
       '  --seed S         루트 시드 (기본 1)',
       '  --map M          plains | dark | desert | glacier | random (기본 random)',
       '  --day D          양 팀을 생성할 육성 일차 1~10 (기본 5). --cycle 은 같은 뜻의 옛 이름',
       '  --runs N         --monster / --rarity 의 표본 육성 수 (기본 60)',
       '  --policy P       육성 자동 정책 greedy | first | random (기본 greedy)',
-      '  --determinism    같은 입력으로 전투를 두 번 돌려 틱별 프레임 해시를 비교',
+      '  --determinism    같은 입력으로 전투를 두 번 돌려 틱별 프레임 해시(영역 포함)를 비교',
       '  --growth         10일 × 5스텝 육성을 헤드리스로 진행하고 분화 보장을 검증',
-      '  --monster        일차별로 하급/중급/고급을 모두 싸워 승률표를 뽑는다 (난이도 보정용)',
+      '  --monster        일차별로 하급/중급/고급을 모두 싸워 승률표를 뽑는다 (난이도·인원 보정용)',
       '  --rarity         선택지 등급 분포와 등급별 예상 전투력 상승치를 집계',
+      '  --dodge          광역 예고 회피율 측정 (판단력 80·민첩 70 vs 판단력 30·민첩 30)',
+      `  --trials N       --dodge 유닛당 판정 횟수 (기본 ${DEFAULT_DODGE_TRIALS})`,
+      `  --skill ID       --dodge 시험 광역 스킬 id (기본 ${DEFAULT_DODGE_SKILL})`,
+      '  --telegraph T    --dodge 예고 시간(초) 덮어쓰기 (기본: 스킬 정의 또는 기본 규칙)',
+      '  --radius R       --dodge 영역 반경 덮어쓰기 (기본: 스킬 정의)',
+      `  --move M         --dodge 시험 유닛 이동속도 스탯 (기본 ${DEFAULT_DODGE_MOVE})`,
       '  --json           요약을 JSON 으로 출력',
       '  --help           이 도움말',
       '',
@@ -393,6 +466,9 @@ const DAY_STEP_LABEL = (() => {
   for (let s = 1; s <= STEPS_PER_DAY; s++) parts.push(`${s}${STEP_KIND_NAME_KO[stepKindOf(s)]}`);
   return parts.join(' · ');
 })();
+
+/** 화면·표에 쓰는 '4:4' 표기. 인원 상수에서 만든다 */
+const VS_LABEL = `${TEAM_SIZE}:${TEAM_SIZE}`;
 
 // ───────────────────────── 출력 유틸 ─────────────────────────
 
@@ -477,17 +553,232 @@ function deepClone<T>(v: T): T {
 
 // ───────────────────────── 프레임 해시 ─────────────────────────
 
-/** 프레임 전체를 직렬화해 FNV-1a 32비트 해시. 결정론 검증용. */
+/** 프레임 전체(유닛·이벤트·영역·거점)를 직렬화해 FNV-1a 32비트 해시. 결정론 검증용. */
 function hashFrame(frame: BattleFrame): number {
   const payload = JSON.stringify({
     tick: frame.tick,
     timeSec: frame.timeSec,
     units: frame.units,
     events: frame.events,
+    zones: frame.zones ?? [],
     capture: frame.capture,
     finished: frame.finished,
   });
   return hashSeed(payload);
+}
+
+// ───────────────────────── 광역 영역(Zone) 기하 ─────────────────────────
+
+/** 시전자 쪽이 아닌, 피해를 받는 쪽인지 */
+function isEnemyOf(side: TeamSide, unit: UnitSnapshot): boolean {
+  return unit.side !== side;
+}
+
+/** 예고 시작 시점에 회피 판정을 받을 수 없는 상태 (GDD §4.4: 기절·빙결·도발) */
+function cannotDodge(unit: UnitSnapshot): boolean {
+  for (const st of unit.statuses) {
+    if (st.kind === 'stun' || st.kind === 'freeze' || st.kind === 'taunt') return true;
+  }
+  return false;
+}
+
+/** 스킬 정의를 찾는다. 없으면 null (몬스터 전용 스킬도 SKILLS 에 있다) */
+function skillDefOf(id: string): SkillDef | null {
+  const def = SKILLS[id];
+  return def ?? null;
+}
+
+/**
+ * line 영역의 절반 폭. 스킬 정의의 radius 가 '폭' 이고 sim 은 선분과의 수직 거리 ≤ radius 로 판정하므로
+ * 그 값을 그대로 쓴다. 스킬을 모르면 스냅샷의 width 를 전체 폭으로 보고 절반을 쓴다.
+ */
+function lineHalfWidth(z: ZoneSnapshot, def: SkillDef | null): number {
+  if (def && def.radius !== undefined && def.radius > 0) return def.radius;
+  if (z.width !== undefined && z.width > 0) return z.width / 2;
+  return 0.5;
+}
+
+function insideZone(z: ZoneSnapshot, def: SkillDef | null, x: number, y: number): boolean {
+  if (z.shape === 'circle') {
+    const dx = x - z.x;
+    const dy = y - z.y;
+    return dx * dx + dy * dy <= z.radius * z.radius + 1e-9;
+  }
+  // line: (x,y)→(x2,y2) 선분과의 수직 거리
+  const x2 = z.x2 ?? z.x;
+  const y2 = z.y2 ?? z.y;
+  const half = lineHalfWidth(z, def);
+  const vx = x2 - z.x;
+  const vy = y2 - z.y;
+  const len2 = vx * vx + vy * vy;
+  let t = 0;
+  if (len2 > 0) {
+    t = ((x - z.x) * vx + (y - z.y) * vy) / len2;
+    if (t < 0) t = 0;
+    else if (t > 1) t = 1;
+  }
+  const px = z.x + vx * t;
+  const py = z.y + vy * t;
+  const dx = x - px;
+  const dy = y - py;
+  return dx * dx + dy * dy <= half * half + 1e-9;
+}
+
+/** 적에게 피해를 주는 광역(enemy_area / line + damage 효과)인지. 이 영역만 회피 통계에 넣는다 */
+function isDamageAoe(def: SkillDef | null): boolean {
+  if (!def) return false;
+  if (def.target !== 'enemy_area' && def.target !== 'line') return false;
+  for (const e of def.effects) if (e.kind === 'damage') return true;
+  return def.linger !== undefined && def.linger.dpsCoef > 0;
+}
+
+/** 한 판에서 모은 광역·회피 통계 */
+interface ZoneStats {
+  /** 'zone' 이벤트 수 (예고 시작) */
+  zoneEvents: number;
+  /** 프레임에 새로 나타난 피해 광역 영역 수 */
+  damageZones: number;
+  /** 예고 시작 시 영역 안에 있던, 회피 판정을 받을 수 있는 적 유닛 수 (= 회피 판정 횟수 추정) */
+  dodgeAttempts: number;
+  /** 'dodge' 이벤트 수 (회피 성공 = 인지) */
+  dodgeEvents: number;
+  /** 예고 시작 시 영역 안에 있었고 impact 때 살아 있던 적 유닛 수 */
+  impactExposed: number;
+  /** 그중 impact 시점에 영역 밖으로 벗어나 피해를 받지 않은 수 (회피 이동이든 일반 이동이든) */
+  impactAvoided: number;
+  /** 그중 예고 시작 틱에 그 스킬의 dodge 이벤트를 받았고(인지) impact 때 영역 밖이었던 수 = 회피 이동으로 벗어남 */
+  dodgedEscaped: number;
+  /** 인지(dodge 이벤트)했지만 impact 때 아직 영역 안이라 맞은 수 (이동속도 부족, 탈출점이 다른 영역 안, 밀림 등) */
+  dodgedHit: number;
+}
+
+function emptyZoneStats(): ZoneStats {
+  return { zoneEvents: 0, damageZones: 0, dodgeAttempts: 0, dodgeEvents: 0, impactExposed: 0, impactAvoided: 0, dodgedEscaped: 0, dodgedHit: 0 };
+}
+
+function addZoneStats(into: ZoneStats, s: ZoneStats): void {
+  into.zoneEvents += s.zoneEvents;
+  into.damageZones += s.damageZones;
+  into.dodgeAttempts += s.dodgeAttempts;
+  into.dodgeEvents += s.dodgeEvents;
+  into.impactExposed += s.impactExposed;
+  into.impactAvoided += s.impactAvoided;
+  into.dodgedEscaped += s.dodgedEscaped;
+  into.dodgedHit += s.dodgedHit;
+}
+
+interface TrackedZone {
+  snapshot: ZoneSnapshot;
+  def: SkillDef | null;
+  /** 예고 시작 시 영역 안에 있던 적 유닛 id (배열 순서 = 프레임 순서) */
+  insideAtStart: string[];
+  /** 그중 예고 시작 틱에 이 스킬의 dodge 이벤트를 받은 유닛 id (인지) */
+  dodged: Set<string>;
+}
+
+interface TrackedBattle {
+  result: BattleResult;
+  zones: ZoneStats;
+}
+
+/**
+ * 전투를 틱 단위로 진행하며 광역 영역의 예고 시작/impact 를 프레임에서 추적한다.
+ * 결과(BattleResult)는 runToEnd() 와 완전히 같다 (같은 step 을 같은 순서로 부른다).
+ *  - zoneFilter: 어떤 영역을 회피 통계에 넣을지 (기본: 피해 광역 전부)
+ *  - unitFilter: 어떤 적 유닛을 셀지 (기본: 전부)
+ */
+function runBattleTracked(
+  input: BattleInput,
+  zoneFilter?: (z: ZoneSnapshot, def: SkillDef | null) => boolean,
+  unitFilter?: (u: UnitSnapshot) => boolean,
+): TrackedBattle {
+  const sim = createBattle(input);
+  const stats = emptyZoneStats();
+  const tracked = new Map<string, TrackedZone>();
+  let prevIds = new Set<string>();
+  const maxTicks = 1_000_000;
+  let ticks = 0;
+
+  while (!sim.finished && ticks < maxTicks) {
+    const f = sim.step();
+    ticks++;
+    const zones = f.zones ?? [];
+    const ids = new Set<string>();
+
+    // 1) 이번 틱에 새로 나타난 영역: 예고 중이면 안에 있는 적 유닛을 기록한다
+    for (const z of zones) {
+      ids.add(z.id);
+      if (prevIds.has(z.id)) continue;
+      const def = skillDefOf(z.skillId);
+      if (!isDamageAoe(def)) continue;
+      if (zoneFilter && !zoneFilter(z, def)) continue;
+      stats.damageZones++;
+      if (z.phase !== 'telegraph') continue; // 예고 없는 스킬은 회피 판정이 없다
+      const inside: string[] = [];
+      for (const u of f.units) {
+        if (!u.alive || !isEnemyOf(z.side, u)) continue;
+        if (unitFilter && !unitFilter(u)) continue;
+        if (!insideZone(z, def, u.x, u.y)) continue;
+        inside.push(u.id);
+        if (!cannotDodge(u)) stats.dodgeAttempts++;
+      }
+      // 같은 틱의 dodge 이벤트(같은 스킬 id, 영역 안 유닛)를 이 영역의 '인지' 로 본다.
+      // (같은 틱에 같은 스킬의 영역이 둘 생기면 구분할 수 없어 둘 다에 센다 — 드물다)
+      const dodged = new Set<string>();
+      for (const ev of f.events) {
+        if (ev.kind === 'dodge' && ev.skillId === z.skillId && inside.indexOf(ev.unit) >= 0) dodged.add(ev.unit);
+      }
+      tracked.set(z.id, { snapshot: z, def, insideAtStart: inside, dodged });
+    }
+
+    // 2) 예고가 끝난(phase 변경 또는 소멸) 영역: 시작 시 안에 있던 유닛이 아직 안에 있는지 본다
+    if (tracked.size > 0) {
+      const byId = new Map<string, ZoneSnapshot>();
+      for (const z of zones) byId.set(z.id, z);
+      const done: string[] = [];
+      for (const [id, tz] of tracked) {
+        const cur = byId.get(id);
+        if (cur && cur.phase === 'telegraph') continue;
+        const shape = cur ?? tz.snapshot;
+        for (const uid of tz.insideAtStart) {
+          let unit: UnitSnapshot | null = null;
+          for (const u of f.units) {
+            if (u.id === uid) {
+              unit = u;
+              break;
+            }
+          }
+          if (!unit || !unit.alive) continue; // impact 전에 죽은 유닛은 회피와 무관
+          stats.impactExposed++;
+          const outside = !insideZone(shape, tz.def, unit.x, unit.y);
+          if (outside) stats.impactAvoided++;
+          if (tz.dodged.has(uid)) {
+            if (outside) stats.dodgedEscaped++;
+            else stats.dodgedHit++;
+          }
+        }
+        done.push(id);
+      }
+      for (const id of done) tracked.delete(id);
+    }
+
+    prevIds = ids;
+  }
+
+  const result = sim.result();
+  if (!result) throw new Error('전투가 끝나지 않았습니다 (틱 상한 초과).');
+  for (const ev of result.events) {
+    if (ev.kind === 'zone') stats.zoneEvents++;
+    else if (ev.kind === 'dodge') {
+      if (unitFilter) {
+        // unitFilter 는 스냅샷 기준이라 id 만으로 걸러야 한다: 마지막 프레임의 유닛에서 찾는다
+        const snap = sim.currentFrame().units.find((u) => u.id === ev.unit);
+        if (snap && !unitFilter(snap)) continue;
+      }
+      stats.dodgeEvents++;
+    }
+  }
+  return { result, zones: stats };
 }
 
 // ───────────────────────── 전투 입력 생성 ─────────────────────────
@@ -514,6 +805,10 @@ function buildInput(rootSeed: number, gameIndex: number, opts: CliOptions): Batt
 
 // ───────────────────────── 대량 시뮬레이션 ─────────────────────────
 
+/** 4:4 전투 목표 평균 시간 (GDD §11 보정 목표) */
+const PVP_DURATION_MIN_SEC = 60;
+const PVP_DURATION_MAX_SEC = 120;
+
 interface JobAgg {
   appearances: number;
   wins: number;
@@ -525,20 +820,38 @@ interface JobAgg {
   skillsUsed: number;
 }
 
+interface ZoneSummary {
+  /** 판당 평균 */
+  zonesPerGame: number;
+  damageZonesPerGame: number;
+  dodgeAttemptsPerGame: number;
+  dodgeSuccessPerGame: number;
+  /** 회피 성공(dodge 이벤트) / 회피 판정 */
+  dodgeSuccessRate: number;
+  /** impact 때 영역 밖에 있던 비율 = 광역 피해 회피 비율 */
+  aoeDamageAvoidedShare: number;
+  /** 회피 이동으로 벗어난 비율 (dodge 이벤트 + impact 때 영역 밖) / 노출 */
+  dodgedEscapedShare: number;
+  totals: ZoneStats;
+}
+
 interface BatchSummary {
   mode: 'batch';
   games: number;
   seed: number;
   day: number;
+  teamSize: number;
   mapOption: string;
   winsA: number;
   winsB: number;
   draws: number;
   avgDurationSec: number;
+  durationTarget: { min: number; max: number; ok: boolean };
   perMap: Record<MapType, { games: number; winsA: number; winsB: number; draws: number; avgDurationSec: number }>;
   perJob: Record<MainJob, JobAgg & { winRate: number; avgDamage: number; avgHealing: number; survivalRate: number }>;
   topSkills: { skillId: string; name: string; uses: number }[];
   reasons: Record<string, number>;
+  zones: ZoneSummary;
 }
 
 function emptyJobAgg(): JobAgg {
@@ -548,6 +861,20 @@ function emptyJobAgg(): JobAgg {
 function skillName(id: string): string {
   const def = SKILLS[id];
   return def ? def.name : id;
+}
+
+function zoneSummaryOf(totals: ZoneStats, games: number): ZoneSummary {
+  const per = (n: number): number => (games > 0 ? n / games : 0);
+  return {
+    zonesPerGame: per(totals.zoneEvents),
+    damageZonesPerGame: per(totals.damageZones),
+    dodgeAttemptsPerGame: per(totals.dodgeAttempts),
+    dodgeSuccessPerGame: per(totals.dodgeEvents),
+    dodgeSuccessRate: totals.dodgeAttempts > 0 ? totals.dodgeEvents / totals.dodgeAttempts : 0,
+    aoeDamageAvoidedShare: totals.impactExposed > 0 ? totals.impactAvoided / totals.impactExposed : 0,
+    dodgedEscapedShare: totals.impactExposed > 0 ? totals.dodgedEscaped / totals.impactExposed : 0,
+    totals,
+  };
 }
 
 function runBatch(opts: CliOptions): BatchSummary {
@@ -560,6 +887,7 @@ function runBatch(opts: CliOptions): BatchSummary {
 
   const skillUses = new Map<string, number>();
   const reasons: Record<string, number> = {};
+  const zoneTotals = emptyZoneStats();
   let winsA = 0;
   let winsB = 0;
   let draws = 0;
@@ -570,7 +898,9 @@ function runBatch(opts: CliOptions): BatchSummary {
 
   for (let g = 0; g < opts.games; g++) {
     const input = buildInput(opts.seed, g, opts);
-    const result: BattleResult = createBattle(input).runToEnd();
+    const tracked = runBattleTracked(input);
+    const result: BattleResult = tracked.result;
+    addZoneStats(zoneTotals, tracked.zones);
 
     // 승패 집계
     if (result.winner === 'A') winsA++;
@@ -664,32 +994,65 @@ function runBatch(opts: CliOptions): BatchSummary {
     .slice(0, 10)
     .map(([skillId, uses]) => ({ skillId, name: skillName(skillId), uses }));
 
+  const avgDurationSec = opts.games > 0 ? durationSum / opts.games : 0;
+
   return {
     mode: 'batch',
     games: opts.games,
     seed: opts.seed,
     day: opts.day,
+    teamSize: TEAM_SIZE,
     mapOption: opts.map,
     winsA,
     winsB,
     draws,
-    avgDurationSec: opts.games > 0 ? durationSum / opts.games : 0,
+    avgDurationSec,
+    durationTarget: {
+      min: PVP_DURATION_MIN_SEC,
+      max: PVP_DURATION_MAX_SEC,
+      ok: avgDurationSec >= PVP_DURATION_MIN_SEC && avgDurationSec <= PVP_DURATION_MAX_SEC,
+    },
     perMap,
     perJob: perJobOut,
     topSkills,
     reasons,
+    zones: zoneSummaryOf(zoneTotals, opts.games),
   };
+}
+
+function printZoneSummary(z: ZoneSummary, games: number): void {
+  section('광역 영역(Zone)·회피 (판당 평균)');
+  printTable(
+    ['항목', '판당 평균', '합계'],
+    [
+      ['광역 영역 생성 (zone 이벤트)', fixed(z.zonesPerGame, 2), String(z.totals.zoneEvents)],
+      ['피해 광역 영역 (프레임 기준)', fixed(z.damageZonesPerGame, 2), String(z.totals.damageZones)],
+      ['회피 판정 (예고 시작 시 영역 안 적 유닛)', fixed(z.dodgeAttemptsPerGame, 2), String(z.totals.dodgeAttempts)],
+      ['회피 성공 (dodge 이벤트)', fixed(z.dodgeSuccessPerGame, 2), String(z.totals.dodgeEvents)],
+    ],
+    ['l', 'r', 'r'],
+  );
+  console.log(
+    `회피 성공률(인지) ${pctOf(z.dodgeSuccessRate)} (${z.totals.dodgeEvents}/${z.totals.dodgeAttempts})  ` +
+      `광역 피해 회피 비율(impact 때 영역 밖) ${pctOf(z.aoeDamageAvoidedShare)} (${z.totals.impactAvoided}/${z.totals.impactExposed})  ` +
+      `회피 이동으로 벗어남 ${pctOf(z.dodgedEscapedShare)} (${z.totals.dodgedEscaped}), 인지했지만 맞음 ${z.totals.dodgedHit}`,
+  );
+  if (z.totals.zoneEvents === 0 && z.totals.damageZones === 0) {
+    console.log(`(${games}판 동안 광역 영역이 하나도 생성되지 않았습니다. sim 이 Zone 을 아직 만들지 않거나 광역 스킬이 쓰이지 않았습니다.)`);
+  }
 }
 
 function printBatch(s: BatchSummary): void {
   const total = s.games;
   section(
-    `전체 결과 (${total}판, 시드 ${s.seed}, ${s.day}일차, 맵 ${s.mapOption === 'random' ? '랜덤' : MAP_NAME_KO[s.mapOption as MapType]})`,
+    `전체 결과 (${total}판, 시드 ${s.seed}, ${s.day}일차, ${VS_LABEL}, 맵 ${s.mapOption === 'random' ? '랜덤' : MAP_NAME_KO[s.mapOption as MapType]})`,
   );
   console.log(
     `A 승 ${pct(s.winsA, total)} (${s.winsA})  B 승 ${pct(s.winsB, total)} (${s.winsB})  무승부 ${pct(s.draws, total)} (${s.draws})`,
   );
-  console.log(`평균 전투 시간 ${fixed(s.avgDurationSec)}초`);
+  console.log(
+    `평균 전투 시간 ${fixed(s.avgDurationSec)}초 (목표 ${s.durationTarget.min}~${s.durationTarget.max}초: ${s.durationTarget.ok ? 'OK' : '조정 필요'})`,
+  );
 
   section('맵별 A 승률');
   printTable(
@@ -741,6 +1104,8 @@ function printBatch(s: BatchSummary): void {
     );
   }
 
+  printZoneSummary(s.zones, total);
+
   section('종료 사유');
   const reasonKeys = Object.keys(s.reasons).sort();
   printTable(
@@ -762,6 +1127,8 @@ interface DeterminismReport {
   detail: string;
   resultMatch: boolean;
   inputMutated: boolean;
+  /** 두 시뮬레이션에서 관측된 광역 영역 수 (같아야 한다) */
+  zonesSeen: number;
 }
 
 function runDeterminism(opts: CliOptions): DeterminismReport {
@@ -776,12 +1143,14 @@ function runDeterminism(opts: CliOptions): DeterminismReport {
   let firstDiffTick: number | null = null;
   let detail = '';
   let ticks = 0;
+  let zonesSeen = 0;
   const maxTicks = 1_000_000;
 
   while (!(sim1.finished && sim2.finished) && ticks < maxTicks) {
     const f1 = sim1.step();
     const f2 = sim2.step();
     ticks++;
+    for (const ev of f1.events) if (ev.kind === 'zone') zonesSeen++;
     if (f1.tick !== f2.tick) {
       firstDiffTick = Math.min(f1.tick, f2.tick);
       detail = `틱 번호 불일치: ${f1.tick} vs ${f2.tick}`;
@@ -816,10 +1185,11 @@ function runDeterminism(opts: CliOptions): DeterminismReport {
     detail,
     resultMatch,
     inputMutated,
+    zonesSeen,
   };
 }
 
-/** 첫 불일치 프레임에서 어느 유닛의 어느 필드가 다른지 짧게 설명 */
+/** 첫 불일치 프레임에서 어느 유닛/영역의 어느 필드가 다른지 짧게 설명 */
 function describeFrameDiff(a: BattleFrame, b: BattleFrame): string {
   if (a.units.length !== b.units.length) return `유닛 수 불일치: ${a.units.length} vs ${b.units.length}`;
   for (let i = 0; i < a.units.length; i++) {
@@ -832,6 +1202,14 @@ function describeFrameDiff(a: BattleFrame, b: BattleFrame): string {
       if (va !== vb) return `유닛 ${ua.id} 필드 ${String(k)}: ${va} vs ${vb}`;
     }
   }
+  const za = a.zones ?? [];
+  const zb = b.zones ?? [];
+  if (za.length !== zb.length) return `광역 영역 수 불일치: ${za.length} vs ${zb.length}`;
+  for (let i = 0; i < za.length; i++) {
+    const sa = JSON.stringify(za[i]);
+    const sb = JSON.stringify(zb[i]);
+    if (sa !== sb) return `광역 영역 ${za[i].id}: ${sa} vs ${sb}`;
+  }
   if (JSON.stringify(a.events) !== JSON.stringify(b.events)) return '이벤트 목록 불일치';
   if (JSON.stringify(a.capture) !== JSON.stringify(b.capture)) return '거점 상태 불일치';
   return '알 수 없는 차이 (직렬화 결과 불일치)';
@@ -839,8 +1217,8 @@ function describeFrameDiff(a: BattleFrame, b: BattleFrame): string {
 
 function printDeterminism(r: DeterminismReport): void {
   section('결정론 검증');
-  console.log(`맵 ${MAP_NAME_KO[r.map]}, 전투 시드 ${r.seed}, 진행 틱 ${r.ticks}`);
-  console.log(`프레임 해시 비교: ${r.firstDiffTick === null ? 'PASS' : `FAIL (첫 불일치 틱 ${r.firstDiffTick})`}`);
+  console.log(`맵 ${MAP_NAME_KO[r.map]}, 전투 시드 ${r.seed}, 진행 틱 ${r.ticks}, 관측된 광역 영역 ${r.zonesSeen}개`);
+  console.log(`프레임 해시 비교(유닛·이벤트·영역·거점): ${r.firstDiffTick === null ? 'PASS' : `FAIL (첫 불일치 틱 ${r.firstDiffTick})`}`);
   if (r.detail) console.log(`  ${r.detail}`);
   console.log(`최종 결과 비교: ${r.resultMatch ? 'PASS' : 'FAIL'}`);
   console.log(`입력 불변 검사: ${r.inputMutated ? '경고 - 시뮬레이터가 입력 객체를 변조함' : 'PASS'}`);
@@ -861,6 +1239,8 @@ interface DayRow {
   pickedTitles: string[];
   monsterTier: MonsterTier | null;
   monsterName: string;
+  /** 몬스터 편성 인원 */
+  monsterUnits: number;
   monsterWon: boolean | null;
   monsterDurationSec: number;
   battleOutcome: Outcome | null;
@@ -916,14 +1296,16 @@ interface RunOutcome {
   /** rarityFloor 가 걸린 세트가 실제로 그 등급 이상을 포함했는지 */
   floorChecked: number;
   floorSatisfied: number;
+  /** 4:4 전투의 광역·회피 통계 합계 */
+  battleZones: ZoneStats;
 }
 
 /**
- * 풀에서 서로 다른 직업 5명을 앞에서부터 고른다. 직업이 5종 미만이면 나머지는 순서대로 채운다.
+ * 풀에서 서로 다른 직업 TEAM_SIZE 명을 앞에서부터 고른다. 직업이 TEAM_SIZE 종 미만이면 나머지는 순서대로 채운다.
  *
  * 먼저 탱커 또는 힐러 1명을 반드시 넣는다. generateOpponentTeam(charGen.ts)이 3일차부터
- * 상대에게 탱커/힐러를 보장하는데 기준 플레이어만 그 보장이 없으면, 표본의 1/3이 구조적으로
- * 불리한 편성(탱커 없음 승률 31.5% vs 있음 55.9%)이 되어 몬스터·상대 난이도 보정값이 어긋난다.
+ * 상대에게 탱커/힐러를 보장하는데 기준 플레이어만 그 보장이 없으면, 표본의 상당 부분이 구조적으로
+ * 불리한 편성이 되어 몬스터·상대 난이도 보정값이 어긋난다. 4인 팀에서는 한 명의 비중이 더 커서 이 규칙이 더 중요하다.
  */
 function pickDistinctJobs(pool: Character[]): string[] {
   const ids: string[] = [];
@@ -935,13 +1317,13 @@ function pickDistinctJobs(pool: Character[]): string[] {
     break;
   }
   for (const c of pool) {
-    if (ids.length >= 5) break;
+    if (ids.length >= TEAM_SIZE) break;
     if (seen.has(c.mainJob)) continue;
     seen.add(c.mainJob);
     ids.push(c.id);
   }
   for (const c of pool) {
-    if (ids.length >= 5) break;
+    if (ids.length >= TEAM_SIZE) break;
     if (!ids.includes(c.id)) ids.push(c.id);
   }
   return ids;
@@ -1048,6 +1430,7 @@ function newDayRow(day: number): DayRow {
     pickedTitles: [],
     monsterTier: null,
     monsterName: '',
+    monsterUnits: 0,
     monsterWon: null,
     monsterDurationSec: 0,
     battleOutcome: null,
@@ -1062,16 +1445,22 @@ function newDayRow(day: number): DayRow {
 
 /**
  * 하나의 육성을 정책에 따라 끝까지 진행한다.
- * 전투는 runToEnd() 로 즉시 끝내고, 상태 머신이 요구하는 순서대로만 호출한다.
+ * 전투는 즉시 끝내고(4:4 는 광역·회피 통계를 위해 틱 추적), 상태 머신이 요구하는 순서대로만 호출한다.
  */
 function driveRun(seed: number, policy: PolicyName, hooks: DriverHooks = {}): RunOutcome {
   const state = apiNewRun(seed);
   const ids = pickDistinctJobs(state.pool);
+  if (ids.length !== TEAM_SIZE) {
+    throw new Error(`풀에서 ${TEAM_SIZE}명을 고를 수 없습니다 (풀 ${state.pool.length}명, 고른 인원 ${ids.length}).`);
+  }
   const teamName = '헤드리스 검증팀';
   apiSelectTeam(state, ids, teamName);
 
   const team = state.team;
   if (!team) throw new Error('팀 선택 이후에도 state.team 이 null 입니다.');
+  if (team.members.length !== TEAM_SIZE) {
+    throw new Error(`팀 인원이 TEAM_SIZE(${TEAM_SIZE})와 다릅니다: ${team.members.length}`);
+  }
   const members = team.members.map((m: Character) => ({ id: m.id, name: m.name, job: m.mainJob }));
 
   const scheduled: Record<string, number | null> = {};
@@ -1121,6 +1510,7 @@ function driveRun(seed: number, policy: PolicyName, hooks: DriverHooks = {}): Ru
   let monsterFights = 0;
   let floorChecked = 0;
   let floorSatisfied = 0;
+  const battleZones = emptyZoneStats();
 
   // 포인트 증감 추적 (획득만 합산. 상점 소비는 빼지 않는다)
   let lastPoints = state.bonusPoints;
@@ -1195,6 +1585,7 @@ function driveRun(seed: number, policy: PolicyName, hooks: DriverHooks = {}): Ru
         const enc = options[idx];
         row.monsterTier = enc.tier;
         row.monsterName = enc.name;
+        row.monsterUnits = enc.team.members.length;
         apiPickMonster(state, idx, enc.tier);
         collectPoints(row);
         break;
@@ -1217,7 +1608,9 @@ function driveRun(seed: number, policy: PolicyName, hooks: DriverHooks = {}): Ru
       case 'battle': {
         const row = rowFor(state.day);
         const input = apiBattleInput(state);
-        const result = createBattle(input).runToEnd();
+        const tracked = runBattleTracked(input);
+        const result = tracked.result;
+        addZoneStats(battleZones, tracked.zones);
         const outcome = outcomeOf(result);
         row.map = input.map;
         row.battleOutcome = outcome;
@@ -1313,6 +1706,7 @@ function driveRun(seed: number, policy: PolicyName, hooks: DriverHooks = {}): Ru
     monsterFights,
     floorChecked,
     floorSatisfied,
+    battleZones,
   };
 }
 
@@ -1349,6 +1743,7 @@ interface GrowthReport {
   mode: 'growth';
   seed: number;
   policy: PolicyName;
+  teamSize: number;
   teamName: string;
   members: { id: string; name: string; job: MainJob }[];
   days: DayRow[];
@@ -1357,6 +1752,10 @@ interface GrowthReport {
   draws: number;
   monsterWins: number;
   monsterFights: number;
+  /** 1일차와 10일차 4:4 전투 시간 (1일차가 짧아야 한다) */
+  firstDayBattleSec: number;
+  lastDayBattleSec: number;
+  avgBattleSec: number;
   finalAvgStatTotal: number;
   finalTeamPower: number;
   finalBonusPoints: number;
@@ -1367,20 +1766,30 @@ interface GrowthReport {
   subJobChecks: SubJobCheck[];
   subJobPass: boolean;
   finished: boolean;
+  battleZones: ZoneSummary;
 }
 
 function runGrowth(opts: CliOptions): GrowthReport {
   const out = driveRun(opts.seed, opts.policy);
   let totalPoints = 0;
   let totalSkillsBought = 0;
+  let battleSum = 0;
+  let battles = 0;
   for (const d of out.days) {
     totalPoints += d.pointsEarned;
     totalSkillsBought += d.skillsBought;
+    if (d.battleOutcome !== null) {
+      battleSum += d.battleDurationSec;
+      battles++;
+    }
   }
+  const first = out.days.find((d) => d.battleOutcome !== null);
+  const last = [...out.days].reverse().find((d) => d.battleOutcome !== null);
   return {
     mode: 'growth',
     seed: opts.seed,
     policy: opts.policy,
+    teamSize: TEAM_SIZE,
     teamName: out.teamName,
     members: out.members,
     days: out.days,
@@ -1389,6 +1798,9 @@ function runGrowth(opts: CliOptions): GrowthReport {
     draws: out.draws,
     monsterWins: out.monsterWins,
     monsterFights: out.monsterFights,
+    firstDayBattleSec: first ? first.battleDurationSec : 0,
+    lastDayBattleSec: last ? last.battleDurationSec : 0,
+    avgBattleSec: battles > 0 ? battleSum / battles : 0,
     finalAvgStatTotal: avgStatTotal(out.state.team),
     finalTeamPower: teamPower(out.state.team),
     finalBonusPoints: out.state.bonusPoints,
@@ -1399,6 +1811,7 @@ function runGrowth(opts: CliOptions): GrowthReport {
     subJobChecks: out.subJobChecks,
     subJobPass: out.subJobPass,
     finished: out.finished,
+    battleZones: zoneSummaryOf(out.battleZones, battles),
   };
 }
 
@@ -1407,13 +1820,13 @@ function rarityShort(r: ChoiceRarity): string {
 }
 
 function printGrowth(r: GrowthReport): void {
-  section(`육성 헤드리스 (시드 ${r.seed}, 정책 ${POLICY_NAME_KO[r.policy]}, 팀 "${r.teamName}")`);
+  section(`육성 헤드리스 (시드 ${r.seed}, 정책 ${POLICY_NAME_KO[r.policy]}, 팀 "${r.teamName}", ${r.teamSize}인)`);
   console.log(`하루 구성: ${DAY_STEP_LABEL} (선택 스텝 ${CHOICE_STEPS.join('·')} / 몬스터 ${MONSTER_STEP} / 전투 ${BATTLE_STEP})`);
   console.log('팀원: ' + r.members.map((m) => `${m.name}(${JOB_NAME_KO[m.job]})`).join(', '));
 
   section('일차별 진행');
   printTable(
-    ['일차', '맵', '선택 3장 등급', '몬스터', '5:5', '포인트', '평균 스탯합', '팀 전투력'],
+    ['일차', '맵', '선택 3장 등급', '몬스터', '인원', VS_LABEL, '전투 시간', '포인트', '평균 스탯합', '팀 전투력'],
     r.days.map((d) => [
       String(d.day),
       d.map ? MAP_NAME_KO[d.map] : '-',
@@ -1421,12 +1834,14 @@ function printGrowth(r: GrowthReport): void {
       d.monsterTier
         ? `${MONSTER_TIER_NAME_KO[d.monsterTier]} ${d.monsterWon === null ? '-' : d.monsterWon ? '승' : '패'}`
         : '-',
+      d.monsterUnits > 0 ? `${d.monsterUnits}명` : '-',
       outcomeKo(d.battleOutcome),
+      d.battleOutcome !== null ? fixed(d.battleDurationSec, 0) + '초' : '-',
       String(d.pointsEarned),
       fixed(d.avgStatTotal, 1),
       fixed(d.teamPower, 0),
     ]),
-    ['r', 'l', 'l', 'l', 'l', 'r', 'r', 'r'],
+    ['r', 'l', 'l', 'l', 'r', 'l', 'r', 'r', 'r', 'r'],
   );
 
   section('일차별 고른 선택지');
@@ -1438,8 +1853,12 @@ function printGrowth(r: GrowthReport): void {
 
   console.log('');
   console.log(
-    `5:5 전적 ${r.wins}승 ${r.loses}패 ${r.draws}무, 몬스터 ${r.monsterWins}/${r.monsterFights}승, ` +
+    `${VS_LABEL} 전적 ${r.wins}승 ${r.loses}패 ${r.draws}무, 몬스터 ${r.monsterWins}/${r.monsterFights}승, ` +
       `총 획득 포인트 ${r.totalPoints}, 상점 스킬 ${r.totalSkillsBought}개, 남은 포인트 ${r.finalBonusPoints}`,
+  );
+  console.log(
+    `${VS_LABEL} 평균 전투 시간 ${fixed(r.avgBattleSec, 1)}초 (1일차 ${fixed(r.firstDayBattleSec, 0)}초 → 10일차 ${fixed(r.lastDayBattleSec, 0)}초` +
+      `${r.firstDayBattleSec < r.lastDayBattleSec ? ', 1일차가 더 짧음 OK' : ', 1일차가 더 짧지 않음 - 표본 하나라 참고만'})`,
   );
   console.log(
     `최종 평균 스탯합 ${fixed(r.finalAvgStatTotal, 1)}, 최종 팀 전투력 ${fixed(r.finalTeamPower, 0)}, ` +
@@ -1449,6 +1868,8 @@ function printGrowth(r: GrowthReport): void {
     `보장 등급(rarityFloor) 충족 ${r.floorSatisfied}/${r.floorChecked}` +
       (r.floorChecked === 0 ? ' (보장이 걸린 세트 없음)' : r.floorSatisfied === r.floorChecked ? ' PASS' : ' FAIL'),
   );
+
+  printZoneSummary(r.battleZones, r.wins + r.loses + r.draws);
 
   section(`직업 분화 보장 검증 (첫 등장이 ${SUBJOB_DAY_MIN}~${SUBJOB_DAY_MAX}일차, 추가 등장은 직업 변경 후 재분화만 인정)`);
   console.log('등장 표기 "일차:스텝", 뒤의 * 는 이미 분화된 상태에서 다시 제시된 경우입니다.');
@@ -1472,11 +1893,31 @@ function printGrowth(r: GrowthReport): void {
 
 // ───────────────────────── --monster (난이도 보정) ─────────────────────────
 
+/** 몬스터 인원 구간. 같은 난이도 안에서 1기 보스와 8기 떼의 승률 편차를 보기 위한 묶음 */
+type CountBucket = '1~2' | '3~4' | '5~8';
+const COUNT_BUCKETS: readonly CountBucket[] = ['1~2', '3~4', '5~8'];
+/** 같은 난이도 안 인원 구간 승률 편차 허용치 (GDD §7.3.1: ±8%p) */
+const BUCKET_SPREAD_MAX = 0.08;
+
+function bucketOf(unitCount: number): CountBucket {
+  if (unitCount <= 2) return '1~2';
+  if (unitCount <= 4) return '3~4';
+  return '5~8';
+}
+
 interface DefAgg {
   games: number;
   wins: number;
   durationSum: number;
   durations: number[];
+  /** 편성 인원 (정의상 고정. 다른 값이 관측되면 최대값을 둔다) */
+  unitCount: number;
+}
+
+interface BucketAgg {
+  games: number;
+  wins: number;
+  durationSum: number;
 }
 
 interface TierAgg {
@@ -1488,6 +1929,8 @@ interface TierAgg {
   monsterNames: Map<string, number>;
   /** 몬스터 종별 집계 (등장 순서 고정) */
   defs: Map<string, DefAgg>;
+  /** 인원 구간별 집계 */
+  buckets: Record<CountBucket, BucketAgg>;
 }
 
 interface TierStat {
@@ -1505,11 +1948,27 @@ interface TierStat {
 interface DefStat {
   tier: MonsterTier;
   name: string;
+  unitCount: number;
   games: number;
   winRate: number;
   avgDurationSec: number;
   medianDurationSec: number;
   longRate: number;
+}
+
+interface BucketStat {
+  games: number;
+  wins: number;
+  winRate: number;
+  avgDurationSec: number;
+}
+
+interface TierBucketStat {
+  tier: MonsterTier;
+  buckets: Record<CountBucket, BucketStat>;
+  /** 표본이 있는 구간들의 승률 최대−최소. 구간이 1개 이하면 null */
+  spread: number | null;
+  pass: boolean;
 }
 
 function median(sorted: number[]): number {
@@ -1523,25 +1982,45 @@ interface MonsterReport {
   seed: number;
   runs: number;
   policy: PolicyName;
+  teamSize: number;
+  monsterTeamRange: { min: number; max: number };
   /** 목표 승률 (하급은 하한) */
   targets: Record<MonsterTier, number>;
   /** 일차별 3스텝(몬스터 전투 직전) 평균 팀 전투력. EXPECTED_TEAM_POWER_BY_DAY 보정용 실측치 */
   perDay: { day: number; playerPower: number; tiers: Record<MonsterTier, TierStat> }[];
   overall: Record<MonsterTier, TierStat>;
-  topMonsters: { tier: MonsterTier; name: string; count: number }[];
+  topMonsters: { tier: MonsterTier; name: string; unitCount: number; count: number }[];
   /** 몬스터 종별 승률·전투 시간 (종별 편차 확인용) */
   perDef: DefStat[];
+  /** 난이도 × 인원 구간 승률 */
+  perBucket: TierBucketStat[];
+  /** 인원 범위 밖(1~8 위반) 편성이 관측된 횟수 */
+  unitCountViolations: number;
   runsCompleted: number;
 }
 
 const MONSTER_TARGET: Record<MonsterTier, number> = { low: 0.975, mid: 0.8, high: 0.5 };
 const MONSTER_TARGET_LABEL: Record<MonsterTier, string> = { low: '95~100%', mid: '80%', high: '50%' };
 
-function emptyTierAgg(): TierAgg {
-  return { games: 0, wins: 0, durationSum: 0, durations: [], monsterNames: new Map(), defs: new Map() };
+function emptyBuckets(): Record<CountBucket, BucketAgg> {
+  const out = {} as Record<CountBucket, BucketAgg>;
+  for (const b of COUNT_BUCKETS) out[b] = { games: 0, wins: 0, durationSum: 0 };
+  return out;
 }
 
-/** 목표 전투 시간 구간 (GDD §6.1) */
+function emptyTierAgg(): TierAgg {
+  return {
+    games: 0,
+    wins: 0,
+    durationSum: 0,
+    durations: [],
+    monsterNames: new Map(),
+    defs: new Map(),
+    buckets: emptyBuckets(),
+  };
+}
+
+/** 몬스터 전투 목표 시간 구간 (GDD §6.1. 초반 육성 단계는 4:4 보다 짧게 끝나도 된다) */
 const DURATION_MIN_SEC = 40;
 const DURATION_MAX_SEC = 120;
 
@@ -1564,6 +2043,30 @@ function tierStat(a: TierAgg): TierStat {
   };
 }
 
+function bucketStats(tier: MonsterTier, a: TierAgg): TierBucketStat {
+  const buckets = {} as Record<CountBucket, BucketStat>;
+  let min = Infinity;
+  let max = -Infinity;
+  let present = 0;
+  for (const b of COUNT_BUCKETS) {
+    const agg = a.buckets[b];
+    const winRate = agg.games > 0 ? agg.wins / agg.games : 0;
+    buckets[b] = {
+      games: agg.games,
+      wins: agg.wins,
+      winRate,
+      avgDurationSec: agg.games > 0 ? agg.durationSum / agg.games : 0,
+    };
+    if (agg.games > 0) {
+      present++;
+      if (winRate < min) min = winRate;
+      if (winRate > max) max = winRate;
+    }
+  }
+  const spread = present >= 2 ? max - min : null;
+  return { tier, buckets, spread, pass: spread === null || spread <= BUCKET_SPREAD_MAX + 1e-9 };
+}
+
 function runMonsterCalibration(opts: CliOptions): MonsterReport {
   // [일차][난이도] 집계
   const perDay = new Map<number, Record<MonsterTier, TierAgg>>();
@@ -1583,6 +2086,7 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
 
   const showProgress = !opts.json;
   let runsCompleted = 0;
+  let unitCountViolations = 0;
 
   for (let i = 0; i < opts.runs; i++) {
     const seed = (opts.seed + i) >>> 0;
@@ -1598,6 +2102,8 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
         powerPerDay.set(day, pw);
         // 난이도 3장을 전부 싸워 본다. 복제본만 쓰므로 진행 중인 육성에는 영향이 없다.
         for (const enc of options) {
+          const unitCount = enc.team.members.length;
+          if (unitCount < MONSTER_TEAM_MIN || unitCount > MONSTER_TEAM_MAX) unitCountViolations++;
           const input: BattleInput = {
             seed: hashSeed(`${state.seed}:${day}:probe:${enc.tier}:${enc.monsterId}`),
             map: enc.map,
@@ -1606,6 +2112,7 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
           };
           const result = createBattle(input).runToEnd();
           const won = result.winner === 'A';
+          const bucket = bucketOf(unitCount);
           for (const agg of [rec[enc.tier], overall[enc.tier]]) {
             agg.games++;
             if (won) agg.wins++;
@@ -1614,13 +2121,18 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
             agg.monsterNames.set(enc.name, (agg.monsterNames.get(enc.name) ?? 0) + 1);
             let d = agg.defs.get(enc.name);
             if (!d) {
-              d = { games: 0, wins: 0, durationSum: 0, durations: [] };
+              d = { games: 0, wins: 0, durationSum: 0, durations: [], unitCount };
               agg.defs.set(enc.name, d);
             }
             d.games++;
             if (won) d.wins++;
             d.durationSum += result.durationSec;
             d.durations.push(result.durationSec);
+            if (unitCount > d.unitCount) d.unitCount = unitCount;
+            const b = agg.buckets[bucket];
+            b.games++;
+            if (won) b.wins++;
+            b.durationSum += result.durationSec;
           }
         }
       },
@@ -1651,12 +2163,17 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
     const entries = [...overall[t].monsterNames.entries()].sort(
       (a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
     );
-    for (const [name, count] of entries) topMonsters.push({ tier: t, name, count });
+    for (const [name, count] of entries) {
+      const d = overall[t].defs.get(name);
+      topMonsters.push({ tier: t, name, unitCount: d ? d.unitCount : 0, count });
+    }
   }
 
   const perDef: DefStat[] = [];
   for (const t of MONSTER_TIER_ORDER) {
-    const entries = [...overall[t].defs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    const entries = [...overall[t].defs.entries()].sort(
+      (a, b) => a[1].unitCount - b[1].unitCount || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0),
+    );
     for (const [name, d] of entries) {
       const sorted = d.durations.slice().sort((x, y) => x - y);
       let long = 0;
@@ -1664,6 +2181,7 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
       perDef.push({
         tier: t,
         name,
+        unitCount: d.unitCount,
         games: d.games,
         winRate: d.games > 0 ? d.wins / d.games : 0,
         avgDurationSec: d.games > 0 ? d.durationSum / d.games : 0,
@@ -1673,24 +2191,35 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
     }
   }
 
+  const perBucket: TierBucketStat[] = MONSTER_TIER_ORDER.map((t) => bucketStats(t, overall[t]));
+
   return {
     mode: 'monster',
     seed: opts.seed,
     runs: opts.runs,
     policy: 'greedy',
+    teamSize: TEAM_SIZE,
+    monsterTeamRange: { min: MONSTER_TEAM_MIN, max: MONSTER_TEAM_MAX },
     targets: MONSTER_TARGET,
     perDay: perDayOut,
     overall: overallOut,
     topMonsters,
     perDef,
+    perBucket,
+    unitCountViolations,
     runsCompleted,
   };
 }
 
 function printMonster(r: MonsterReport): void {
-  section(`몬스터 난이도 보정 (표본 육성 ${r.runs}회, 시드 ${r.seed}~${(r.seed + r.runs - 1) >>> 0}, 정책 ${POLICY_NAME_KO[r.policy]})`);
+  section(
+    `몬스터 난이도 보정 (표본 육성 ${r.runs}회, 시드 ${r.seed}~${(r.seed + r.runs - 1) >>> 0}, 정책 ${POLICY_NAME_KO[r.policy]}, 플레이어 ${r.teamSize}인 vs 몬스터 ${r.monsterTeamRange.min}~${r.monsterTeamRange.max}인)`,
+  );
   console.log('매 일차 3스텝에서 하급·중급·고급을 모두 싸워 본 결과입니다 (복제 상태로 싸우므로 육성 진행에는 영향 없음).');
   console.log(`완주한 육성 ${r.runsCompleted}/${r.runs}`);
+  if (r.unitCountViolations > 0) {
+    console.log(`경고: 인원이 ${r.monsterTeamRange.min}~${r.monsterTeamRange.max} 범위 밖인 몬스터 편성이 ${r.unitCountViolations}회 관측되었습니다.`);
+  }
 
   section('일차 × 난이도 승률 (괄호는 평균 전투 시간)');
   printTable(
@@ -1727,6 +2256,22 @@ function printMonster(r: MonsterReport): void {
     ['l', 'r', 'r', 'r', 'r', 'r'],
   );
 
+  section(`난이도 × 인원 구간 승률 (같은 난이도 안 편차 ±${Math.round(BUCKET_SPREAD_MAX * 100)}%p 이내 목표)`);
+  printTable(
+    ['난이도', ...COUNT_BUCKETS.map((b) => `${b}명`), '편차', '판정'],
+    r.perBucket.map((tb) => [
+      MONSTER_TIER_NAME_KO[tb.tier],
+      ...COUNT_BUCKETS.map((b) => {
+        const s = tb.buckets[b];
+        return s.games === 0 ? '-' : `${pctOf(s.winRate)} (${s.games}판, ${fixed(s.avgDurationSec, 0)}초)`;
+      }),
+      tb.spread === null ? '-' : `${(tb.spread * 100).toFixed(1)}p`,
+      tb.spread === null ? '구간 부족' : tb.pass ? 'OK' : '조정 필요',
+    ]),
+    ['l', 'r', 'r', 'r', 'r', 'l'],
+  );
+  console.log('인원 구간의 편차가 크면 TIER_POWER_RATIO 가 아니라 해당 인원 편성의 MonsterDef.powerScale 을 움직입니다 (1기 보스는 내리고, 8기 떼는 올리는 식).');
+
   section(`난이도별 전투 시간 분포 (목표 ${DURATION_MIN_SEC}~${DURATION_MAX_SEC}초)`);
   printTable(
     ['난이도', '평균', '중앙값', `${DURATION_MIN_SEC}초 미만`, `${DURATION_MAX_SEC}초 초과`, '판정'],
@@ -1747,22 +2292,23 @@ function printMonster(r: MonsterReport): void {
   );
   console.log('평균만 보면 긴 꼬리에 가려 중앙값이 하한 아래로 내려간 것을 놓칩니다. 중앙값과 두 비율을 함께 보세요.');
 
-  section('몬스터 종별 승률과 전투 시간');
+  section('몬스터 종별 승률과 전투 시간 (인원 오름차순)');
   if (r.perDef.length === 0) {
     console.log('(표본 없음)');
   } else {
     printTable(
-      ['난이도', '몬스터', '표본', '승률', '평균', '중앙값', `${DURATION_MAX_SEC}초 초과`],
+      ['난이도', '몬스터', '인원', '표본', '승률', '평균', '중앙값', `${DURATION_MAX_SEC}초 초과`],
       r.perDef.map((m) => [
         MONSTER_TIER_NAME_KO[m.tier],
         m.name,
+        `${m.unitCount}명`,
         String(m.games),
         pctOf(m.winRate),
         fixed(m.avgDurationSec, 1) + '초',
         fixed(m.medianDurationSec, 1) + '초',
         pctOf(m.longRate),
       ]),
-      ['l', 'l', 'r', 'r', 'r', 'r', 'r'],
+      ['l', 'l', 'r', 'r', 'r', 'r', 'r', 'r'],
     );
     console.log('종별 승률이 난이도 평균에서 크게 벗어나면 그 종의 MonsterDef.powerScale 을 조정합니다.');
   }
@@ -1801,6 +2347,8 @@ interface RarityPerRarity {
   /** 위 평균에 쓰인 스탯형 카드 수 */
   statCards: number;
   targetStatGain: string;
+  /** 평균 순 스탯 상승이 기준 구간 안인지 */
+  statGainOk: boolean | null;
 }
 
 interface RarityReport {
@@ -1827,23 +2375,27 @@ const RARITY_BANDS: { label: string; from: number; to: number; weights: Record<C
 /** 보장 등급 검증에 쓸 등급 (일반은 보장 의미가 없어 제외) */
 const FLOOR_TEST_ORDER: readonly ChoiceRarity[] = ['rare', 'epic', 'legendary'];
 
-/** GDD §7.4.2 의 총 스탯 상승량 기준 (표시 비교용) */
-const RARITY_STAT_TARGET: Record<ChoiceRarity, string> = {
-  common: '10~16',
-  rare: '20~30',
-  epic: '36~50',
-  legendary: '60~85',
+/** GDD §7.4.2 의 총 스탯 상승량 기준 (4인 팀에서도 유지) */
+const RARITY_STAT_RANGE: Record<ChoiceRarity, { min: number; max: number }> = {
+  common: { min: 10, max: 16 },
+  rare: { min: 20, max: 30 },
+  epic: { min: 36, max: 50 },
+  legendary: { min: 60, max: 85 },
 };
+
+function rarityStatTargetLabel(r: ChoiceRarity): string {
+  const t = RARITY_STAT_RANGE[r];
+  return `${t.min}~${t.max}`;
+}
 
 /**
  * 희귀도별 '총 스탯 상승량 기준'(GDD §7.4.2)이 직접 적용되는 카드 종류.
  * 스킬 습득은 스킬 가격, 시너지는 레어~에픽, 직업 분화는 항상 에픽으로 등급을 보므로 제외한다.
  * 맵 적응 훈련은 상승치가 스탯이 아니라 적응도라 역시 제외한다.
+ * 희생은 보상의 일부를 보너스 포인트로 주기도 해서 스탯 기준과 직접 비교할 수 없다 (종류별 표에서 따로 본다).
  */
-// 희생은 보상의 일부를 보너스 포인트로 주기도 해서 스탯 기준과 직접 비교할 수 없다 (종류별 표에서 따로 본다).
 const STAT_KINDS: readonly ChoiceKind[] = ['big_single', 'small_multi', 'tradeoff', 'gamble'];
 
-/** 카드의 총 스탯 상승량 (양수 변화만. 카테고리 효과는 5스탯으로 환산) */
 /**
  * 카드 한 장의 순 스탯 변화량 (상승 - 하락).
  * GDD §7.4.2 의 '총 스탯 상승량 기준'은 순 변화량 기준이다. 상승분만 세면 편중 훈련처럼
@@ -2001,6 +2553,8 @@ function runRarity(opts: CliOptions): RarityReport {
       if (c.powerDelta < min) min = c.powerDelta;
       if (c.powerDelta > max) max = c.powerDelta;
     }
+    const avgStatGain = statCards > 0 ? statSum / statCards : 0;
+    const range = RARITY_STAT_RANGE[r];
     return {
       rarity: r,
       cards: list.length,
@@ -2008,9 +2562,10 @@ function runRarity(opts: CliOptions): RarityReport {
       avgPowerDelta: list.length > 0 ? sum / list.length : 0,
       minPowerDelta: list.length > 0 ? min : 0,
       maxPowerDelta: list.length > 0 ? max : 0,
-      avgStatGain: statCards > 0 ? statSum / statCards : 0,
+      avgStatGain,
       statCards,
-      targetStatGain: RARITY_STAT_TARGET[r],
+      targetStatGain: rarityStatTargetLabel(r),
+      statGainOk: statCards > 0 ? avgStatGain >= range.min && avgStatGain <= range.max : null,
     };
   });
 
@@ -2058,7 +2613,7 @@ function runRarity(opts: CliOptions): RarityReport {
 }
 
 function printRarity(r: RarityReport): void {
-  section(`선택지 등급 모델 (표본 ${r.cards}장 / ${r.sets}세트, 시드 ${r.seed}~${(r.seed + r.runs - 1) >>> 0})`);
+  section(`선택지 등급 모델 (표본 ${r.cards}장 / ${r.sets}세트, 시드 ${r.seed}~${(r.seed + r.runs - 1) >>> 0}, ${TEAM_SIZE}인 팀)`);
   console.log(
     `표본 방식: ${r.source === 'generateChoices' ? 'generateChoices 직접 호출 (전투 없음)' : '실제 육성 진행에서 수집'}` +
       `, 분화 보장 세트 ${r.subJobSets}개는 분포에서 제외`,
@@ -2086,7 +2641,7 @@ function printRarity(r: RarityReport): void {
 
   section('등급별 예상 전투력 상승치(powerDelta)와 스탯 상승량');
   printTable(
-    ['등급', '카드', '비율', '평균 powerDelta', '최소', '최대', '스탯형 카드', '평균 스탯상승', '기준(스탯)'],
+    ['등급', '카드', '비율', '평균 powerDelta', '최소', '최대', '스탯형 카드', '평균 스탯상승', '기준(스탯)', '판정'],
     r.perRarity.map((p) => [
       CHOICE_RARITY_NAME_KO[p.rarity],
       String(p.cards),
@@ -2097,10 +2652,12 @@ function printRarity(r: RarityReport): void {
       String(p.statCards),
       fixed(p.avgStatGain, 1),
       p.targetStatGain,
+      p.statGainOk === null ? '표본 없음' : p.statGainOk ? 'OK' : '조정 필요',
     ]),
-    ['l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r'],
+    ['l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'l'],
   );
   console.log('평균 스탯상승은 순수 스탯 카드(집중·합동·편중·도박)의 순 변화량(상승-하락) 평균입니다. 스킬·시너지·분화·맵 적응·희생 카드는 보상이 스탯만이 아니라 제외했습니다.');
+  console.log(`기준은 GDD §7.4.2 (일반 10~16 / 레어 20~30 / 에픽 36~50 / 전설 60~85). ${TEAM_SIZE}인 팀에서도 총량 기준은 그대로입니다.`);
 
   section('선택지 종류별');
   printTable(
@@ -2131,6 +2688,394 @@ function printRarity(r: RarityReport): void {
   console.log(pass ? '보장 등급: PASS' : '보장 등급: FAIL');
 }
 
+// ───────────────────────── --dodge (광역 예고 회피율) ─────────────────────────
+
+/** 회피 이동 속도 배율 (GDD §4.4) */
+const DODGE_SPEED_MULT = 1.15;
+/** 탈출점 여유 거리 (GDD §4.4) */
+const DODGE_ESCAPE_MARGIN = 0.6;
+/** 이 예고 시간보다 짧으면 회피 확률 절반 */
+const DODGE_SHORT_TELEGRAPH_SEC = 0.5;
+
+/**
+ * 광역 회피 확률 (GDD §4.4 확정 공식).
+ *   clamp(판단력 × 0.006 + 민첩 × 0.003, 0.05, 0.85), 예고 < 0.5초면 절반. (v0.5 보정: 기본항 0.10 → 0)
+ * sim 이 같은 이름의 함수를 내보내면 --dodge 가 그 값과 이 값을 대조한다.
+ */
+function dodgeChanceFormula(judgment: number, agility: number, telegraphSec: number): number {
+  let p = judgment * 0.006 + agility * 0.003;
+  if (p < 0.05) p = 0.05;
+  else if (p > 0.85) p = 0.85;
+  if (telegraphSec < DODGE_SHORT_TELEGRAPH_SEC) p *= 0.5;
+  return p;
+}
+
+/** 스킬의 예고 시간 기본 규칙 (GDD §6.5.1). telegraphSec 이 있으면 그 값 */
+function telegraphSecOf(def: SkillDef): number {
+  if (def.telegraphSec !== undefined) return Math.max(0, def.telegraphSec);
+  if (def.target === 'ally_area') return 0;
+  if (def.target !== 'enemy_area' && def.target !== 'line') return 0;
+  const radius = def.radius ?? 0;
+  if (radius <= 2.5 && def.range <= 2) return SHORT_TELEGRAPH_SEC;
+  return DEFAULT_TELEGRAPH_SEC;
+}
+
+/** 모든 스탯이 base 인 합성 캐릭터. overrides 로 일부만 바꾼다 */
+function syntheticCharacter(
+  id: string,
+  name: string,
+  job: MainJob,
+  base: number,
+  overrides: Partial<Record<BaseStatKey, number>>,
+  skills: string[],
+): Character {
+  const stats = {} as StatBlock;
+  for (const k of BASE_STAT_KEYS) {
+    const v = overrides[k];
+    stats[k] = v === undefined ? base : v;
+  }
+  const adaptation = {} as Adaptation;
+  for (const m of MAP_TYPES) adaptation[m] = 50;
+  return {
+    id,
+    name,
+    mainJob: job,
+    subJob: null,
+    stats,
+    adaptation,
+    growthVariance: {},
+    skills,
+    rarity: 3,
+  };
+}
+
+interface DodgeUnitSpec {
+  label: string;
+  judgment: number;
+  agility: number;
+  moveSpeed: number;
+  /** 목표: 'min' 이면 회피율 ≥ value, 'max' 면 < value, null 이면 참고용 */
+  target: { kind: 'min' | 'max'; value: number } | null;
+}
+
+interface DodgeUnitResult {
+  label: string;
+  judgment: number;
+  agility: number;
+  moveSpeed: number;
+  /** 공식 인지 확률 */
+  chance: number;
+  /** 관측 인지율 (판정 성공 / 시도) */
+  perceivedRate: number;
+  /** 이동 가능 거리 (예고 시간 × 회피 속도) */
+  reachSec: number;
+  reachDist: number;
+  /** 영역 중심에서 벗어나는 데 필요한 거리 (반경 + 여유) */
+  needDistCenter: number;
+  /** 영역 중심에 있을 때 실제 회피율 (인지 ∧ 이동 성공) */
+  dodgeRateCenter: number;
+  /** 영역 안 임의 위치에 있을 때 실제 회피율 */
+  dodgeRateRandom: number;
+  trials: number;
+  target: DodgeUnitSpec['target'];
+  /** 목표 판정 (중심 기준). 참고용 유닛은 null */
+  pass: boolean | null;
+  /** 실전 표본 */
+  battle: {
+    battles: number;
+    zones: number;
+    attempts: number;
+    dodgeEvents: number;
+    exposed: number;
+    /** impact 때 영역 밖 (회피 이동이든 일반 이동이든) */
+    avoided: number;
+    /** 인지(dodge 이벤트) + impact 때 영역 밖 = 회피 이동으로 벗어남 */
+    dodgedEscaped: number;
+    /** 인지했지만 impact 때 영역 안 */
+    dodgedHit: number;
+    /** dodge 이벤트 / 회피 판정 */
+    perceivedRate: number;
+    /** 회피 이동으로 벗어남 / 노출. 판정 기준. (일반 이동으로 우연히 나간 경우는 제외 — 회피 공식의 효과만 잰다) */
+    dodgeRate: number;
+    pass: boolean | null;
+    note: string;
+  };
+}
+
+interface DodgeReport {
+  mode: 'dodge';
+  seed: number;
+  trials: number;
+  skillId: string;
+  skillName: string;
+  telegraphSec: number;
+  radius: number;
+  map: MapType;
+  /** sim 이 내보낸 dodgeChance 와 공식 대조 결과 */
+  simCheck: { available: boolean; matches: boolean | null; note: string };
+  units: DodgeUnitResult[];
+  /** 두 목표 유닛의 공식 기준 판정 */
+  formulaPass: boolean;
+  /** 실전 표본 판정 (측정 불가면 null) */
+  battlePass: boolean | null;
+  pass: boolean;
+}
+
+/** sim 이 dodgeChance 를 내보내면 (판단력, 민첩, 예고시간) 으로 불러 공식과 대조한다 */
+function checkSimDodgeChance(telegraphSec: number): DodgeReport['simCheck'] {
+  const f = lookup(simModule as unknown as Record<string, unknown>, ['dodgeChance', 'dodgeChanceOf', 'computeDodgeChance']);
+  if (!f) return { available: false, matches: null, note: 'sim 이 dodgeChance 를 내보내지 않음 (공식은 이 도구의 구현으로 계산)' };
+  const probes: [number, number][] = [
+    [80, 70],
+    [30, 30],
+    [10, 10],
+    [100, 100],
+  ];
+  const diffs: string[] = [];
+  for (const [j, a] of probes) {
+    let v: unknown;
+    try {
+      v = f(j, a, telegraphSec);
+    } catch (e) {
+      return { available: true, matches: null, note: `sim.dodgeChance 호출 실패 (인자 형태가 다름): ${(e as Error).message}` };
+    }
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) {
+      return { available: true, matches: null, note: 'sim.dodgeChance 가 0~1 확률을 돌려주지 않음 (인자 형태가 다름)' };
+    }
+    const expect = dodgeChanceFormula(j, a, telegraphSec);
+    if (Math.abs(v - expect) > 1e-6) diffs.push(`판단력 ${j}·민첩 ${a}: sim ${v.toFixed(4)} vs 공식 ${expect.toFixed(4)}`);
+  }
+  if (diffs.length > 0) return { available: true, matches: false, note: `공식 불일치 — ${diffs.join(', ')}` };
+  return { available: true, matches: true, note: 'sim.dodgeChance 가 GDD §4.4 공식과 일치' };
+}
+
+function runDodge(opts: CliOptions): DodgeReport {
+  const def = SKILLS[opts.skill];
+  if (!def) throw new Error(`알 수 없는 스킬 id: ${opts.skill}`);
+  if (def.target !== 'enemy_area' && def.target !== 'line') {
+    throw new Error(`--skill 은 enemy_area / line 대상 광역이어야 합니다: ${opts.skill} (${def.target})`);
+  }
+  const telegraphSec = opts.telegraph !== null ? opts.telegraph : telegraphSecOf(def);
+  const radius = opts.radius !== null ? opts.radius : def.radius ?? 2.5;
+  const map: MapType = opts.map === 'random' ? 'plains' : opts.map;
+  const job: MainJob = 'swordsman';
+
+  const specs: DodgeUnitSpec[] = [
+    { label: '판단력 80·민첩 70', judgment: 80, agility: 70, moveSpeed: opts.move, target: { kind: 'min', value: 0.5 } },
+    { label: '판단력 30·민첩 30', judgment: 30, agility: 30, moveSpeed: opts.move, target: { kind: 'max', value: 0.3 } },
+    { label: '참고: 판단력 30·민첩 30·이동속도 20', judgment: 30, agility: 30, moveSpeed: 20, target: null },
+  ];
+
+  const ticks = Math.max(0, Math.round(telegraphSec * TICK_RATE));
+  const reachSec = ticks * TICK_DT;
+
+  const units: DodgeUnitResult[] = [];
+  for (let si = 0; si < specs.length; si++) {
+    const spec = specs[si];
+    const unit = syntheticCharacter(`dodge_${si}`, spec.label, job, 40, {
+      judgment: spec.judgment,
+      agility: spec.agility,
+      moveSpeed: spec.moveSpeed,
+    }, []);
+    const derived = computeDerived(unit, map);
+    const escapeSpeed = derived.moveSpeed * DODGE_SPEED_MULT;
+    const reachDist = reachSec * escapeSpeed;
+    const needDistCenter = radius + DODGE_ESCAPE_MARGIN;
+    const chance = dodgeChanceFormula(spec.judgment, spec.agility, telegraphSec);
+
+    // ── 공식 + 이동 판정 (유닛당 trials 회) ──
+    const rng = new Rng(hashSeed(`${opts.seed}:dodge:formula:${si}`));
+    let perceived = 0;
+    let escapedCenter = 0;
+    let escapedRandom = 0;
+    for (let t = 0; t < opts.trials; t++) {
+      // 임의 위치: 면적 균등 (r = R·√u). 필요 거리 = (R − r) + 여유
+      const r = radius * Math.sqrt(rng.next());
+      const needRandom = radius - r + DODGE_ESCAPE_MARGIN;
+      if (telegraphSec <= 0) continue; // 예고 없는 스킬은 회피 판정 없음
+      if (!rng.chance(chance)) continue;
+      perceived++;
+      if (reachDist + 1e-9 >= needDistCenter) escapedCenter++;
+      if (reachDist + 1e-9 >= needRandom) escapedRandom++;
+    }
+    const dodgeRateCenter = opts.trials > 0 ? escapedCenter / opts.trials : 0;
+    const dodgeRateRandom = opts.trials > 0 ? escapedRandom / opts.trials : 0;
+    const judge = (rate: number): boolean | null => {
+      if (!spec.target) return null;
+      return spec.target.kind === 'min' ? rate >= spec.target.value : rate < spec.target.value;
+    };
+
+    // ── 실전 표본: 시전자 1 vs 시험 유닛 2 (같은 유닛 2기 — 광역 AI 조건 '적 2명 이상' 충족용) ──
+    const battle: DodgeUnitResult['battle'] = {
+      battles: 0, zones: 0, attempts: 0, dodgeEvents: 0, exposed: 0, avoided: 0, dodgedEscaped: 0, dodgedHit: 0,
+      perceivedRate: 0, dodgeRate: 0, pass: null, note: '',
+    };
+    try {
+      const caster = syntheticCharacter('dodge_caster', '시험 시전자', def.job, 40, {
+        vitality: 100, defenseTech: 100, resistance: 100, magicPower: 60, strength: 60, mana: 100, manaRegen: 100,
+        castSpeed: 40, judgment: 60, accuracy: 60, moveSpeed: 30, stamina: 100,
+      }, [def.id]);
+      caster.derivedMult = { maxHp: 30, physAtk: 0.6, magAtk: 0.6 };
+      const targets: Character[] = [];
+      for (let k = 0; k < 2; k++) {
+        const tgt = syntheticCharacter(`dodge_${si}_t${k}`, `${spec.label} ${k + 1}`, job, 40, {
+          // 지구력 100: 표본 전투가 길어(시전자 HP ×30) 30초 이후 피로로 이동속도가 깎이면 회피가 아니라 피로를 재게 된다
+          judgment: spec.judgment, agility: spec.agility, moveSpeed: spec.moveSpeed, vitality: 100, strength: 1, stamina: 100,
+        }, []);
+        tgt.derivedMult = { maxHp: 30, physAtk: 0.05 };
+        targets.push(tgt);
+      }
+      const targetIds = new Set(targets.map((t) => t.id));
+      const maxBattles = Math.max(1, Math.min(opts.trials, 200));
+      for (let g = 0; g < maxBattles && battle.zones < opts.trials; g++) {
+        const input: BattleInput = {
+          seed: hashSeed(`${opts.seed}:dodge:battle:${si}:${g}`),
+          map,
+          teamA: { id: 'dodge_a', name: '시전자', members: [deepClone(caster)], synergies: [] },
+          teamB: { id: 'dodge_b', name: '시험 유닛', members: targets.map((t) => deepClone(t)), synergies: [] },
+        };
+        const tracked = runBattleTracked(
+          input,
+          (z) => z.side === 'A' && z.skillId === def.id,
+          (u) => targetIds.has(u.id),
+        );
+        battle.battles++;
+        battle.zones += tracked.zones.damageZones;
+        battle.attempts += tracked.zones.dodgeAttempts;
+        battle.dodgeEvents += tracked.zones.dodgeEvents;
+        battle.exposed += tracked.zones.impactExposed;
+        battle.avoided += tracked.zones.impactAvoided;
+        battle.dodgedEscaped += tracked.zones.dodgedEscaped;
+        battle.dodgedHit += tracked.zones.dodgedHit;
+        // 영역이 하나도 안 생기는 sim 이면 첫 판에서 멈춘다 (시간 낭비 방지)
+        if (g === 0 && tracked.zones.damageZones === 0 && tracked.zones.zoneEvents === 0) break;
+      }
+      battle.perceivedRate = battle.attempts > 0 ? battle.dodgeEvents / battle.attempts : 0;
+      battle.dodgeRate = battle.exposed > 0 ? battle.dodgedEscaped / battle.exposed : 0;
+      if (battle.zones === 0) {
+        battle.note = '측정 불가 — 실전에서 광역 영역(Zone)이 생성되지 않음 (sim 미구현 또는 스킬 미발동)';
+      } else if (battle.exposed === 0) {
+        battle.note = '측정 불가 — 예고 시작 시 영역 안에 시험 유닛이 없었음';
+      } else {
+        battle.pass = judge(battle.dodgeRate);
+        battle.note = `${battle.battles}판, 영역 ${battle.zones}개`;
+      }
+    } catch (e) {
+      battle.note = `실전 표본 실패: ${(e as Error).message}`;
+    }
+
+    units.push({
+      label: spec.label,
+      judgment: spec.judgment,
+      agility: spec.agility,
+      moveSpeed: spec.moveSpeed,
+      chance,
+      perceivedRate: opts.trials > 0 ? perceived / opts.trials : 0,
+      reachSec,
+      reachDist,
+      needDistCenter,
+      dodgeRateCenter,
+      dodgeRateRandom,
+      trials: opts.trials,
+      target: spec.target,
+      pass: judge(dodgeRateCenter),
+      battle,
+    });
+  }
+
+  const targeted = units.filter((u) => u.target !== null);
+  const formulaPass = targeted.every((u) => u.pass === true);
+  const battleJudged = targeted.filter((u) => u.battle.pass !== null);
+  const battlePass = battleJudged.length === targeted.length && targeted.length > 0
+    ? battleJudged.every((u) => u.battle.pass === true)
+    : null;
+
+  return {
+    mode: 'dodge',
+    seed: opts.seed,
+    trials: opts.trials,
+    skillId: def.id,
+    skillName: def.name,
+    telegraphSec,
+    radius,
+    map,
+    simCheck: checkSimDodgeChance(telegraphSec),
+    units,
+    formulaPass,
+    battlePass,
+    pass: formulaPass && battlePass !== false,
+  };
+}
+
+function targetLabel(t: DodgeUnitSpec['target']): string {
+  if (!t) return '참고';
+  return t.kind === 'min' ? `≥ ${Math.round(t.value * 100)}%` : `< ${Math.round(t.value * 100)}%`;
+}
+
+function passLabel(p: boolean | null): string {
+  return p === null ? '-' : p ? 'PASS' : 'FAIL';
+}
+
+function printDodge(r: DodgeReport): void {
+  section(`광역 예고 회피율 (시드 ${r.seed}, 유닛당 ${r.trials}회, 스킬 ${r.skillName}[${r.skillId}], 예고 ${fixed(r.telegraphSec, 2)}초, 반경 ${fixed(r.radius, 1)}, 맵 ${MAP_NAME_KO[r.map]})`);
+  console.log('회피 확률 = clamp(판단력 × 0.006 + 민첩 × 0.003, 0.05, 0.85), 예고 0.5초 미만이면 절반 (GDD §4.4, v0.5 보정: 기본항 0.10 → 0).');
+  console.log(`인지에 성공한 유닛은 이동속도 × ${DODGE_SPEED_MULT} 로 영역 밖 (+${DODGE_ESCAPE_MARGIN} 여유) 까지 달린다. 예고 시간 안에 못 나가면 맞는다.`);
+  console.log(`sim 공식 대조: ${r.simCheck.note}`);
+
+  section('공식 + 이동 판정 (유닛은 영역 중심에 서 있다고 가정. 임의 위치는 면적 균등)');
+  printTable(
+    ['유닛', '이동속도', '인지 확률', '관측 인지율', '이동 가능', '필요(중심)', '실제 회피율(중심)', '실제 회피율(임의)', '목표', '판정'],
+    r.units.map((u) => [
+      u.label,
+      String(u.moveSpeed),
+      pctOf(u.chance),
+      pctOf(u.perceivedRate),
+      `${fixed(u.reachDist, 2)} (${fixed(u.reachSec, 2)}초)`,
+      fixed(u.needDistCenter, 2),
+      pctOf(u.dodgeRateCenter),
+      pctOf(u.dodgeRateRandom),
+      targetLabel(u.target),
+      passLabel(u.pass),
+    ]),
+    ['l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'l'],
+  );
+  console.log('이동 가능 거리가 필요 거리보다 짧으면 인지해도 맞습니다 (이동속도가 낮은 유닛의 회피율이 여기서 떨어집니다).');
+
+  section('실전 표본 (시전자 1기 vs 시험 유닛 2기, 지구력 100 으로 피로 배제. 실제 전투에서 zone / dodge 이벤트와 impact 시점 위치를 추적)');
+  printTable(
+    ['유닛', '전투', '영역', '회피 판정', 'dodge 이벤트', '노출', '벗어남(전체)', '회피로 벗어남', '인지 후 맞음', '인지율', '실제 회피율', '목표', '판정', '비고'],
+    r.units.map((u) => [
+      u.label,
+      String(u.battle.battles),
+      String(u.battle.zones),
+      String(u.battle.attempts),
+      String(u.battle.dodgeEvents),
+      String(u.battle.exposed),
+      String(u.battle.avoided),
+      String(u.battle.dodgedEscaped),
+      String(u.battle.dodgedHit),
+      u.battle.attempts > 0 ? pctOf(u.battle.perceivedRate) : '-',
+      u.battle.exposed > 0 ? pctOf(u.battle.dodgeRate) : '-',
+      targetLabel(u.target),
+      passLabel(u.battle.pass),
+      u.battle.note,
+    ]),
+    ['l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'l', 'l'],
+  );
+  console.log("실제 회피율 = 회피로 벗어남 / 노출. '벗어남(전체)' 는 일반 이동으로 우연히 나간 경우까지 포함한 참고값.");
+
+  console.log('');
+  console.log(`보정 목표 [4] 회피 — 공식+이동 판정: ${r.formulaPass ? 'PASS' : 'FAIL'}, 실전 표본: ${r.battlePass === null ? '측정 불가' : r.battlePass ? 'PASS' : 'FAIL'}`);
+  console.log(r.pass ? '결과: PASS' : '결과: FAIL');
+  const weak = r.units.find((u) => u.target && u.target.kind === 'max');
+  if (weak && weak.pass === false && weak.perceivedRate >= 0.3) {
+    console.log(
+      `참고: 판단력 30·민첩 30 의 인지 확률이 ${pctOf(weak.chance)} 라 이동속도 ${weak.moveSpeed} 로 전부 벗어나면 30% 를 넘습니다. ` +
+        '이 목표는 느린 유닛이 인지해도 못 벗어나는 것을 전제로 하므로, 반경·예고 시간·이동속도 조합(--radius / --telegraph / --move)을 바꿔 보거나 공식 계수를 낮춰야 합니다.',
+    );
+  }
+}
+
 // ───────────────────────── 진입점 ─────────────────────────
 
 async function main(): Promise<number> {
@@ -2152,6 +3097,13 @@ async function main(): Promise<number> {
       const rep = runDeterminism(opts);
       if (opts.json) console.log(JSON.stringify(rep, null, 2));
       else printDeterminism(rep);
+      return rep.pass ? 0 : 1;
+    }
+
+    if (opts.dodge) {
+      const rep = runDodge(opts);
+      if (opts.json) console.log(JSON.stringify(rep, null, 2));
+      else printDodge(rep);
       return rep.pass ? 0 : 1;
     }
 

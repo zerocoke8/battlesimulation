@@ -1,4 +1,4 @@
-/* 이능 5:5 전투 시뮬레이터 — 다크 테마 */
+/* 이능 4:4 전투 시뮬레이터 — 다크 테마 */
 :root {
   --bg: #0f1218;
   --bg2: #161b24;
@@ -374,6 +374,8 @@ button, input, select { font: inherit; }
 .hud-power { color: var(--muted); font-variant-numeric: tabular-nums; }
 .hud-floor { font-weight: 700; }
 body.hud-on #app { padding-top: 52px; }
+/* HUD(fixed, z-index 60)가 켜져 있으면 sticky-bar 는 HUD 아래에 붙는다 (선택 N/4, 포인트 합계가 가려지지 않게) */
+body.hud-on .sticky-bar { top: 48px; }
 
 @media (max-width: 620px) {
   .hud-inner { gap: 6px; padding: 4px 7px; }
@@ -382,6 +384,7 @@ body.hud-on #app { padding-top: 52px; }
   .hud-chip { font-size: 9px; padding: 1px 4px; }
   .hud-meta { font-size: 10px; gap: 6px; }
   body.hud-on #app { padding-top: 46px; }
+  body.hud-on .sticky-bar { top: 42px; }
 }
 @media (max-width: 400px) {
   .run-hud { top: 4px; left: 4px; max-width: calc(100vw - 8px); }
@@ -389,6 +392,7 @@ body.hud-on #app { padding-top: 52px; }
   .hud-chip { font-size: 8px; padding: 1px 3px; }
   .hud-floor { display: none; }
   body.hud-on #app { padding-top: 42px; }
+  body.hud-on .sticky-bar { top: 38px; }
 }
 
 /* ───────── 선택지 희귀도 ───────── */

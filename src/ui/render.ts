@@ -1,8 +1,15 @@
 /**
  * 전투 관전 캔버스 렌더러 (FM 모바일 스타일).
  * 시뮬레이션 프레임(BattleFrame)만 받아서 그린다. 시뮬레이션 상태를 바꾸지 않는다.
+ *
+ * v0.5: 광역 영역(BattleFrame.zones)을 그린다 (GDD §6.5.5).
+ *  - telegraph: 시전자 팀 색 점선 테두리 + 안쪽이 progress 만큼 채워지는 원/직사각형
+ *  - flash: impact 직후 밝은 폭발 플래시
+ *  - active: 장판. 반투명 채움 + 가장자리 흐름
+ *  - 'dodge' 이벤트: 해당 유닛 위에 '회피!'
+ * 한 팀이 6명 이상(몬스터 1~8인 대열)이면 이름 글씨와 HP 바를 줄여 겹침을 줄인다.
  */
-import type { BattleEvent, BattleFrame, BattleInput, MapDef, MonsterTier, StatusKind, Team, TeamSide, UnitSnapshot } from '../core/types';
+import type { BattleEvent, BattleFrame, BattleInput, MapDef, MonsterTier, StatusKind, Team, TeamSide, UnitSnapshot, ZoneSnapshot } from '../core/types';
 import { JOB_GLYPH, MONSTER_GLYPH, skillName } from './format';
 
 /** 고정 순회 순서 */
@@ -58,6 +65,31 @@ const STATUS_DOT: Partial<Record<StatusKind, string>> = {
 const FLOAT_LIFE_SEC = 0.6;
 const MAX_FLOATS = 80;
 
+/** 한 팀의 (소환물 제외) 유닛 수가 이 값을 넘으면 이름·HP 바를 축소한다 */
+const DENSE_UNIT_THRESHOLD = 5;
+/** 이름 글씨 크기 (맵 단위 배율): 보통 / 밀집 */
+const NAME_FONT_SCALE = 0.42;
+const NAME_FONT_SCALE_DENSE = 0.32;
+/** HP 바 폭 (맵 단위): 보통 / 밀집. 밀집 값은 8기 대열의 열 간격(1.4)보다 좁아야 이웃과 겹치지 않는다 */
+const HP_BAR_W = 2.4;
+const HP_BAR_W_DENSE = 1.3;
+/** 밀집 대열의 열 간격 (맵 단위). 이름표를 열마다 한 줄씩 엇갈려 놓는 기준 */
+const DENSE_COLUMN_GAP = 1.4;
+/** 캐릭터 반경 (맵 단위): 보통 / 밀집 */
+const UNIT_RADIUS = 0.9;
+const UNIT_RADIUS_DENSE = 0.78;
+
+/** 폭발 플래시의 심 색. 팀 색 테두리가 바깥으로 퍼진다 */
+const ZONE_FLASH_CORE = '#ffffff';
+/** 밀집 표시용 짧은 이름: 몬스터 개체 접미사('슬라임 A' → 'A')만 남긴다. 접미사가 없으면 그대로 */
+function denseLabel(name: string): string {
+  const m = /\s([A-Z])$/.exec(name);
+  return m ? m[1] : name;
+}
+
+/** '회피!' 텍스트 색 */
+const DODGE_COLOR = '#8ef0ff';
+
 interface FloatText {
   x: number;
   y: number;
@@ -75,6 +107,8 @@ export class BattleRenderer {
   private summonIds = new Set<string>();
   /** 팀별 보스(몬스터 중 최대 HP) 유닛 id. 첫 draw 에서 한 번 계산한다 */
   private bossIds: Set<string> | null = null;
+  /** 어느 한 팀이 DENSE_UNIT_THRESHOLD 명을 넘는가 (이름·HP 바 축소). 매 draw 에서 갱신 */
+  private dense = false;
 
   /**
    * @param monsters 캐릭터 id → 몬스터 난이도. 몬스터 전투에서만 채워 넣는다.
@@ -141,6 +175,7 @@ export class BattleRenderer {
     }
 
     this.ensureBosses(frame);
+    this.dense = isDenseFrame(frame);
 
     if (frame.tick !== this.lastTick) {
       this.ingestEvents(frame.events, byId, frame.timeSec);
@@ -154,6 +189,13 @@ export class BattleRenderer {
     this.drawCapture(frame, s);
     this.drawVision(frame, s);
 
+    // 광역 영역: 예고·장판은 유닛 아래, 폭발 플래시는 유닛 위에 그린다
+    const zones: ZoneSnapshot[] = frame.zones ?? [];
+    for (const z of zones) {
+      if (z.phase === 'telegraph') this.drawTelegraph(z, s, frame.timeSec);
+      else if (z.phase === 'active') this.drawLinger(z, s, frame.timeSec);
+    }
+
     // 죽은 유닛 → 소환물 → 캐릭터 순으로 그려서 캐릭터가 위에 오게 한다
     const dead = frame.units.filter((u) => !u.alive);
     const summons = frame.units.filter((u) => u.alive && u.job === 'summon');
@@ -161,6 +203,8 @@ export class BattleRenderer {
     for (const u of dead) this.drawDead(u, s);
     for (const u of summons) this.drawUnit(u, s, frame, byId);
     for (const u of chars) this.drawUnit(u, s, frame, byId);
+
+    for (const z of zones) if (z.phase === 'flash') this.drawFlash(z, s);
 
     this.drawFloats(frame.timeSec, s);
     this.drawOverlay(frame, s);
@@ -220,6 +264,15 @@ export class BattleRenderer {
           this.pushFloat(u.x, u.y, '소환', '#b3e5fc', false, t, jitter);
           break;
         }
+        case 'dodge': {
+          const u = byId.get(e.unit);
+          if (!u) break;
+          this.pushFloat(u.x, u.y - 0.5, '회피!', DODGE_COLOR, true, t, 0);
+          break;
+        }
+        case 'zone':
+          // 영역 자체는 frame.zones 로 그린다. 스킬 이름은 'skill' 이벤트가 이미 띄운다
+          break;
         default:
           break;
       }
@@ -385,10 +438,16 @@ export class BattleRenderer {
   /** 유닛 반경 (맵 단위 × s). 몬스터는 난이도/보스 여부에 따라 커진다 */
   private radiusOf(u: UnitSnapshot, s: number): number {
     if (u.job === 'summon') return 0.55 * s;
+    const base = this.dense ? UNIT_RADIUS_DENSE : UNIT_RADIUS;
     const tier = this.tierOf(u);
-    if (!tier) return 0.9 * s;
+    if (!tier) return base * s;
     const boss = this.bossIds?.has(u.id) ? BOSS_RADIUS_MULT : 1;
-    return 0.9 * s * MONSTER_RADIUS_MULT[tier] * boss;
+    return base * s * MONSTER_RADIUS_MULT[tier] * boss;
+  }
+
+  /** 이름 글씨 크기 (px). 밀집 시 축소 */
+  private nameFontPx(s: number): number {
+    return Math.max(8, s * (this.dense ? NAME_FONT_SCALE_DENSE : NAME_FONT_SCALE));
   }
 
   private drawDead(u: UnitSnapshot, s: number): void {
@@ -409,7 +468,7 @@ export class BattleRenderer {
     ctx.stroke();
     if (u.job !== 'summon') {
       ctx.fillStyle = '#ffffff';
-      ctx.font = `${Math.max(8, s * 0.42)}px sans-serif`;
+      ctx.font = `${this.nameFontPx(s)}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       ctx.fillText(u.name, x, y + r * 0.95);
@@ -511,8 +570,8 @@ export class BattleRenderer {
     ctx.textBaseline = 'middle';
     ctx.fillText(glyph, x, y + (isSummon ? 0 : r * 0.02));
 
-    // HP 바
-    const barW = (isSummon ? 1.6 : isBoss ? 3.2 : 2.4) * s;
+    // HP 바 (밀집 시 조금 좁게)
+    const barW = (isSummon ? 1.6 : isBoss ? 3.2 : this.dense ? HP_BAR_W_DENSE : HP_BAR_W) * s;
     const barH = Math.max(2, s * 0.28);
     const bx = x - barW / 2;
     const by = y - r - barH - s * 0.25;
@@ -552,17 +611,155 @@ export class BattleRenderer {
     // 이름
     if (!isSummon) {
       ctx.fillStyle = '#ffffff';
-      ctx.font = `${Math.max(8, s * 0.42)}px sans-serif`;
+      ctx.font = `${this.nameFontPx(s)}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
       ctx.shadowColor = 'rgba(0,0,0,0.9)';
       ctx.shadowBlur = 3;
-      ctx.fillText(u.name, x, y + r + s * 0.1);
+      // 밀집 시: 개체 접미사('슬라임 A' → 'A')만 쓰고, 이웃 열과 이름줄을 엇갈려 놓아 겹치지 않게 한다 (종 이름은 전투 제목에 있다)
+      const label = this.dense ? denseLabel(u.name) : u.name;
+      const stagger = this.dense && Math.round(u.x / DENSE_COLUMN_GAP) % 2 !== 0 ? this.nameFontPx(s) * 1.1 : 0;
+      ctx.fillText(label, x, y + r + s * 0.1 + stagger);
       ctx.shadowBlur = 0;
     }
 
     ctx.restore();
     void frame;
+  }
+
+  // ───────────── 광역 영역 (Zone) ─────────────
+
+  /**
+   * 영역 외곽 경로를 현재 path 에 만든다.
+   * circle: 중심(x,y) 반경 radius × frac1. line: (x,y)→(x2,y2) 선분의 frac0~frac1 구간을 width 폭으로 감싼 직사각형.
+   */
+  private traceZone(z: ZoneSnapshot, s: number, frac0 = 0, frac1 = 1): void {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    if (z.shape === 'circle') {
+      const r = Math.max(0, z.radius) * s * Math.max(0, frac1);
+      if (r <= 0) return;
+      ctx.arc(z.x * s, z.y * s, r, 0, Math.PI * 2);
+      ctx.closePath();
+      return;
+    }
+    const c = lineCorners(z, frac0, frac1);
+    ctx.moveTo(c[0].x * s, c[0].y * s);
+    ctx.lineTo(c[1].x * s, c[1].y * s);
+    ctx.lineTo(c[2].x * s, c[2].y * s);
+    ctx.lineTo(c[3].x * s, c[3].y * s);
+    ctx.closePath();
+  }
+
+  /** 영역 중심 (라벨 위치) */
+  private zoneCenter(z: ZoneSnapshot): { x: number; y: number } {
+    if (z.shape === 'circle' || z.x2 === undefined || z.y2 === undefined) return { x: z.x, y: z.y };
+    return { x: (z.x + z.x2) / 2, y: (z.y + z.y2) / 2 };
+  }
+
+  /** 예고: 팀 색 점선 테두리 + 안쪽이 진행률만큼 채워짐 */
+  private drawTelegraph(z: ZoneSnapshot, s: number, now: number): void {
+    const ctx = this.ctx;
+    const color = TEAM_COLOR[z.side];
+    const p = clamp01(z.progress);
+    ctx.save();
+
+    // 바탕: 희미한 채움
+    this.traceZone(z, s);
+    ctx.fillStyle = hexToRgba(color, 0.12);
+    ctx.fill();
+
+    // 진행률만큼 차오르는 안쪽 채움 (원은 중심에서 커지고, 직선은 시전자 쪽에서 뻗어 나간다)
+    if (p > 0) {
+      this.traceZone(z, s, 0, p);
+      ctx.fillStyle = hexToRgba(color, 0.22 + 0.2 * p);
+      ctx.fill();
+    }
+
+    // 점선 테두리 (천천히 돌아간다)
+    this.traceZone(z, s);
+    ctx.setLineDash([s * 0.4, s * 0.28]);
+    ctx.lineDashOffset = -now * s * 1.6;
+    ctx.lineWidth = Math.max(1.5, s * 0.13);
+    ctx.strokeStyle = hexToRgba(color, 0.9);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 라벨: 스킬 이름 (영역이 어느 정도 클 때만)
+    const big = z.shape === 'circle' ? z.radius >= 1.6 : (z.width ?? 0) >= 1.2;
+    if (big) {
+      const c = this.zoneCenter(z);
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.font = `${Math.max(8, s * 0.4)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = 'rgba(0,0,0,0.8)';
+      ctx.shadowBlur = 3;
+      ctx.fillText(skillName(z.skillId), c.x * s, c.y * s);
+    }
+    ctx.restore();
+  }
+
+  /** 폭발: impact 직후 밝은 플래시. progress 0→1 동안 사라진다 */
+  private drawFlash(z: ZoneSnapshot, s: number): void {
+    const ctx = this.ctx;
+    const color = TEAM_COLOR[z.side];
+    const p = clamp01(z.progress);
+    const fade = 1 - p;
+    ctx.save();
+    // 밝은 심
+    this.traceZone(z, s);
+    ctx.fillStyle = hexToRgba(ZONE_FLASH_CORE, 0.55 * fade);
+    ctx.fill();
+    // 팀 색 테두리가 바깥으로 퍼진다
+    this.traceZone(z, s, 0, 1 + 0.35 * p);
+    ctx.lineWidth = Math.max(2, s * 0.22 * fade);
+    ctx.strokeStyle = hexToRgba(color, 0.9 * fade);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /** 장판: 반투명 채움 + 가장자리 흐름 */
+  private drawLinger(z: ZoneSnapshot, s: number, now: number): void {
+    const ctx = this.ctx;
+    const color = TEAM_COLOR[z.side];
+    const light = TEAM_COLOR_LIGHT[z.side];
+    const p = clamp01(z.progress);
+    ctx.save();
+
+    // 채움 (끝나갈수록 옅어진다)
+    this.traceZone(z, s);
+    const pulse = 0.5 + 0.5 * Math.sin(now * 5);
+    ctx.fillStyle = hexToRgba(color, (0.26 + 0.05 * pulse) * (1 - 0.5 * p));
+    ctx.fill();
+
+    // 안쪽 흐름: 원은 중심에서 퍼져 나가는 고리, 직선은 따라 흐르는 띠
+    ctx.lineWidth = Math.max(1, s * 0.08);
+    for (let i = 0; i < 3; i++) {
+      const f = (now * 0.7 + i / 3) % 1;
+      if (z.shape === 'circle') {
+        this.traceZone(z, s, 0, f);
+      } else {
+        const w = 0.12;
+        this.traceZone(z, s, Math.max(0, f - w), f);
+      }
+      ctx.strokeStyle = hexToRgba(light, 0.35 * (1 - f));
+      ctx.stroke();
+    }
+
+    // 가장자리: 실선 + 흐르는 점선
+    this.traceZone(z, s);
+    ctx.lineWidth = Math.max(1.5, s * 0.12);
+    ctx.strokeStyle = hexToRgba(color, 0.75);
+    ctx.stroke();
+    this.traceZone(z, s);
+    ctx.setLineDash([s * 0.25, s * 0.35]);
+    ctx.lineDashOffset = now * s * 2.2;
+    ctx.lineWidth = Math.max(1, s * 0.08);
+    ctx.strokeStyle = hexToRgba(light, 0.9);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
   }
 
   // ───────────── 플로팅 텍스트 ─────────────
@@ -613,6 +810,55 @@ const STATUS_LABEL: Partial<Record<StatusKind, string>> = {
   silence: '침묵',
   invuln: '무적',
 };
+
+/** 한 팀이라도 (소환물 제외) 유닛이 DENSE_UNIT_THRESHOLD 명을 넘으면 밀집 */
+function isDenseFrame(frame: BattleFrame): boolean {
+  const n: Record<TeamSide, number> = { A: 0, B: 0 };
+  for (const u of frame.units) {
+    if (u.job === 'summon') continue;
+    n[u.side] += 1;
+  }
+  return n.A > DENSE_UNIT_THRESHOLD || n.B > DENSE_UNIT_THRESHOLD;
+}
+
+function clamp01(v: number): number {
+  if (!Number.isFinite(v)) return 0;
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/**
+ * line 영역의 네 꼭짓점 (맵 단위). frac0~frac1 은 시전자(x,y)→끝점(x2,y2) 방향의 구간 비율.
+ * 끝점이 없거나 길이가 0 이면 오른쪽 방향의 단위 길이로 대신한다.
+ */
+function lineCorners(z: ZoneSnapshot, frac0: number, frac1: number): { x: number; y: number }[] {
+  const x2 = z.x2 ?? z.x;
+  const y2 = z.y2 ?? z.y;
+  let dx = x2 - z.x;
+  let dy = y2 - z.y;
+  let len = Math.hypot(dx, dy);
+  if (len < 1e-6) {
+    dx = 1;
+    dy = 0;
+    len = 1;
+  }
+  const ux = dx / len;
+  const uy = dy / len;
+  const half = Math.max(0, z.width ?? z.radius * 2) / 2;
+  const nx = -uy * half;
+  const ny = ux * half;
+  const a0 = len * frac0;
+  const a1 = len * frac1;
+  const sx = z.x + ux * a0;
+  const sy = z.y + uy * a0;
+  const ex = z.x + ux * a1;
+  const ey = z.y + uy * a1;
+  return [
+    { x: sx + nx, y: sy + ny },
+    { x: ex + nx, y: ey + ny },
+    { x: ex - nx, y: ey - ny },
+    { x: sx - nx, y: sy - ny },
+  ];
+}
 
 function hexToRgba(hex: string, alpha: number): string {
   const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);

@@ -404,7 +404,8 @@ export const JOBS: Record<MainJob, JobDef> = {
     attackSchool: 'phys',
     statProfile: ASSASSIN_PROFILE,
     growth: growthFromProfile(ASSASSIN_PROFILE, { agility: 1.5, evasion: 1.4, critical: 1.4, focus: 1.3, vitality: 0.8, teamwork: 0.7 }),
-    hpBonus: 100,
+    // v0.5 보정: 100 → 140. 10일차 암살자 승률 36% (하한 35%)·생존율 19% 로 전 직업 최저였다
+    hpBonus: 140,
     starterSkills: ['assassin_ambush', 'assassin_smoke'],
     skillPool: ['assassin_stealth', 'assassin_ambush', 'assassin_shadowstep', 'assassin_smoke', 'assassin_lethal'],
     subJobs: ASSASSIN_SUBJOBS,

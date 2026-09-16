@@ -13,6 +13,7 @@ import {
   STAT_CATEGORY,
   STEPS_PER_DAY,
   STEP_KIND_NAME_KO,
+  TEAM_SIZE,
   stepKindOf,
   type BaseStatKey,
   type Character,
@@ -30,6 +31,9 @@ import { SUBJOBS } from '../core/data/jobs';
 import { getSkill } from '../core/data/skills';
 import { powerRating, statTotal } from '../core/stats';
 import { expectedPlayerPower } from '../core/data/monsters';
+
+/** '4:4' — 플레이어 전투 표기. TEAM_SIZE 에서 만들어 하드코딩하지 않는다 */
+export const VS_LABEL = `${TEAM_SIZE}:${TEAM_SIZE}`;
 
 /** 캔버스 아이콘용 직업 한 글자 */
 export const JOB_GLYPH: Record<MainJob, string> = {
@@ -184,7 +188,7 @@ export function phaseKo(p: RunPhase): string {
     case 'monster_select': return '몬스터 난이도 선택';
     case 'monster_battle': return '몬스터 전투';
     case 'pre_battle': return '전투 준비';
-    case 'battle': return '5:5 전투';
+    case 'battle': return `${VS_LABEL} 전투`;
     case 'day_end': return '하루 마무리';
     case 'done': return '육성 완료';
     default: return String(p);

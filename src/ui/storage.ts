@@ -4,7 +4,8 @@
  *
  * 저장 형식 버전 (SAVE_VERSION):
  *  - 저장은 항상 { v: SAVE_VERSION, data } 봉투에 담는다.
- *  - 버전이 다르면(= v0.3 이전의 사이클 기반 저장 포함) 조용히 버린다. 경고도 마이그레이션도 하지 않는다.
+ *  - 버전이 다르면(= v0.4 이전의 5인 팀 저장 포함) 조용히 버린다. 경고도 마이그레이션도 하지 않는다.
+ *  - 버전이 맞아도 인원이 TEAM_SIZE 가 아닌 플레이어 팀·고스트·완성 팀은 버린다 (몬스터 팀은 저장되지 않는다).
  *
  * 불러온 팀 데이터는 현재 데이터 정의(스킬/세부 직업/직업)와 대조해 정리한다:
  * 스킬이 이름 변경·삭제된 뒤 남은 옛 저장은 computeDerived(getSkill) 에서 예외를 던져
@@ -15,7 +16,10 @@ import {
   CHOICE_RARITY_ORDER,
   MAIN_JOBS,
   MAP_TYPES,
+  MONSTER_TEAM_MAX,
+  MONSTER_TEAM_MIN,
   MONSTER_TIER_ORDER,
+  TEAM_SIZE,
   type Character,
   type ChoiceRarity,
   type GhostSnapshot,
@@ -28,8 +32,11 @@ import {
 import { SKILLS } from '../core/data/skills';
 import { SUBJOBS, jobOfSubJob } from '../core/data/jobs';
 
-/** 저장 형식 버전. 구조가 바뀌면 올린다. 버전이 다른 저장 데이터는 조용히 폐기된다. */
-export const SAVE_VERSION = 2;
+/**
+ * 저장 형식 버전. 구조가 바뀌면 올린다. 버전이 다른 저장 데이터는 조용히 폐기된다.
+ *  - v3 (v0.5): 팀 인원 5 → TEAM_SIZE(4). 인원이 TEAM_SIZE 가 아닌 팀·고스트는 버전이 맞아도 버린다.
+ */
+export const SAVE_VERSION = 3;
 
 const KEY_RUN = 'bs:run';
 const KEY_GHOSTS = 'bs:ghosts';
@@ -149,9 +156,10 @@ function sanitizeCharacter(c: Character): boolean {
 
 /**
  * 팀의 멤버·시너지를 정리한다.
- * 플레이어/상대 팀은 정확히 5명, 몬스터 팀은 1~5명이어야 한다 (min/max 로 지정).
+ * 플레이어/상대/고스트/완성 팀은 정확히 TEAM_SIZE 명, 몬스터 팀은 MONSTER_TEAM_MIN~MONSTER_TEAM_MAX 명이어야 한다 (min/max 로 지정).
+ * 인원이 범위를 벗어나면 null (조용히 폐기).
  */
-function sanitizeTeam(t: Team, min = 5, max = 5): Team | null {
+function sanitizeTeam(t: Team, min = TEAM_SIZE, max = TEAM_SIZE): Team | null {
   if (!isTeam(t)) return null;
   t.members = t.members.filter((c) => sanitizeCharacter(c));
   if (t.members.length < min || t.members.length > max) return null;
@@ -174,7 +182,7 @@ function sanitizeEncounter(e: MonsterEncounter): boolean {
   if (typeof e.reward.teamStatBonus !== 'number') e.reward.teamStatBonus = 0;
   if (typeof e.desc !== 'string') e.desc = '';
   if (typeof e.estimatedPower !== 'number') e.estimatedPower = 0;
-  const team = sanitizeTeam(e.team, 1, 5);
+  const team = sanitizeTeam(e.team, MONSTER_TEAM_MIN, MONSTER_TEAM_MAX);
   if (!team) return false;
   e.team = team;
   return true;
@@ -243,18 +251,22 @@ export function loadRun(): RunState | null {
     s.currentChoices = [];
   }
 
+  const history: typeof s.history = [];
   for (const rec of s.history) {
-    if (!rec) continue;
+    if (!rec || typeof rec !== 'object' || !rec.result) continue;
     if (!Array.isArray(rec.choicesTaken)) rec.choicesTaken = [];
     rec.choicesTaken = rec.choicesTaken.filter((ct) => ct && typeof ct.title === 'string');
     for (const ct of rec.choicesTaken) if (!isRarity(ct.rarity)) ct.rarity = 'common';
     if (typeof rec.pointsEarned !== 'number') rec.pointsEarned = 0;
     if (rec.monster && !isTier(rec.monster.tier)) rec.monster = null;
-    if (rec.teamSnapshot) {
-      const snap = sanitizeTeam(rec.teamSnapshot);
-      if (snap) rec.teamSnapshot = snap;
-    }
+    // 인원이 TEAM_SIZE 가 아닌 스냅샷은 고스트로 쓸 수 없다. 현재 팀으로 대체하고, 그것도 없으면 기록을 버린다
+    const snap = rec.teamSnapshot ? sanitizeTeam(rec.teamSnapshot) : null;
+    if (snap) rec.teamSnapshot = snap;
+    else if (s.team) rec.teamSnapshot = s.team;
+    else continue;
+    history.push(rec);
   }
+  s.history = history;
   return s;
 }
 

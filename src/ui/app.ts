@@ -2,7 +2,7 @@
  * 브라우저 UI 진입점. #app 에 화면을 상태 기반으로 렌더링한다.
  * 시뮬레이션/육성 로직은 src/core 에 있고 여기서는 호출만 한다.
  *
- * 육성 구조 (v0.4): 10일 × 5스텝 — 선택 · 선택 · 몬스터 · 선택 · 5:5 전투 → 하루 마무리.
+ * 육성 구조 (v0.5): 10일 × 5스텝 — 선택 · 선택 · 몬스터 · 선택 · 4:4(TEAM_SIZE) 전투 → 하루 마무리.
  * 화면 왼쪽 위에는 항상 진행 HUD 가 떠 있다 (전투 관전 중에도).
  */
 import {
@@ -21,6 +21,7 @@ import {
   STAT_NAME_KO,
   STEPS_PER_DAY,
   STEP_KIND_NAME_KO,
+  TEAM_SIZE,
   TICK_RATE,
   TOTAL_DAYS,
   type BaseStatKey,
@@ -77,6 +78,7 @@ import {
   MONSTER_TIER_COLOR,
   MONSTER_TIER_HINT_KO,
   VICTORY_KO,
+  VS_LABEL,
   categoryAverages,
   clear,
   composition,
@@ -103,7 +105,7 @@ import {
 // ───────────────────────── 앱 상태 ─────────────────────────
 
 type View = 'start' | 'run' | 'pvp_setup' | 'battle' | 'result';
-/** 'run' = 5:5 전투, 'monster' = 몬스터 전투, 'pvp' = 완성팀 대전 */
+/** 'run' = 4:4 전투, 'monster' = 몬스터 전투, 'pvp' = 완성팀 대전 */
 type BattleMode = 'run' | 'monster' | 'pvp';
 
 interface BattleSession {
@@ -548,8 +550,8 @@ function renderStart(): HTMLElement {
     'div',
     { class: 'screen start' },
     h('div', { class: 'hero' },
-      h('h1', null, '이능 5:5 전투 시뮬레이터'),
-      h('p', { class: 'muted' }, `가챠 풀에서 5명을 고르고 ${TOTAL_DAYS}일 동안 육성해 팀을 완성하세요. 하루는 선택 · 선택 · 몬스터 전투 · 선택 · 5:5 전투 다섯 스텝입니다. 전투는 자동으로 진행되며 관전만 합니다.`),
+      h('h1', null, `이능 ${VS_LABEL} 전투 시뮬레이터`),
+      h('p', { class: 'muted' }, `가챠 풀에서 ${TEAM_SIZE}명을 고르고 ${TOTAL_DAYS}일 동안 육성해 팀을 완성하세요. 하루는 선택 · 선택 · 몬스터 전투 · 선택 · ${VS_LABEL} 전투 다섯 스텝입니다. 전투는 자동으로 진행되며 관전만 합니다.`),
     ),
     h(
       'div',
@@ -657,7 +659,7 @@ function renderSelectTeam(state: RunState): HTMLElement {
   nameInput.addEventListener('input', () => { selection.name = nameInput.value; });
 
   const confirm = () => {
-    if (selection.ids.length !== 5) { toast('5명을 선택해야 합니다.'); return; }
+    if (selection.ids.length !== TEAM_SIZE) { toast(`${TEAM_SIZE}명을 선택해야 합니다.`); return; }
     const name = (nameInput.value.trim() || '나의 팀').slice(0, 16);
     selectTeam(state, selection.ids.slice(), name, { ghosts: ghostsFor(state) });
     restoreRunData(state);
@@ -675,23 +677,23 @@ function renderSelectTeam(state: RunState): HTMLElement {
     'div',
     { class: 'sticky-bar' },
     h('div', { class: 'row wrap' },
-      h('strong', null, `선택 ${selection.ids.length}/5`),
+      h('strong', null, `선택 ${selection.ids.length}/${TEAM_SIZE}`),
       h('span', { class: 'chips' }, Object.entries(counts).map(([job, n]) => h('span', { class: `chip job-${job}` }, `${JOB_NAME_KO[job as keyof typeof JOB_NAME_KO]} ×${n}`))),
     ),
-    h('div', { class: 'row' }, nameInput, h('button', { class: 'btn primary', disabled: selection.ids.length !== 5, onclick: confirm }, '확정')),
+    h('div', { class: 'row' }, nameInput, h('button', { class: 'btn primary', disabled: selection.ids.length !== TEAM_SIZE, onclick: confirm }, `${TEAM_SIZE}명 확정`)),
   );
 
   const cards = state.pool.map((c) => {
     const selected = selection.ids.includes(c.id);
-    const full = selection.ids.length >= 5 && !selected;
+    const full = selection.ids.length >= TEAM_SIZE && !selected;
     return h(
       'div',
       {
         class: `card char-card ${selected ? 'selected' : ''} ${full ? 'dim' : ''}`,
         onclick: () => {
           if (selected) selection.ids = selection.ids.filter((x) => x !== c.id);
-          else if (selection.ids.length < 5) selection.ids.push(c.id);
-          else { toast('이미 5명을 선택했습니다.'); return; }
+          else if (selection.ids.length < TEAM_SIZE) selection.ids.push(c.id);
+          else { toast(`이미 ${TEAM_SIZE}명을 선택했습니다.`); return; }
           render();
         },
       },
@@ -711,7 +713,7 @@ function renderSelectTeam(state: RunState): HTMLElement {
   return h(
     'div',
     { class: 'screen' },
-    header('팀 선택', `풀 ${state.pool.length}명 중 5명을 고르세요 · 시드 ${state.seed} · 총 ${TOTAL_DAYS}일 육성`, backToStartButton()),
+    header('팀 선택', `풀 ${state.pool.length}명 중 ${TEAM_SIZE}명을 고르세요 · 시드 ${state.seed} · 총 ${TOTAL_DAYS}일 육성`, backToStartButton()),
     bar,
     h('div', { class: 'grid cards' }, cards),
   );
@@ -897,7 +899,7 @@ function monsterCard(enc: MonsterEncounter, ourPower: number, day: number, onSta
   );
 }
 
-// ───────────────────────── 5. 5:5 전투 준비 (5스텝) ─────────────────────────
+// ───────────────────────── 5. 4:4 전투 준비 (5스텝) ─────────────────────────
 
 function renderPreBattle(state: RunState): HTMLElement {
   if (!state.team) return noTeamScreen();
@@ -976,7 +978,7 @@ function historyStrip(state: RunState): HTMLElement | null {
   );
 }
 
-// ───────────────────────── 6. 전투 관전 (몬스터 / 5:5 공용) ─────────────────────────
+// ───────────────────────── 6. 전투 관전 (몬스터 / 4:4 공용) ─────────────────────────
 
 function startBattle(input: BattleInput, mode: BattleMode, title: string): void {
   stopBattleLoop();
@@ -1039,7 +1041,7 @@ function renderBattle(): HTMLElement {
 
   b.hud = { time, hpA, hpB, hpAText, hpBText, kills, capture, capA, capB, speedBtns, pauseBtn };
 
-  const dayLabel = b.mode !== 'pvp' && run ? `${run.day}일차 ${b.mode === 'monster' ? '3스텝 몬스터 전투' : '5스텝 5:5 전투'}` : '완성 팀 대전';
+  const dayLabel = b.mode !== 'pvp' && run ? `${run.day}일차 ${b.mode === 'monster' ? '3스텝 몬스터 전투' : `5스텝 ${VS_LABEL} 전투`}` : '완성 팀 대전';
 
   const screen = h(
     'div',
@@ -1319,7 +1321,7 @@ function renderResult(): HTMLElement {
 /**
  * 하루 마무리에 표시할 몬스터 승리 추가 보상 줄.
  * state.rarityFloor / state.pendingTeamStatBonus 는 day_end 에 닿기 전에 이미 소비되므로
- * (4스텝 선택 확정 시 / 5:5 전투 준비 시) 그 값이 아니라 그날의 기록에서 다시 구한다.
+ * (4스텝 선택 확정 시 / 4:4 전투 준비 시) 그 값이 아니라 그날의 기록에서 다시 구한다.
  */
 function monsterExtraRewardLines(rec: DayRecord | undefined): Child[] {
   if (!rec || !rec.monster || !rec.monster.won) return [];
@@ -1377,7 +1379,7 @@ function renderDayEnd(state: RunState): HTMLElement {
           h('span', { class: 'tiny muted' }, `${reasonKo(rec.monster.result.reason)} · ${fmtSec(rec.monster.result.durationSec)}`),
         )
       : h('div', { class: 'small muted' }, '기록 없음'),
-    h('div', { class: 'section-title' }, '5:5 전투'),
+    h('div', { class: 'section-title' }, `${VS_LABEL} 전투`),
     rec
       ? h('div', { class: 'row wrap' },
           h('span', { class: `chip map-chip map-${rec.map}` }, MAP_NAME_KO[rec.map]),
@@ -1549,7 +1551,7 @@ function renderDone(state: RunState): HTMLElement {
   return h(
     'div',
     { class: 'screen' },
-    header('육성 완료', `${team.name} · 5:5 ${wins}승 ${draws}무 ${losses}패 · 몬스터 ${monsterWins}/${monsterCount} · 전투력 ${fmtNum(safeTeamPower(team))}`, backToStartButton()),
+    header('육성 완료', `${team.name} · ${VS_LABEL} ${wins}승 ${draws}무 ${losses}패 · 몬스터 ${monsterWins}/${monsterCount} · 전투력 ${fmtNum(safeTeamPower(team))}`, backToStartButton()),
     h('div', { class: 'card' },
       h('div', { class: 'card-title' }, '팀 시너지'),
       team.synergies.length === 0 ? h('div', { class: 'small muted' }, '없음') : h('ul', { class: 'skill-ul' }, team.synergies.map((s) => h('li', null, h('strong', null, s.name), h('div', { class: 'tiny muted' }, s.desc)))),
@@ -1557,7 +1559,7 @@ function renderDone(state: RunState): HTMLElement {
     h('div', { class: 'card' },
       h('div', { class: 'card-title' }, `${TOTAL_DAYS}일 기록 (누적 포인트 ${fmtNum(totalPoints)})`),
       h('div', { class: 'table-wrap' }, h('table', { class: 'table' },
-        h('thead', null, h('tr', null, ['일차', '맵', '상대', '5:5 결과', '몬스터', '포인트', '선택'].map((t) => h('th', null, t)))),
+        h('thead', null, h('tr', null, ['일차', '맵', '상대', `${VS_LABEL} 결과`, '몬스터', '포인트', '선택'].map((t) => h('th', null, t)))),
         h('tbody', null, state.history.map((r) => h('tr', null,
           h('td', null, `${r.day}일`),
           h('td', null, MAP_NAME_KO[r.map]),
@@ -1628,6 +1630,7 @@ function renderPvpSetup(): HTMLElement {
     const a = teams.find((t) => t.id === pvp.aId);
     const b0 = teams.find((t) => t.id === pvp.bId);
     if (!a || !b0) { toast('두 팀을 선택하세요.'); return; }
+    if (a.members.length !== TEAM_SIZE || b0.members.length !== TEAM_SIZE) { toast(`완성 팀은 ${TEAM_SIZE}명이어야 합니다.`); return; }
     const b = dedupeTeamIds(a, b0);
     pvp.seed = parseSeed(seedInput.value);
     pvp.map = mapSel.value as MapType;
@@ -1637,7 +1640,7 @@ function renderPvpSetup(): HTMLElement {
   return h(
     'div',
     { class: 'screen' },
-    header('완성 팀 대전', '저장된 두 팀으로 전투를 재생합니다. 같은 시드·맵·팀이면 결과가 항상 같습니다.', h('button', { class: 'btn ghost small', onclick: () => { view = 'start'; render(); } }, '메인')),
+    header('완성 팀 대전', `저장된 두 ${TEAM_SIZE}인 팀으로 ${VS_LABEL} 전투를 재생합니다. 같은 시드·맵·팀이면 결과가 항상 같습니다.`, h('button', { class: 'btn ghost small', onclick: () => { view = 'start'; render(); } }, '메인')),
     h('div', { class: 'grid two' }, teamPicker('A'), teamPicker('B')),
     h('div', { class: 'card' },
       h('div', { class: 'row wrap' },
@@ -1663,4 +1666,6 @@ document.addEventListener('visibilitychange', () => {
   if (battle && !document.hidden) battle.lastTs = performance.now();
 });
 
+// 탭 제목도 팀 인원 표기(4:4)를 따른다. index.html 의 정적 제목은 부팅 시 덮어쓴다.
+document.title = `이능 ${VS_LABEL} 전투 시뮬레이터`;
 render();

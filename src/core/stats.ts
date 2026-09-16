@@ -86,7 +86,7 @@ export function computeDerived(c: Character, map: MapType, pctMods?: Partial<Rec
   const cdr = mastery * 0.4;
   const d: DerivedStats = {
     // 최대 HP: 체력에 대해 초선형(체력²) — 성장할수록 공격력보다 HP 가 빨리 늘어 후반 전투가 길어진다 (GDD 6.1 전투 시간 목표).
-    // 고정항 300 → 900: 체력이 낮은 편성(하급 몬스터, 초반 5:5)의 전투가 목표 하한 40초를 크게 밑돌았다.
+    // 고정항 300 → 900: 체력이 낮은 편성(하급 몬스터, 초반 4:4)의 전투가 목표 하한 40초를 크게 밑돌았다.
     // 고정항은 양 팀에 똑같이 더해지므로 승률은 그대로 두고 짧은 쪽 꼬리만 끌어올린다.
     // 체력 40 ≈ 2180, 체력 55 ≈ 3320 (+직업 보정 × 3).
     maxHp: (900 + vitality * vitality * 0.8 + hpBonus * 3) * mapMod,

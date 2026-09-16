@@ -3,7 +3,10 @@
  * 순수 함수 집합. DOM/저장소 접근 없음.
  *
  * 하루의 스텝 순서는 고정이다:
- *   1스텝 선택지 → 2스텝 선택지 → 3스텝 몬스터 전투 → 4스텝 선택지 → 5스텝 5:5 전투 → 하루 마무리(day_end)
+ *   1스텝 선택지 → 2스텝 선택지 → 3스텝 몬스터 전투 → 4스텝 선택지 → 5스텝 4:4 전투 → 하루 마무리(day_end)
+ *
+ * 팀 인원은 TEAM_SIZE(4) 로 고정. 플레이어 팀·상대팀·고스트 모두 정확히 TEAM_SIZE 명이어야 하며,
+ * 인원이 다른 고스트(구버전 저장)는 상대 풀에서 제외한다.
  *
  * 결정론: 모든 난수는 hashSeed(`${seed}:${day}:${step}:<purpose>:<counter>`) 에서 파생한다.
  * Rng 인스턴스는 절대 state 에 담지 않는다. 따라서 저장/불러오기 후 이어해도 같은 결과가 나온다.
@@ -17,7 +20,7 @@ import type {
 import {
   BASE_STAT_KEYS, BATTLE_STEP, MAP_TYPES, MONSTER_STEP, MONSTER_TIER_NAME_KO,
   STAT_MAX, STEPS_PER_DAY, STEP_KIND_NAME_KO, SUBJOB_DAY_MAX, SUBJOB_DAY_MIN,
-  TOTAL_DAYS, stepKindOf,
+  TEAM_SIZE, TOTAL_DAYS, stepKindOf,
 } from '../types';
 import { generateOpponentTeam, generatePool } from '../gen/charGen';
 import { applyChoice, applyEffect, generateChoices } from './choices';
@@ -30,7 +33,7 @@ import { powerRating } from '../stats';
 // ───────────────────────── 상수 ─────────────────────────
 
 export const POOL_SIZE = 24;
-/** 5:5 전투 보상 포인트 (일차 보정 별도) */
+/** 4:4 전투 보상 포인트 (일차 보정 별도) */
 export const BONUS_WIN = 120;
 export const BONUS_LOSE = 50;
 export const BONUS_DRAW = 80;
@@ -135,7 +138,7 @@ export function teamPower(t: Team | null): number {
   return Math.round(sum);
 }
 
-/** 5:5 전투 포인트: 기본값 + 20 × (day-1)/3 (반올림) */
+/** 4:4 전투 포인트: 기본값 + 20 × (day-1)/3 (반올림) */
 export function bonusFor(result: BattleResult, day: number): number {
   const outcome = playerOutcome(result);
   const base = outcome === 'win' ? BONUS_WIN : outcome === 'lose' ? BONUS_LOSE : BONUS_DRAW;
@@ -370,10 +373,10 @@ export function newRun(seed: number, _opts?: RunOptions): RunState {
   };
 }
 
-/** 풀에서 5명 선택 → 팀 구성, 1일차 1스텝(선택지)으로 진입 */
+/** 풀에서 정확히 TEAM_SIZE(4)명 선택 → 팀 구성, 1일차 1스텝(선택지)으로 진입 */
 export function selectTeam(state: RunState, charIds: string[], teamName: string, _opts?: RunOptions): void {
   if (state.phase !== 'select_team') throw new Error('팀 선택 단계가 아닙니다.');
-  if (charIds.length !== 5) throw new Error('정확히 5명을 선택해야 합니다.');
+  if (charIds.length !== TEAM_SIZE) throw new Error(`정확히 ${TEAM_SIZE}명을 선택해야 합니다.`);
   const members: Character[] = [];
   const seen = new Set<string>();
   for (const id of charIds) {
@@ -403,13 +406,18 @@ export function selectTeam(state: RunState, charIds: string[], teamName: string,
   state.rerolls = REROLLS_PER_DAY;
   (state as RunStateInternal).dayProgress = { day: 1, points: 0, choices: [], monster: null };
 
-  // 분화 예정 일차: [SUBJOB_DAY_MIN, SUBJOB_DAY_MAX] 안에서 하루 최대 2명씩 분산
+  // 분화 예정 일차: TEAM_SIZE 명을 [SUBJOB_DAY_MIN, SUBJOB_DAY_MAX](4~6일차) 에 최대한 고르게 분산한다.
+  // 일차를 한 바퀴(셔플)씩 돌며 인원수만큼 슬롯을 채우므로 4인 팀이면 세 날 모두 최소 1명, 한 날만 2명이고
+  // 그 '2명인 날'은 시드에 따라 달라진다 (같은 시드면 항상 같은 배정).
   const rng = new Rng(hashSeed(`${state.seed}:0:0:subjob:0`));
+  const days: number[] = [];
+  for (let d = SUBJOB_DAY_MIN; d <= SUBJOB_DAY_MAX; d++) days.push(d);
   const slots: number[] = [];
-  for (let r = 0; r < 2; r++) {
-    for (let d = SUBJOB_DAY_MIN; d <= SUBJOB_DAY_MAX; d++) slots.push(d);
+  while (slots.length < members.length) {
+    const round = rng.shuffle(days);
+    for (let i = 0; i < round.length && slots.length < members.length; i++) slots.push(round[i]);
   }
-  const assigned = rng.shuffle(slots).slice(0, members.length);
+  const assigned = rng.shuffle(slots);
   state.subJobChoiceDay = {};
   for (let i = 0; i < members.length; i++) state.subJobChoiceDay[members[i].id] = assigned[i];
 
@@ -447,7 +455,7 @@ export function rerollChoices(state: RunState): boolean {
 
 /**
  * 선택지 하나를 고른다.
- *  - 1스텝 → 2스텝(선택지), 2스텝 → 3스텝(몬스터 선택), 4스텝 → 5스텝(5:5 전투 준비)
+ *  - 1스텝 → 2스텝(선택지), 2스텝 → 3스텝(몬스터 선택), 4스텝 → 5스텝(4:4 전투 준비)
  * rarityFloor 는 이 시점에 소비된다 (리롤 중에는 유지).
  */
 export function pickChoice(
@@ -485,14 +493,17 @@ export function pickChoice(
     state.currentMonster = null;
     monsterOptions(state);
   } else {
-    // 4스텝: 5:5 전투 준비
+    // 4스텝: 4:4 전투 준비
     prepareBattle(state, opts);
   }
 
   return { success: res.success, applied: res.applied, choice };
 }
 
-/** 5:5 전투 준비: 맵(전날과 다른 맵), 상대(같은 일차 고스트 우선), phase 'pre_battle' */
+/**
+ * 4:4 전투 준비: 맵(전날과 다른 맵), 상대(같은 일차 고스트 우선), phase 'pre_battle'.
+ * 고스트는 같은 일차 · 다른 육성 시드 · 인원이 정확히 TEAM_SIZE 인 것만 상대 후보가 된다.
+ */
 export function prepareBattle(state: RunState, opts?: RunOptions): void {
   requireTeam(state);
   state.step = BATTLE_STEP;
@@ -509,7 +520,9 @@ export function prepareBattle(state: RunState, opts?: RunOptions): void {
   const candidates = MAP_TYPES.filter((m) => m !== prevMap);
   const map: MapType = rng.pick(candidates.length > 0 ? candidates : MAP_TYPES);
 
-  const ghosts = (opts?.ghosts ?? []).filter((g) => g.day === state.day && g.runSeed !== state.seed);
+  const ghosts = (opts?.ghosts ?? []).filter(
+    (g) => g.day === state.day && g.runSeed !== state.seed && g.team.members.length === TEAM_SIZE,
+  );
   const ghostChance = opts?.ghostChance ?? 1;
   let opponent: Team;
   if (ghosts.length > 0 && rng.chance(ghostChance)) {
@@ -548,7 +561,7 @@ function cloneGhostTeam(g: GhostSnapshot, day: number): Team {
   return t;
 }
 
-/** 5:5 전투 입력. 전투 시드 = hashSeed(seed:day:5:battle) */
+/** 4:4 전투 입력. 전투 시드 = hashSeed(seed:day:BATTLE_STEP:battle) */
 export function battleInput(state: RunState): BattleInput {
   const team = requireTeam(state);
   if (!state.currentMap || !state.opponent) throw new Error('전투가 준비되지 않았습니다.');
@@ -560,14 +573,14 @@ export function battleInput(state: RunState): BattleInput {
   };
 }
 
-/** 5:5 관전 시작 (phase 'battle') */
+/** 4:4 관전 시작 (phase 'battle') */
 export function startBattle(state: RunState): BattleInput {
   const input = battleInput(state);
   state.phase = 'battle';
   return input;
 }
 
-/** 5:5 전투 종료: 하루 기록 확정, 포인트 지급, 하루 마무리(day_end) */
+/** 4:4 전투 종료: 하루 기록 확정, 포인트 지급, 하루 마무리(day_end) */
 export function finishBattle(state: RunState, result: BattleResult): void {
   const team = requireTeam(state);
   if (state.phase !== 'battle' && state.phase !== 'pre_battle') throw new Error('전투 단계가 아닙니다.');
@@ -655,7 +668,7 @@ export function finishDay(state: RunState, opts?: RunOptions): void {
   state.currentChoices = generateChoices(state, choiceRng(state));
 }
 
-/** 완료된(또는 진행 중인) 육성에서 고스트 스냅샷 목록을 만든다 (각 일차 5:5 전투 직전 팀) */
+/** 완료된(또는 진행 중인) 육성에서 고스트 스냅샷 목록을 만든다 (각 일차 4:4 전투 직전 팀, TEAM_SIZE 명) */
 export function ghostsFromRun(state: RunState, savedAt: string): GhostSnapshot[] {
   const out: GhostSnapshot[] = [];
   for (const rec of state.history) {

@@ -153,7 +153,11 @@ export interface MapDef {
   timeLimitSec: number;
   /** 거점 (capture 규칙일 때). 점령에 필요한 누적 초 */
   capture?: { x: number; y: number; radius: number; secondsToCapture: number };
-  /** 스폰 위치 (팀 A 왼쪽, 팀 B 오른쪽). 5개씩 */
+  /**
+   * 대열 기준 열(anchor). 실제 위치는 sim 이 인원 수에 맞게 생성한다.
+   * 팀 A 는 왼쪽, 팀 B 는 오른쪽. 배열의 x 평균이 그 팀의 기준 열, y 평균이 대열 중심이 된다.
+   * 어느 쪽 팀이든 1~MONSTER_TEAM_MAX 명을 세울 수 있어야 하므로 배열 길이에 의존하지 않는다.
+   */
   spawnA: { x: number; y: number }[];
   spawnB: { x: number; y: number }[];
 }
@@ -184,7 +188,7 @@ export type SkillTarget =
   | 'ally' // 단일 아군 (자신 포함)
   | 'ally_area' // 아군 광역
   | 'ally_lowest_hp'
-  | 'line'; // 시전자→타겟 직선 관통 (radius = 폭)
+  | 'line'; // 시전자→타겟 직선 관통 (radius = 반폭. 실제 폭 = radius × 2)
 
 export type SkillEffect =
   | {
@@ -234,7 +238,7 @@ export interface SkillDef {
   castTimeSec: number; // 시전 시간. 0이면 즉시
   range: number; // 사거리 (맵 단위)
   target: SkillTarget;
-  radius?: number; // 광역 반경 / line 폭
+  radius?: number; // 광역 반경 / line 반폭 (폭 = radius × 2)
   effects: SkillEffect[];
   /** 패시브 전용: 상시 적용되는 파생 수치 % 보정. 예: { critChance: 5, evasion: 10 } */
   passiveMods?: Partial<Record<DerivedStatKey, number>>;
@@ -244,10 +248,35 @@ export interface SkillDef {
   aiCondition?: AiCondition;
   /** 스킬 상점 가격 (보너스 포인트) */
   cost: number;
+  /**
+   * 광역 예고(텔레그래프) 시간(초). 시전 완료 후 이 시간이 지나야 효과가 적용된다.
+   * 생략 시 sim 이 기본값을 정한다: enemy_area / line 피해 스킬 0.8,
+   * 시전자 중심 소형 근접 광역(radius ≤ 2.5, range ≤ 2) 0.3, ally_area 는 0(즉시, 0.4초 표시용 영역만 남김).
+   * 0 이면 예고 없이 즉시 적용.
+   */
+  telegraphSec?: number;
+  /**
+   * 장판. 예고(impact) 뒤 durationSec 동안 영역이 남아 안에 있는 적에게
+   * 매 틱 dpsCoef × 시전자 공격력 × dt 의 피해(방어 적용)와 status 를 준다.
+   */
+  linger?: {
+    durationSec: number;
+    dpsCoef: number;
+    status?: { status: StatusKind; durationSec: number; value?: number };
+  };
 }
 
 export const MAX_ACTIVE_SKILLS = 3;
 export const MAX_PASSIVE_SKILLS = 2;
+
+/** 광역 예고 기본값 (초). SkillDef.telegraphSec 이 없을 때 sim 이 쓴다 */
+export const DEFAULT_TELEGRAPH_SEC = 0.8;
+/** 시전자 중심 소형 근접 광역(radius ≤ 2.5, range ≤ 2)의 예고 기본값 */
+export const SHORT_TELEGRAPH_SEC = 0.3;
+/** 아군 광역(ally_area)이 프레임에 남기는 표시용 영역 지속 시간 */
+export const ALLY_AREA_FLASH_SEC = 0.4;
+/** impact 직후 폭발 표시('flash' phase) 지속 시간 */
+export const ZONE_FLASH_SEC = 0.25;
 
 // ───────────────────────── 파생 전투 수치 ─────────────────────────
 
@@ -315,10 +344,17 @@ export interface SynergyDef {
   bonusStealthSec?: number;
 }
 
+/** 플레이어 팀·4:4 상대팀·고스트·완성팀의 인원. 정확히 이 수여야 한다 */
+export const TEAM_SIZE = 4;
+/** 몬스터 팀 인원 범위. 4:4 에 구애받지 않는다 */
+export const MONSTER_TEAM_MIN = 1;
+export const MONSTER_TEAM_MAX = 8;
+
 export interface Team {
   id: string;
   name: string;
-  members: Character[]; // 플레이어 팀 5명, 몬스터 팀 1~5명
+  /** 플레이어 팀은 정확히 TEAM_SIZE 명, 몬스터 팀은 MONSTER_TEAM_MIN~MONSTER_TEAM_MAX(1~8)명 */
+  members: Character[];
   synergies: SynergyDef[];
 }
 
@@ -365,7 +401,45 @@ export type BattleEvent =
   | { t: number; kind: 'summon'; owner: string; unitId: string }
   | { t: number; kind: 'status'; to: string; status: StatusKind; applied: boolean }
   | { t: number; kind: 'capture'; side: TeamSide; progress: number }
+  /** 광역 영역(Zone) 생성 = 예고 시작. from 은 시전자 id */
+  | { t: number; kind: 'zone'; from: string; skillId: string; x: number; y: number }
+  /** 유닛이 광역 예고를 보고 회피에 성공 (영역 밖으로 이동 시작) */
+  | { t: number; kind: 'dodge'; unit: string; skillId: string }
   | { t: number; kind: 'end'; winner: TeamSide | 'draw'; reason: string };
+
+/** 광역 영역 형태. circle = 중심(x,y)+radius, line = (x,y)→(x2,y2) 선분 + width 폭 */
+export type ZoneShape = 'circle' | 'line';
+
+/**
+ * 광역 영역 표시 단계.
+ *  - telegraph: 예고 중. progress = 경과/예고 시간 (0→1). 안쪽이 진행률만큼 채워진다.
+ *  - active: 장판(linger) 지속 중. progress = 경과/장판 시간 (0→1).
+ *  - flash: impact 직후 ZONE_FLASH_SEC 동안 폭발 표시. progress = 경과/ZONE_FLASH_SEC.
+ */
+export type ZonePhase = 'telegraph' | 'active' | 'flash';
+
+/** 프레임에 실리는 광역 영역 스냅샷. 렌더러는 이것만 보고 그린다 */
+export interface ZoneSnapshot {
+  id: string;
+  /** 시전자 팀 (테두리 색) */
+  side: TeamSide;
+  skillId: string;
+  shape: ZoneShape;
+  x: number;
+  y: number;
+  /** circle 반경. line 이면 0 */
+  radius: number;
+  /** line 전용 끝점. circle 이면 undefined */
+  x2?: number;
+  y2?: number;
+  /** line 전용 폭. circle 이면 undefined */
+  width?: number;
+  phase: ZonePhase;
+  /** 현재 단계 진행률 0~1 */
+  progress: number;
+  /** 현재 단계 남은 시간(초) */
+  remainingSec: number;
+}
 
 export interface BattleFrame {
   tick: number;
@@ -373,6 +447,8 @@ export interface BattleFrame {
   units: UnitSnapshot[];
   /** 이번 틱에 발생한 이벤트 */
   events: BattleEvent[];
+  /** 현재 살아있는 광역 영역(예고·장판·폭발 표시). 생성 순서 고정 */
+  zones: ZoneSnapshot[];
   /** 거점 점령 진행 (capture 맵일 때). 각 0~1 */
   capture: { progressA: number; progressB: number; holder: TeamSide | null } | null;
   finished: boolean;
@@ -428,7 +504,7 @@ export const STEPS_PER_DAY = 5;
 export const CHOICE_STEPS = [1, 2, 4] as const;
 /** 몬스터 전투 스텝 번호 */
 export const MONSTER_STEP = 3;
-/** 5:5 전투 스텝 번호 */
+/** 4:4 전투 스텝 번호 */
 export const BATTLE_STEP = 5;
 /** 선택지 한 세트의 카드 수 */
 export const CHOICES_PER_SET = 3;
@@ -481,7 +557,7 @@ export interface MonsterUnitTemplate {
   skills: string[];
 }
 
-/** 몬스터 편성 정의. units 의 count 합계는 1~5 여야 한다 */
+/** 몬스터 편성 정의. units 의 count 합계는 MONSTER_TEAM_MIN~MONSTER_TEAM_MAX(1~8) 여야 한다 */
 export interface MonsterDef {
   id: string;
   name: string; // 한국어 표시명 (예: '슬라임 무리')
@@ -511,7 +587,7 @@ export interface MonsterEncounter {
   name: string;
   desc: string;
   map: MapType;
-  team: Team; // 몬스터 팀 (1~5명)
+  team: Team; // 몬스터 팀 (MONSTER_TEAM_MIN~MONSTER_TEAM_MAX 명)
   reward: MonsterReward;
   /** 표시용 예상 전투력 */
   estimatedPower: number;
@@ -589,27 +665,27 @@ export interface Choice {
 // ───────────────────────── 육성: 진행 상태 ─────────────────────────
 
 export type RunPhase =
-  | 'select_team' // 풀에서 5명 선택 (day=0, step=0)
+  | 'select_team' // 풀에서 TEAM_SIZE(4)명 선택 (day=0, step=0)
   | 'choice' // 선택지 3장 중 1장 (step 1, 2, 4)
   | 'monster_select' // 몬스터 난이도 3장 중 1장 (step 3 전반)
   | 'monster_battle' // 몬스터 전투 관전 (step 3 후반)
-  | 'pre_battle' // 5:5 맵·상대 공개 (step 5 전반)
-  | 'battle' // 5:5 전투 관전 (step 5 후반)
+  | 'pre_battle' // 4:4 맵·상대 공개 (step 5 전반)
+  | 'battle' // 4:4 전투 관전 (step 5 후반)
   | 'day_end' // 하루 마무리: 보상 요약 + 보너스 상점 (스텝 아님)
   | 'done'; // 10일 완료
 
 /** 하루의 기록 */
 export interface DayRecord {
   day: number; // 1~10
-  map: MapType; // 5:5 전투 맵
-  result: BattleResult; // 5:5 전투 결과
+  map: MapType; // 4:4 전투 맵
+  result: BattleResult; // 4:4 전투 결과
   opponentName: string;
   /** 그날의 몬스터 전투. 아직 없거나 건너뛰었으면 null */
   monster: { tier: MonsterTier; name: string; won: boolean; result: BattleResult } | null;
   /** 그날 획득한 보너스 포인트 총합 */
   pointsEarned: number;
   choicesTaken: { title: string; rarity: ChoiceRarity; success: boolean | null }[];
-  /** 5:5 전투 직전 팀 스냅샷 (고스트 상대 풀용) */
+  /** 4:4 전투 직전 팀 스냅샷 (고스트 상대 풀용). 인원은 TEAM_SIZE */
   teamSnapshot: Team;
 }
 
@@ -623,7 +699,7 @@ export interface RunState {
   pool: Character[]; // 가챠 풀 (선택 단계)
   team: Team | null;
   bonusPoints: number;
-  /** 현재 5:5 전투 맵 */
+  /** 현재 4:4 전투 맵 */
   currentMap: MapType | null;
   opponent: Team | null;
   /** monster_select 단계에서 제시된 난이도 3장. 그 외에는 null */
@@ -642,7 +718,7 @@ export interface RunState {
   pendingTeamStatBonus: number;
 }
 
-/** 저장된 과거 육성의 일차별 스냅샷. Bazaar 방식 상대 매칭에 사용 */
+/** 저장된 과거 육성의 일차별 스냅샷. Bazaar 방식 상대 매칭에 사용. team.members 는 TEAM_SIZE 명이어야 하며 아니면 버린다 */
 export interface GhostSnapshot {
   runSeed: number;
   day: number;

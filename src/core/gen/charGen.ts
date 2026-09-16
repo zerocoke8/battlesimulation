@@ -1,10 +1,11 @@
 /**
- * 캐릭터 풀 / 상대팀 랜덤 생성 (GDD §7.1, §7.2 1단계 상대).
+ * 캐릭터 풀 / 상대팀 랜덤 생성 (GDD §7.1, §7.6 1단계 상대).
  * 모든 난수는 Rng 만 사용한다. 순회 순서는 BASE_STAT_KEYS / MAP_TYPES / MAIN_JOBS 고정.
+ * 팀 인원은 숫자로 하드코딩하지 않고 항상 TEAM_SIZE(4:4 상대팀)를 쓴다.
  */
 import { Rng } from '../rng';
 import type { Adaptation, BaseStatKey, Character, MainJob, MapType, StatBlock, Team } from '../types';
-import { BASE_STAT_KEYS, MAIN_JOBS, MAP_TYPES, MAX_ACTIVE_SKILLS, MAX_PASSIVE_SKILLS, STAT_MAX, STAT_MIN } from '../types';
+import { BASE_STAT_KEYS, MAIN_JOBS, MAP_TYPES, MAX_ACTIVE_SKILLS, MAX_PASSIVE_SKILLS, STAT_MAX, STAT_MIN, TEAM_SIZE } from '../types';
 import { JOBS } from '../data/jobs';
 import { getSkill, skillPoolFor } from '../data/skills';
 import { autoSynergies } from '../data/synergies';
@@ -107,14 +108,16 @@ export function generateCharacter(rng: Rng, job: MainJob, powerLevel: number, id
 }
 
 /**
- * 가챠 풀 생성. size ≥ 18 이면 9직업 각 2명 이상 보장, 나머지는 랜덤 직업.
+ * 가챠 풀 생성. 9직업 전부가 최소 1명씩 들어가고(size ≥ 9), size ≥ 18 이면 각 2명 이상 보장. 나머지는 랜덤 직업.
+ * 풀에서 TEAM_SIZE 명을 고르므로 size 는 TEAM_SIZE 이상이어야 한다 (호출측 POOL_SIZE = 24).
  * id 형식: p<seedfrag>_<n>_<hash>
  */
 export function generatePool(rng: Rng, size: number): Character[] {
   const frag = rng.fork().toString(36).slice(0, 4);
   const jobs: MainJob[] = [];
-  if (size >= 18) {
-    for (const j of MAIN_JOBS) jobs.push(j, j);
+  const perJob = size >= MAIN_JOBS.length * 2 ? 2 : size >= MAIN_JOBS.length ? 1 : 0;
+  for (let r = 0; r < perJob; r++) {
+    for (const j of MAIN_JOBS) jobs.push(j);
   }
   while (jobs.length < size) jobs.push(rng.pick(MAIN_JOBS));
   const order = rng.shuffle(jobs.slice(0, size));
@@ -162,26 +165,30 @@ function learnRandomFromPool(rng: Rng, c: Character): boolean {
 }
 
 /**
- * 일차별 5:5 상대팀 목표 전투력 (teamPower 척도 = 스탯 합 + 스킬 수 × 30). 인덱스 0 이 1일차.
+ * 일차별 4:4 상대팀 목표 전투력 (teamPower 척도 = 팀 전원의 스탯 합 + 스킬 수 × 30). 인덱스 0 이 1일차.
  *
- * 보정 기준: `npm run headless -- --growth --policy greedy` 로 측정한 표준 성장 플레이어의 일차별 전투력
- * (1일차 4693 → 10일차 6110) 대비 1~5일차는 약 1.02배, 6~10일차는 약 0.965배.
+ * ★ v0.5 보정 대상 — calibrator A 가 `npm run headless -- --growth` 로 재측정해 이 표만 고친다 ★
+ * 아래 값은 v0.4(5인 팀) 실측 표를 TEAM_SIZE / 5 = 0.8 배로 환산한 **임시값**이다.
+ *   5인 기준 실측: 1일차 4702 → 10일차 5900. (표준 성장 플레이어 1일차 4693 → 10일차 6110 대비
+ *   1~5일차 약 1.02배, 6~10일차 약 0.965배. 시드 1~32, 탐욕 정책, 320판에서 일차별 승률 44~56%, 전체 50.6%)
  * 6일차에 상대가 전원 분화하는데, 분화는 전투력 '점수'보다 실전 값어치가 커서 그 구간부터 점수 목표를
- * 한 단계 낮춰야 승률이 평평해진다 (그래서 5일차 목표가 6일차보다 높다).
- * 실측 승률(시드 1~32, 탐욕 정책, 320판): 일차별 44~56%, 전체 50.6%.
- * 이 표만 고치면 상대 강도 곡선 전체가 바뀐다.
+ * 한 단계 낮춰야 승률이 평평해진다 (그래서 5일차 목표가 6일차보다 높다). 이 형태는 4인 팀에서도 유지한다.
+ *
+ * 목표(GDD §11): 10일차 생성 상대 대비 플레이어 승률 45~55%, 4:4 전투 평균 60~120초.
+ * 이 표는 팀 합계 척도라 TEAM_SIZE 가 바뀌면 반드시 다시 측정한다. generateOpponentTeam 의 fitTeamPower 가
+ * 이 값에 맞춰 스탯을 가감하므로 이 표만 고치면 상대 강도 곡선 전체가 바뀐다.
  */
 export const OPPONENT_POWER_BY_DAY: readonly number[] = [
-  4702, // 1일차 (첫날은 양쪽 다 갓 만든 팀이라 동급)
-  4963, // 2일차
-  5120, // 3일차
-  5305, // 4일차
-  5525, // 5일차
-  5365, // 6일차 — 여기서 상대가 전원 세부 직업으로 분화한다. 분화는 점수보다 실전 값어치가 커서
-  5490, // 7일차    같은 승률을 유지하려면 점수 목표를 오히려 한 단계 낮춰야 한다 (5일차 > 6일차)
-  5633, // 8일차
-  5767, // 9일차
-  5900, // 10일차
+  3852, // 1일차 (첫날은 양쪽 다 갓 만든 팀이라 동급. 플레이어는 선택지 3장만 적용된 상태라 목표를 약간 낮게 잡는다)
+  4108, // 2일차
+  4239, // 3일차
+  4370, // 4일차
+  4551, // 5일차
+  4419, // 6일차 — 여기서 상대가 전원 세부 직업으로 분화한다. 분화는 점수보다 실전 값어치가 커서
+  4431, // 7일차    같은 승률을 유지하려면 점수 목표를 오히려 한 단계 낮춰야 한다 (5일차 > 6일차)
+  4545, // 8일차
+  4655, // 9일차
+  4762, // 10일차
 ];
 
 /** 일차별 상대팀 목표 전투력. 표 밖의 일차는 양 끝 기울기로 선형 외삽한다 */
@@ -229,7 +236,7 @@ function fitTeamPower(team: Team, target: number): void {
 }
 
 /**
- * 일차에 맞게 스케일링된 5:5 상대팀 (GDD §7.6 1단계).
+ * 일차에 맞게 스케일링된 4:4 상대팀 (GDD §7.6 1단계). 인원은 정확히 TEAM_SIZE 명.
  * - day ≥ 3: 탱커 또는 힐러 1명 이상. 같은 직업 최대 2명.
  * - day ≥ 6: 전원 세부 직업 분화 (statBonus + grantedSkills)
  * - floor(day/4) 개의 추가 스킬, 맵 적응도 소폭 훈련, 자동 시너지
@@ -242,16 +249,16 @@ export function generateOpponentTeam(rng: Rng, day: number, map: MapType, idPref
   const jobs: MainJob[] = [];
   if (day >= 3) jobs.push(rng.pick(['tank', 'healer'] as const));
   let guard = 0;
-  while (jobs.length < 5 && guard++ < 200) {
+  while (jobs.length < TEAM_SIZE && guard++ < 200) {
     const j = rng.pick(MAIN_JOBS);
     if (countJob(jobs, j) >= 2) continue;
     jobs.push(j);
   }
-  while (jobs.length < 5) jobs.push(MAIN_JOBS[jobs.length % MAIN_JOBS.length]);
-  const order = rng.shuffle(jobs);
+  while (jobs.length < TEAM_SIZE) jobs.push(MAIN_JOBS[jobs.length % MAIN_JOBS.length]);
+  const order = rng.shuffle(jobs.slice(0, TEAM_SIZE));
 
   const members: Character[] = [];
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < TEAM_SIZE; i++) {
     members.push(generateCharacter(rng, order[i], powerLevel, `${idPrefix}_${i}`));
   }
 
@@ -297,7 +304,8 @@ export function generateOpponentTeam(rng: Rng, day: number, map: MapType, idPref
 // ───────────────────────── 팀 전투력 ─────────────────────────
 
 /**
- * 팀 전투력 요약값 = 멤버 powerRating(스탯 합 + 스킬 수 × 30) 의 단순 합.
+ * 팀 전투력 요약값 = 멤버 powerRating(스탯 합 + 스킬 수 × 30) 의 단순 합. 인원에 비례하므로
+ * 4인 팀은 같은 성장의 5인 팀보다 약 0.8배가 나온다 (OPPONENT_POWER_BY_DAY 도 같은 척도).
  * 진행 HUD 표시와 몬스터 강도 스케일링의 공통 기준이다. 순회 순서는 members 배열 순서로 고정.
  * 몬스터처럼 derivedMult 를 가진 유닛의 실제 강도는 여기에 반영되지 않는다
  * (몬스터 쪽 보정은 data/monsters.ts 의 monsterTeamPower 가 담당한다).
