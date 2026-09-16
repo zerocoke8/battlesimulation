@@ -18,6 +18,8 @@ import {
   type BaseStatKey,
   type Character,
   type ChoiceRarity,
+  type HazardDef,
+  type MagicSchool,
   type MainJob,
   type MonsterTier,
   type RunPhase,
@@ -27,10 +29,54 @@ import {
   type Team,
   type VictoryRule,
 } from '../core/types';
+import { MAP_TYPES } from '../core/types';
 import { SUBJOBS } from '../core/data/jobs';
 import { getSkill, isZoneSkill } from '../core/data/skills';
+import { MAPS } from '../core/data/maps';
 import { powerRating, statTotal } from '../core/stats';
 import { expectedPlayerPower } from '../core/data/monsters';
+
+// ───────────── 이능 계열 / 맵 기믹 ─────────────
+
+export const MAGIC_SCHOOL_NAME_KO: Record<MagicSchool, string> = {
+  fire: '화염', lightning: '전기', ice: '냉기', holy: '신성', nature: '자연', shadow: '암흑', none: '무속성',
+};
+
+/** 이능 계열 한국어 이름 (모르는 값은 그대로) */
+export function schoolKo(s: string): string {
+  return (MAGIC_SCHOOL_NAME_KO as Record<string, string>)[s] ?? s;
+}
+
+/** 이능 계열 대표 색 (이펙트·텍스트용). none = 물리(회백색) */
+export const MAGIC_SCHOOL_COLOR: Record<MagicSchool, string> = {
+  fire: '#ff8c2a', lightning: '#ffe94a', ice: '#8ee8ff', holy: '#fff2a8', nature: '#7ee07e', shadow: '#b47cff', none: '#e6e6e6',
+};
+
+/** 모든 맵의 기믹 정의를 id 로 찾는다 (MAP_TYPES 순서, 배열 순서 고정). 없으면 null. 예외를 던지지 않는다 */
+export function hazardDef(id: string): HazardDef | null {
+  for (const m of MAP_TYPES) {
+    const def = MAPS[m];
+    const list = def && Array.isArray(def.hazards) ? def.hazards : [];
+    for (const hz of list) if (hz.id === id) return hz;
+  }
+  return null;
+}
+
+/** 기믹 표시명 ('눈보라'). 기믹이 아니면 null */
+export function hazardName(id: string): string | null {
+  const hz = hazardDef(id);
+  return hz ? hz.name : null;
+}
+
+/** 영역 라벨: 기믹이면 기믹 이름, 아니면 스킬 이름 (모르면 id) */
+export function zoneLabel(skillId: string): string {
+  return hazardName(skillId) ?? skillName(skillId);
+}
+
+/** 붕괴 감소율 등 소수 1자리 퍼센트 ('1.8%') */
+export function fmtRate(pct: number): string {
+  return `${(Math.round(pct * 10) / 10).toFixed(1)}%`;
+}
 
 /** '4:4' — 플레이어 전투 표기. TEAM_SIZE 에서 만들어 하드코딩하지 않는다 */
 export const VS_LABEL = `${TEAM_SIZE}:${TEAM_SIZE}`;
@@ -60,6 +106,7 @@ export const MONSTER_TIER_HINT_KO: Record<MonsterTier, string> = {
 
 export const REASON_KO: Record<string, string> = {
   annihilation: '상대 전멸',
+  mutual_annihilation: '동시 전멸 · 직전 잔여 HP 합 비교',
   timeout_hp: '시간 종료 · 잔여 HP 합 비교',
   capture: '거점 점령',
   timeout_draw: '시간 종료 · 무승부',

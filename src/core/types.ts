@@ -40,6 +40,11 @@ export interface SubJobDef {
   grantedSkills: string[];
   /** 세부 직업 전용 스킬 풀 id */
   skillPool: string[];
+  /**
+   * (v0.7) 분화 시 맵 적응도에 가산되는 값. 상한 100 (`STAT_MAX`).
+   * 예: mage_ice = { glacier: 25 }. 플레이어·생성 상대팀·몬스터 어느 분화 경로든 같은 함수로 적용한다.
+   */
+  adaptationBonus?: Partial<Adaptation>;
 }
 
 export interface JobDef {
@@ -126,15 +131,107 @@ export const MAP_NAME_KO: Record<MapType, string> = {
 
 export type VictoryRule =
   | 'annihilation' // 전멸만 (시간 초과 시 무승부)
-  | 'annihilation_or_hp' // 전멸 또는 시간 초과 시 잔여 HP 합 비교
-  | 'capture_or_annihilation'; // 거점 점령 또는 전멸
+  | 'annihilation_or_hp' // 전멸 또는 시간 초과 시 잔여 HP 합 비교 (v0.7 부터 모든 맵의 규칙)
+  | 'capture_or_annihilation'; // 거점 점령 또는 전멸 (v0.7 에서 빙하맵 정의에서 제거. 타입은 남겨 둔다)
+
+/** 맵 기본 크기 (v0.7: 40×30 → 28×20). 모든 맵이 같은 크기를 쓴다 */
+export const MAP_DEFAULT_WIDTH = 28;
+export const MAP_DEFAULT_HEIGHT = 20;
+/**
+ * 캔버스가 맵 바깥에 두는 여백(프레임) 폭. 맵 단위. 사방 동일.
+ * 유닛은 맵 안(0~width, 0~height)에만 있고, 렌더러는 (width + 2×여백) × (height + 2×여백) 영역을 화면에 맞춘다.
+ */
+export const MAP_MARGIN_UNITS = 1.5;
+
+// ───── 맵 기믹 (hazard, v0.7) ─────
+
+/**
+ * 기믹 영역의 중심을 정하는 방식.
+ *  - random_unit_each_side: 양 팀에서 살아있는 유닛(소환물 포함)을 시드 난수로 한 명씩 골라 그 위치를 중심으로 각각 생성 → 한 파도에 2개.
+ *    한쪽 팀이 전멸 상태면 그 팀 것은 만들지 않는다.
+ *  - random_point: 맵 안의 임의 지점 1개.
+ */
+export type HazardTargeting = 'random_unit_each_side' | 'random_point';
+
+/**
+ * 맵 기믹 정의. 시전자 없는 광역 영역을 주기적으로 만든다.
+ * 영역은 기존 Zone 시스템을 쓴다: side 'neutral', casterId HAZARD_CASTER_ID('map'), skillId = hazard.id.
+ * 양 팀 모두 맞고, 양 팀 모두 회피 판정(GDD §4.4)을 받는다.
+ *
+ * n 번째 파도(n = 0, 1, 2 …)의 시각과 반경:
+ *   interval(n) = max(minIntervalSec, intervalSec − intervalDecayPerWave × n)  … n 번째 파도 뒤 다음 파도까지의 간격
+ *   radius(n)   = min(maxRadius ?? ∞, radius + (radiusGrowthPerWave ?? 0) × n)
+ *   첫 파도는 startSec 에 생성된다.
+ */
+export interface HazardDef {
+  id: string;
+  /** 한국어 표시명 (예: '눈보라') */
+  name: string;
+  /** 첫 파도 시각(초) */
+  startSec: number;
+  /** 파도 간격(초). 파도마다 intervalDecayPerWave 씩 줄어 minIntervalSec 에서 멈춘다 */
+  intervalSec: number;
+  minIntervalSec: number;
+  intervalDecayPerWave: number;
+  targeting: HazardTargeting;
+  /** 영역 반경(맵 단위) */
+  radius: number;
+  /** 예고 시간(초). 이 시간이 지나야 impact. 0 이면 즉시(회피 판정 없음) */
+  telegraphSec: number;
+  /** impact 피해: 대상 최대 HP 의 %. 방어 적용 안 함, 보호막은 적용 */
+  damagePctMaxHp: number;
+  /** 장판. impact 뒤 durationSec 동안 안의 유닛에게 초당 최대 HP 의 dpsPctMaxHp % 피해와 둔화(slow 0~1) */
+  linger?: { durationSec: number; dpsPctMaxHp: number; slow?: number };
+  /** 이펙트 계열 (렌더 색·파티클 선택용). 눈보라 = 'ice' */
+  magic: MagicSchool;
+  /**
+   * true 면 피해 × hazardAdaptationMult(해당 맵 적응도). 적응도 100 → −30%, 0 → +30%.
+   * 소환물은 소환사의 적응도를 쓴다.
+   */
+  adaptationScaled: boolean;
+  /** 파도마다 반경 증가량 */
+  radiusGrowthPerWave?: number;
+  /** 반경 상한 */
+  maxRadius?: number;
+}
+
+/** 기믹 영역의 casterId / 피해 이벤트의 from 에 쓰는 고정 id. 유닛 id 와 겹치지 않는다 */
+export const HAZARD_CASTER_ID = 'map';
+/** adaptationScaled 기믹의 적응도 1 당 피해 배율 변화. (적응도 − 50) × 0.006 → ±30% */
+export const HAZARD_ADAPT_SCALE = 0.006;
+
+/** adaptationScaled 기믹 피해 배율. adaptation 은 해당 맵 적응도(1~100). 결과 0.7 ~ 1.3 */
+export function hazardAdaptationMult(adaptation: number): number {
+  return 1 - (adaptation - 50) * HAZARD_ADAPT_SCALE;
+}
+
+// ───── 전장 붕괴 (attrition, v0.7) ─────
+
+/** 전장 붕괴 시작 시각(초). 모든 맵 공통 */
+export const ATTRITION_START_SEC = 120;
+/** 붕괴 시작 시 초당 최대 HP 감소율 (%) */
+export const ATTRITION_BASE_PCT = 0.3;
+/** 붕괴 시작 후 1초마다 감소율이 늘어나는 양 (%p/초) */
+export const ATTRITION_ACCEL_PCT = 0.05;
+/** 모든 맵의 제한 시간(초). 붕괴 안전장치. 실제로는 190초 안팎에 반드시 끝난다 */
+export const MAP_TIME_LIMIT_SEC = 240;
+
+/**
+ * 시각 t(초)의 전장 붕괴 감소율 (최대 HP 의 %/초). 붕괴 전이면 0.
+ * rate(t) = ATTRITION_BASE_PCT + ATTRITION_ACCEL_PCT × (t − ATTRITION_START_SEC).  예: 150초 1.8, 180초 3.3.
+ * sim(적용)과 UI(배너 표시)가 같은 함수를 쓴다.
+ */
+export function attritionRatePctPerSec(timeSec: number): number {
+  if (timeSec < ATTRITION_START_SEC) return 0;
+  return ATTRITION_BASE_PCT + ATTRITION_ACCEL_PCT * (timeSec - ATTRITION_START_SEC);
+}
 
 export interface MapDef {
   id: MapType;
   name: string;
   desc: string;
-  width: number; // 맵 단위 (기본 40)
-  height: number; // (기본 30)
+  width: number; // 맵 단위 (기본 MAP_DEFAULT_WIDTH = 28)
+  height: number; // (기본 MAP_DEFAULT_HEIGHT = 20)
   /** 시야 반경. 이 밖의 적은 타겟팅 불가. 0이면 무제한 */
   visionRadius: number;
   /** 지구력 소모 배율 (사막 2.0) */
@@ -147,12 +244,14 @@ export interface MapDef {
   stealthBonusSec: number;
   /** 특정 마법 계열 위력 배율. 예: { ice: 1.25 } */
   schoolBonus: Partial<Record<MagicSchool, number>>;
-  /** 승리 규칙 */
+  /** 승리 규칙. v0.7 부터 전 맵 'annihilation_or_hp' */
   victory: VictoryRule;
-  /** 제한 시간 (초) */
+  /** 제한 시간 (초). v0.7 부터 전 맵 MAP_TIME_LIMIT_SEC(240) */
   timeLimitSec: number;
-  /** 거점 (capture 규칙일 때). 점령에 필요한 누적 초 */
+  /** 거점 (capture 규칙일 때). 점령에 필요한 누적 초. v0.7 에서는 어느 맵도 쓰지 않는다 */
   capture?: { x: number; y: number; radius: number; secondsToCapture: number };
+  /** (v0.7) 맵 기믹. 없으면 빈 배열. 처리 순서는 배열 순서 고정 */
+  hazards: HazardDef[];
   /**
    * 대열 기준 열(anchor). 실제 위치는 sim 이 인원 수에 맞게 생성한다.
    * 팀 A 는 왼쪽, 팀 B 는 오른쪽. 배열의 x 평균이 그 팀의 기준 열, y 평균이 대열 중심이 된다.
@@ -312,8 +411,11 @@ export interface Character {
   /**
    * 몬스터 유닛 표시용. 있으면 렌더러가 일반 캐릭터와 다르게 그린다.
    * 플레이어 캐릭터는 항상 undefined.
+   *  - kind: 유닛 템플릿의 한국어 이름 (예: '슬라임', '고블린 사수')
+   *  - species: (v0.7) 소속 MonsterDef.id (예: 'slime_swarm'). 도트 스프라이트 키 'monster_<species>' 의 재료.
+   *    monsters.ts 가 채운다. 없으면 sim 이 kind 로 대신한다.
    */
-  monster?: { kind: string; tier: MonsterTier };
+  monster?: { kind: string; tier: MonsterTier; species?: string };
   /**
    * 파생 전투 수치 최종 배율. computeDerived 가 모든 계산을 끝낸 뒤 마지막에 곱한다.
    * 스탯 상한(100) 때문에 난이도를 더 못 올리는 문제를 피하기 위한 몬스터 전용 수단.
@@ -391,6 +493,14 @@ export interface UnitSnapshot {
   /** 시전 중이면 스킬 id 와 진행률 0~1 */
   casting: { skillId: string; progress: number } | null;
   targetId: string | null;
+  /**
+   * (v0.7) 도트 스프라이트 키. sim 이 채운다 (src/ui/pixel/spriteTypes.ts 의 규칙과 동일):
+   *  - 직업 캐릭터: mainJob id (예 'mage'). 세부 직업은 같은 시트에 팔레트 틴트만 적용하므로 키에 넣지 않는다.
+   *  - 소환물: 'summon_<SummonUnitId>' (예 'summon_beast')
+   *  - 몬스터: 'monster_<Character.monster.species ?? kind>' (예 'monster_slime_swarm')
+   * 렌더러는 이 키로 public/sprites/<key>.png 를 찾고 없으면 코드 생성 스프라이트로 폴백한다.
+   */
+  spriteKey?: string;
 }
 
 export type BattleEvent =
@@ -414,10 +524,25 @@ export type BattleEvent =
   | { t: number; kind: 'summon'; owner: string; unitId: string }
   | { t: number; kind: 'status'; to: string; status: StatusKind; applied: boolean }
   | { t: number; kind: 'capture'; side: TeamSide; progress: number }
-  /** 광역 영역(Zone) 생성 = 예고 시작. from 은 시전자 id */
+  /**
+   * 광역 영역(Zone) 생성 = 예고 시작. from 은 시전자 id.
+   * (v0.7) 맵 기믹 영역이면 from = HAZARD_CASTER_ID('map'), skillId = HazardDef.id.
+   */
   | { t: number; kind: 'zone'; from: string; skillId: string; x: number; y: number }
-  /** 유닛이 광역 예고를 보고 회피에 성공 (영역 밖으로 이동 시작) */
+  /** 유닛이 광역 예고를 보고 회피에 성공 (영역 밖으로 이동 시작). 기믹 영역이면 skillId = HazardDef.id */
   | { t: number; kind: 'dodge'; unit: string; skillId: string }
+  /**
+   * (v0.7) 맵 기믹 피해. phase 'impact' 는 예고 종료 시 1회(대상당 1개, BattleResult.events 에도 실린다),
+   * 'linger' 는 장판 한 틱(프레임 이벤트에만 실린다). damage 는 실제 HP 감소량. 헤드리스가 기믹 피해 비중(빙하 8~20%)을 잰다.
+   */
+  | { t: number; kind: 'hazard_damage'; hazardId: string; to: string; damage: number; phase: 'impact' | 'linger'; school: MagicSchool }
+  /** (v0.7) 전장 붕괴 시작. 전투당 1회, t = ATTRITION_START_SEC */
+  | { t: number; kind: 'attrition_start' }
+  /**
+   * (v0.7) 전장 붕괴 한 틱의 피해. 살아있는 유닛(소환물 포함)당 틱마다 1개. 가해자 없음. 방어·보호막 무시.
+   * 프레임 이벤트에만 실린다. UnitBattleStats.damageTaken 에는 포함된다.
+   */
+  | { t: number; kind: 'attrition'; to: string; damage: number }
   | { t: number; kind: 'end'; winner: TeamSide | 'draw'; reason: string };
 
 /** 광역 영역 형태. circle = 중심(x,y)+radius, line = (x,y)→(x2,y2) 선분 + width 폭 */
@@ -431,11 +556,15 @@ export type ZoneShape = 'circle' | 'line';
  */
 export type ZonePhase = 'telegraph' | 'active' | 'flash';
 
+/** 영역의 소속. 'neutral' 은 맵 기믹(양 팀 모두 피해) */
+export type ZoneSide = TeamSide | 'neutral';
+
 /** 프레임에 실리는 광역 영역 스냅샷. 렌더러는 이것만 보고 그린다 */
 export interface ZoneSnapshot {
   id: string;
-  /** 시전자 팀 (테두리 색) */
-  side: TeamSide;
+  /** 시전자 팀 (테두리 색). 맵 기믹이면 'neutral' */
+  side: ZoneSide;
+  /** 스킬 id. 맵 기믹이면 HazardDef.id (예 'hazard_blizzard') */
   skillId: string;
   shape: ZoneShape;
   x: number;
@@ -462,8 +591,13 @@ export interface BattleFrame {
   events: BattleEvent[];
   /** 현재 살아있는 광역 영역(예고·장판·폭발 표시). 생성 순서 고정 */
   zones: ZoneSnapshot[];
-  /** 거점 점령 진행 (capture 맵일 때). 각 0~1 */
+  /** 거점 점령 진행 (capture 맵일 때). 각 0~1. v0.7 에서는 항상 null */
   capture: { progressA: number; progressB: number; holder: TeamSide | null } | null;
+  /**
+   * (v0.7) 현재 전장 붕괴 감소율 (최대 HP 의 %/초). 붕괴 전이면 0.
+   * = attritionRatePctPerSec(timeSec). UI 는 0 보다 크면 '전장 붕괴' 배너와 이 값을 표시한다.
+   */
+  attritionPctPerSec: number;
   finished: boolean;
 }
 
@@ -472,6 +606,7 @@ export interface UnitBattleStats {
   name: string;
   side: TeamSide;
   damageDealt: number;
+  /** 받은 피해 총합. (v0.7) 기믹·붕괴 피해도 포함한다 (가해자는 없음) */
   damageTaken: number;
   healingDone: number;
   kills: number;
@@ -484,8 +619,14 @@ export interface BattleResult {
   seed: number;
   map: MapType;
   winner: TeamSide | 'draw';
-  reason: string; // 'annihilation' | 'timeout_hp' | 'capture' | 'timeout_draw'
+  /**
+   * 'annihilation' | 'mutual_annihilation' | 'timeout_hp' | 'capture' | 'timeout_draw'.
+   * (v0.7) mutual_annihilation = 같은 틱에 양 팀이 함께 전멸(눈보라·붕괴) → 틱 시작 시점 잔여 HP 합이 많던 쪽 승리. 그것도 같으면 winner 'draw', reason 'annihilation'.
+   */
+  reason: string;
   durationSec: number;
+  /** (v0.7) 전장 붕괴(ATTRITION_START_SEC) 이후에 끝났으면 true. 헤드리스가 '붕괴 종료 비율 < 15%' 를 잰다 */
+  endedInAttrition: boolean;
   totalTicks: number;
   unitStats: UnitBattleStats[];
   mvpId: string | null;
@@ -506,6 +647,18 @@ export interface BattleSimulator {
   result(): BattleResult | null;
   runToEnd(): BattleResult;
 }
+
+// ───────────────────────── 관전 렌더 모드 (v0.7) ─────────────────────────
+
+/**
+ * 전투 화면 렌더러. 두 렌더러는 같은 BattleFrame 을 소비한다.
+ *  - pixel: 도트 스프라이트 렌더러 (기본). src/ui/pixel/*
+ *  - simple: 기존 원형 아이콘 렌더러 (간단 모드). src/ui/render.ts
+ * 선택은 localStorage 'bs:renderMode' 에 저장한다 (src/ui/storage.ts).
+ */
+export type RenderMode = 'pixel' | 'simple';
+export const DEFAULT_RENDER_MODE: RenderMode = 'pixel';
+export const RENDER_MODE_NAME_KO: Record<RenderMode, string> = { pixel: '도트 모드', simple: '간단 모드' };
 
 // ───────────────────────── 육성: 일정 (10일 × 5스텝) ─────────────────────────
 

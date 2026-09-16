@@ -6,6 +6,7 @@
  *
  *  - generateChoices: 정확히 CHOICES_PER_SET 장. 중복 없음. rarityFloor 보장. 분화 예정이면 3장 모두 분화 카드
  *  - applyChoice / applyEffect: 효과 적용 (스탯 클램프, 스킬 슬롯 제한 준수)
+ *  - applySubJob: 세부 직업 분화의 단일 적용 경로 (statBonus + adaptationBonus + grantedSkills). charGen 도 이것을 쓴다
  *  - estimatePowerDelta: 카드에 표시할 예상 전투력 상승치
  *
  * 난수는 인자로 받은 Rng 만 쓴다. Math.random / Date 금지. 순회는 항상 상수 배열 순서.
@@ -17,7 +18,7 @@
 import { Rng, hashSeed } from '../rng';
 import type {
   BaseStatKey, Character, Choice, ChoiceEffect, ChoiceKind, ChoiceRarity, MainJob, MapType, RunState,
-  StatCategory, SubJobDef, Team,
+  StatCategory, SubJobDef, SubJobId, Team,
 } from '../types';
 import {
   BASE_STAT_KEYS, CHOICES_PER_SET, CHOICE_KIND_NAME_KO, CHOICE_RARITY_NAME_KO, CHOICE_RARITY_ORDER,
@@ -218,6 +219,9 @@ function effectPower(team: Team, e: ChoiceEffect): number {
       const sub = getSubJob(e.subJob);
       let v = W_SUBJOB;
       for (const k of BASE_STAT_KEYS) v += (sub.statBonus[k] ?? 0) * W_STAT;
+      if (sub.adaptationBonus) {
+        for (const m of MAP_TYPES) v += (sub.adaptationBonus[m] ?? 0) * W_ADAPT;
+      }
       v += sub.grantedSkills.length * W_SKILL;
       return v;
     }
@@ -514,6 +518,19 @@ function buildJobChange(ctx: Ctx): Choice | null {
   return ch;
 }
 
+/**
+ * 맵 적응 카드 설명 뒤에 붙는 맵별 효과 안내 (v0.7). 거점 같은 옛 규칙은 언급하지 않는다.
+ * 빙하는 눈보라(기믹) 피해가 적응도로 줄어드는 점이 실제 승패에 개입하므로 그 사실을 알려 준다.
+ */
+function adaptationHint(map: MapType): string {
+  switch (map) {
+    case 'glacier': return ' 빙하 적응도가 높을수록 눈보라 피해가 줄어듭니다 (적응도 100 이면 -30%).';
+    case 'desert': return ' 사막은 지구력 소모가 2배라 적응도가 낮으면 빨리 지칩니다.';
+    case 'dark': return ' 어둠에서는 시야가 좁아 적응도가 낮으면 적을 늦게 봅니다.';
+    case 'plains': return ' 평원은 개활지라 적응도가 전투 전반의 능률에 고르게 반영됩니다.';
+  }
+}
+
 function buildAdaptation(ctx: Ctx, rarity: ChoiceRarity): Choice {
   const { rng, team } = ctx;
   const budget = budgetFor(rng, rarity);
@@ -525,7 +542,7 @@ function buildAdaptation(ctx: Ctx, rarity: ChoiceRarity): Choice {
     return mk(ctx, {
       id: makeId(ctx, 'adaptation'), kind: 'adaptation', rarity,
       title: `${CHOICE_KIND_NAME_KO.adaptation}: 팀 전체 ${MAP_NAME_KO[map]}`,
-      desc: `팀 ${n}명 전원의 ${MAP_NAME_KO[map]} 적응도 ${fmt(delta)}.`,
+      desc: `팀 ${n}명 전원의 ${MAP_NAME_KO[map]} 적응도 ${fmt(delta)}.${adaptationHint(map)}`,
       charIds: team.members.map((c) => c.id),
       effects: [{ kind: 'adaptation', charId: 'all', map, delta }],
     });
@@ -535,7 +552,7 @@ function buildAdaptation(ctx: Ctx, rarity: ChoiceRarity): Choice {
   return mk(ctx, {
     id: makeId(ctx, 'adaptation'), kind: 'adaptation', rarity,
     title: `${CHOICE_KIND_NAME_KO.adaptation}: ${c.name}의 ${MAP_NAME_KO[map]}`,
-    desc: `${c.name}의 ${MAP_NAME_KO[map]} 적응도 ${fmt(delta)} (현재 ${c.adaptation[map]}).`,
+    desc: `${c.name}의 ${MAP_NAME_KO[map]} 적응도 ${fmt(delta)} (현재 ${c.adaptation[map]}).${adaptationHint(map)}`,
     charIds: [c.id],
     effects: [{ kind: 'adaptation', charId: c.id, map, delta }],
   });
@@ -666,10 +683,18 @@ function buildSubJob(ctx: Ctx, c: Character, sub: SubJobDef, rarity: ChoiceRarit
     const v = sub.statBonus[k];
     if (v !== undefined && v !== 0) bonusParts.push(`${statName(k)} ${fmt(v)}`);
   }
+  const adaptParts: string[] = [];
+  if (sub.adaptationBonus) {
+    for (const m of MAP_TYPES) {
+      const v = sub.adaptationBonus[m];
+      if (v !== undefined && v !== 0) adaptParts.push(`${MAP_NAME_KO[m]} 적응도 ${fmt(v)}`);
+    }
+  }
   const skillNames = sub.grantedSkills.map((id) => `[${getSkill(id).name}]`);
   const desc =
     `${c.name}${eulReul(c.name)} ${JOB_NAME_KO[c.mainJob]} → ${sub.name}${euro(sub.name)} 분화합니다. ${sub.desc}` +
     (bonusParts.length ? ` 스탯 보정: ${bonusParts.join(', ')}.` : '') +
+    (adaptParts.length ? ` 맵 적응: ${adaptParts.join(', ')}.` : '') +
     (skillNames.length ? ` 습득 스킬: ${skillNames.join(', ')}.` : '');
   return mk(ctx, {
     id: makeId(ctx, 'subjob'), kind: 'subjob', rarity,
@@ -845,12 +870,24 @@ function learnSkill(c: Character, skillId: string): void {
   c.skills.push(skillId);
 }
 
-function setSubJob(c: Character, subJobId: string): void {
+/**
+ * 세부 직업 분화 적용 (v0.7 단일 경로). statBonus 가산 → adaptationBonus 가산(상한 STAT_MAX) → grantedSkills 습득 순.
+ * 플레이어 선택지(set_subjob)·생성 상대팀(charGen)·몬스터 어느 분화 경로든 반드시 이 함수를 쓴다.
+ * 순회는 BASE_STAT_KEYS / MAP_TYPES 고정 순서. 난수 없음.
+ */
+export function applySubJob(c: Character, subJobId: SubJobId): void {
   const sub = getSubJob(subJobId);
   c.subJob = sub.id;
   for (const k of BASE_STAT_KEYS) {
     const v = sub.statBonus[k];
     if (v !== undefined && v !== 0) c.stats[k] = clampStat(c.stats[k] + v);
+  }
+  const adapt = sub.adaptationBonus;
+  if (adapt) {
+    for (const m of MAP_TYPES) {
+      const v = adapt[m];
+      if (v !== undefined && v !== 0) c.adaptation[m] = clampStat(c.adaptation[m] + v);
+    }
   }
   for (const id of sub.grantedSkills) learnSkill(c, id);
 }
@@ -906,7 +943,7 @@ export function applyEffect(team: Team, e: ChoiceEffect): void {
     }
     case 'set_subjob': {
       const c = findChar(team, e.charId);
-      if (c) setSubJob(c, e.subJob);
+      if (c) applySubJob(c, e.subJob);
       return;
     }
     case 'change_job': {

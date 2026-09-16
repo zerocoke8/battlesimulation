@@ -8,16 +8,26 @@
  * - 광역 스킬(enemy_area / line)은 시전 완료 시 즉시 적용하지 않고 Zone 을 만든다 (GDD §6.5).
  *   예고(telegraph) → impact → (linger 장판). 예고 시작 시 영역 안의 적마다 회피 판정 1회 (GDD §4.4).
  *   Zone 은 생성 순서 배열로 관리하고 매 틱 유닛 처리 뒤에 처리한다. 시전자가 죽어도 Zone 은 남는다.
+ * - (v0.7) 맵 기믹(MapDef.hazards)은 시전자 없는 중립 Zone (side 'neutral', casterId 'map') 을 주기적으로 만든다.
+ *   양 팀 모두 맞고 양 팀 모두 회피 판정을 받는다. 피해는 최대 HP 의 % (방어 무시, 보호막 적용, 적응도 보정).
+ * - (v0.7) 전장 붕괴: ATTRITION_START_SEC 부터 모든 살아있는 유닛이 초당 최대 HP 의 attritionRatePctPerSec(t) % 를 잃는다
+ *   (방어·보호막·무적 무시, 가해자 없음). 전 맵 공통.
+ * - 유닛 위치는 맵 가장자리에서 MAP_MARGIN_UNITS 이상 안쪽으로 클램프한다 (스프라이트가 여백 프레임에 걸치지 않게).
  * - DOM / Math.random / Date 를 절대 사용하지 않는다.
  */
 import {
   ALLY_AREA_FLASH_SEC,
+  ATTRITION_START_SEC,
   DEFAULT_TELEGRAPH_SEC,
   DERIVED_STAT_KEYS,
+  HAZARD_CASTER_ID,
+  MAP_MARGIN_UNITS,
   SHORT_TELEGRAPH_SEC,
   TICK_DT,
   TICK_RATE,
   ZONE_FLASH_SEC,
+  attritionRatePctPerSec,
+  hazardAdaptationMult,
 } from '../types';
 import type {
   BattleEvent,
@@ -28,6 +38,7 @@ import type {
   Character,
   DerivedStatKey,
   DerivedStats,
+  HazardDef,
   MainJob,
   MapDef,
   Role,
@@ -43,6 +54,7 @@ import type {
   UnitSnapshot,
   ZonePhase,
   ZoneShape,
+  ZoneSide,
   ZoneSnapshot,
 } from '../types';
 import { Rng } from '../rng';
@@ -77,6 +89,13 @@ const DODGE_SPEED_MULT = 1.15; // 회피 이동 속도 배율
 const DODGE_ESCAPE_MARGIN = 0.6; // 영역 경계 밖 여유
 const DODGE_CENTER_EPS = 0.5; // 이 거리 안이면 '중심에 맞은 것' 으로 보고 시전자 반대쪽으로 탈출
 
+/** 유닛 위치 클램프 여백 (맵 단위). 유닛 중심은 [POS_MARGIN, width − POS_MARGIN] 안에만 있다 */
+const POS_MARGIN = MAP_MARGIN_UNITS;
+/** 기믹 장판 둔화의 1회 지속 시간(초). 안에 있는 동안 매 틱 갱신되므로 벗어난 뒤 이만큼 남는다 */
+const HAZARD_SLOW_DURATION_SEC = 1;
+/** 전장 붕괴 시작 틱 */
+const ATTRITION_START_TICK = Math.max(1, Math.round(ATTRITION_START_SEC * TICK_RATE));
+
 // 광역 영역 표시 틱 수
 const ZONE_FLASH_TICKS = Math.max(1, Math.round(ZONE_FLASH_SEC * TICK_RATE));
 const ALLY_AREA_FLASH_TICKS = Math.max(1, Math.round(ALLY_AREA_FLASH_SEC * TICK_RATE));
@@ -87,7 +106,7 @@ const FORMATION_BACK_OFFSET = 1.0; // 후열: 기준 열 뒤
 const FORMATION_COLUMN_GAP = 1.4; // 한 줄이 넘칠 때 추가 열 간격 / 저격수 열 간격
 const FORMATION_MAX_PER_COLUMN = 4; // 한 열 최대 인원
 const FORMATION_ROW_SPACING = 3.0; // 세로 간격
-const FORMATION_MARGIN = 0.8; // 맵 경계 여유
+const FORMATION_MARGIN = MAP_MARGIN_UNITS; // 맵 경계 여유 (= 유닛 위치 클램프 여백)
 const FORMATION_MIN_SEP = 0.8; // 유닛 최소 간격
 
 const FATIGUE_KEYS: readonly DerivedStatKey[] = ['physAtk', 'magAtk', 'physDef', 'magDef', 'atkSpeed', 'moveSpeed'];
@@ -149,6 +168,10 @@ interface Unit {
   attackSchool: 'phys' | 'magic';
   /** 소환물 기본 파생 수치 (버프 적용 전) */
   summonRaw: DerivedStats | null;
+  /** 이 맵의 적응도 (0~100). 소환물은 소환사의 값. 기믹 피해 배율(hazardAdaptationMult)에 쓴다 */
+  adapt: number;
+  /** 도트 스프라이트 키 (UnitSnapshot.spriteKey). 직업 id / 'summon_<kind>' / 'monster_<species ?? kind>' */
+  spriteKey: string;
 
   x: number;
   y: number;
@@ -235,11 +258,16 @@ type EffectMode = 'all' | 'harmful' | 'helpful';
  */
 interface Zone {
   id: string;
-  side: TeamSide;
+  /** 시전자 팀. 맵 기믹이면 'neutral' (양 팀 모두 대상) */
+  side: ZoneSide;
+  /** 시전 유닛 idx. 맵 기믹이면 -1 */
   casterIdx: number;
   casterId: string;
   skillId: string;
-  skill: SkillDef;
+  /** 스킬 영역이면 스킬 정의, 맵 기믹이면 null */
+  skill: SkillDef | null;
+  /** 맵 기믹 영역이면 정의, 스킬 영역이면 null */
+  hazard: HazardDef | null;
   shape: ZoneShape;
   x: number;
   y: number;
@@ -265,10 +293,20 @@ interface Zone {
   impactDone: boolean;
   /** 표시용(아군 광역 / 즉시 적용 광역의 폭발 표시). 장판 피해 없음 */
   displayOnly: boolean;
-  src: EffectSource;
+  /** 시전자 수치 스냅샷. 맵 기믹이면 null */
+  src: EffectSource | null;
   lingerSchool: 'phys' | 'magic';
   lingerAtk: number; // impact 시점 시전자 공격력 (캐시)
   lingerMult: number; // 맵 마법 계열 배율
+}
+
+/** 맵 기믹 스케줄 상태 (기믹당 1개, MapDef.hazards 순서) */
+interface HazardState {
+  def: HazardDef;
+  /** 다음 파도가 생성되는 틱 */
+  nextWaveTick: number;
+  /** 지금까지 생성한 파도 수 (= 다음 파도의 n) */
+  wave: number;
 }
 
 // ───────────────────────── 유틸 ─────────────────────────
@@ -379,6 +417,36 @@ function safeGetSkill(id: string): SkillDef | null {
   } catch {
     return null;
   }
+}
+
+/** 기믹 피해의 dealDamage 계열 ('none' 이면 물리, 그 외 이능) */
+function hazardDamageSchool(def: HazardDef): 'phys' | 'magic' {
+  return def.magic === 'none' ? 'phys' : 'magic';
+}
+
+/** 캐릭터의 스프라이트 키 (UnitSnapshot.spriteKey 규칙) */
+function spriteKeyOfCharacter(c: Character): string {
+  if (c.monster) return 'monster_' + (c.monster.species ?? c.monster.kind);
+  return c.mainJob;
+}
+
+/** n 번째 파도 뒤 다음 파도까지의 간격(초): max(minIntervalSec, intervalSec − intervalDecayPerWave × n) */
+export function hazardIntervalSec(def: HazardDef, wave: number): number {
+  return Math.max(def.minIntervalSec, def.intervalSec - def.intervalDecayPerWave * wave);
+}
+
+/** n 번째 파도의 반경: min(maxRadius, radius + radiusGrowthPerWave × n) */
+export function hazardRadiusAt(def: HazardDef, wave: number): number {
+  let r = def.radius + (def.radiusGrowthPerWave ?? 0) * wave;
+  if (def.maxRadius !== undefined && r > def.maxRadius) r = def.maxRadius;
+  return r;
+}
+
+/**
+ * 전장 붕괴 감소율 (최대 HP 의 %/초). 붕괴 전이면 0. types.ts 의 attritionRatePctPerSec 과 같다 (헤드리스 도구용 재수출).
+ */
+export function attritionRatePct(tSec: number): number {
+  return attritionRatePctPerSec(tSec);
 }
 
 // ───────────────────────── 공개 도우미 ─────────────────────────
@@ -528,9 +596,10 @@ export function hashFrame(f: BattleFrame): string {
   }
   for (let i = 0; i < f.zones.length; i++) {
     const z = f.zones[i];
-    s += ';z' + z.id + ':' + z.phase + ',' + z.x.toFixed(3) + ',' + z.y.toFixed(3) + ',' + z.remainingSec.toFixed(3);
+    s += ';z' + z.id + ':' + z.side + ',' + z.skillId + ',' + z.phase + ',' + z.x.toFixed(3) + ',' + z.y.toFixed(3) + ',' + z.radius.toFixed(3) + ',' + z.remainingSec.toFixed(3);
   }
   if (f.capture) s += ';c' + f.capture.progressA.toFixed(3) + '/' + f.capture.progressB.toFixed(3);
+  if (f.attritionPctPerSec > 0) s += ';a' + f.attritionPctPerSec.toFixed(3);
   return s;
 }
 
@@ -560,6 +629,13 @@ class Battle implements BattleSimulator {
   private zoneCounter = 0;
   /** 광역 영역. 생성 순서 고정 */
   private zones: Zone[] = [];
+  /** 맵 기믹 스케줄 (MapDef.hazards 순서) */
+  private readonly hazardStates: HazardState[] = [];
+  /** 전장 붕괴 시작 이벤트를 냈는가 */
+  private attritionStarted = false;
+  /** 이번 틱 시작 시점의 팀별 잔여 HP 합. 같은 틱에 양 팀이 함께 전멸했을 때 승자 판정에 쓴다 */
+  private tickStartHpA = 0;
+  private tickStartHpB = 0;
   private readonly visionRadius: number;
 
   constructor(input: BattleInput) {
@@ -569,6 +645,11 @@ class Battle implements BattleSimulator {
     this.maxTicks = Math.max(1, Math.round(this.map.timeLimitSec * TICK_RATE));
     this.hardCapTicks = this.maxTicks + 1;
     this.visionRadius = this.map.visionRadius;
+    const hazards = this.map.hazards ?? [];
+    for (let i = 0; i < hazards.length; i++) {
+      const def = hazards[i];
+      this.hazardStates.push({ def, nextWaveTick: Math.max(1, Math.round(def.startSec * TICK_RATE)), wave: 0 });
+    }
 
     this.teams = {
       A: this.makeTeamRuntime('A', input.teamA, this.map.spawnA),
@@ -662,6 +743,8 @@ class Battle implements BattleSimulator {
       char: c,
       attackSchool: jobDef.attackSchool,
       summonRaw: null,
+      adapt: clamp(c.adaptation ? c.adaptation[this.input.map] ?? 50 : 50, 0, 100),
+      spriteKey: spriteKeyOfCharacter(c),
       x,
       y,
       facing: side === 'A' ? 0 : Math.PI,
@@ -744,6 +827,8 @@ class Battle implements BattleSimulator {
       char: null,
       attackSchool: def.school,
       summonRaw: raw,
+      adapt: owner.adapt,
+      spriteKey: 'summon_' + unitId,
       x,
       y,
       facing: owner.facing,
@@ -952,6 +1037,8 @@ class Battle implements BattleSimulator {
     this.tick++;
     this.time = this.tick * TICK_DT;
     this.events = [];
+    this.tickStartHpA = this.hpSum('A');
+    this.tickStartHpB = this.hpSum('B');
 
     this.evaluateSynergies();
     this.updateVision();
@@ -964,7 +1051,9 @@ class Battle implements BattleSimulator {
       this.tickUnit(u);
     }
     this.separate();
+    this.tickHazards(); // 맵 기믹 파도 생성 (이번 틱 생성분은 tickZones 가 다음 틱부터 센다)
     this.tickZones(); // 광역 영역: 유닛 처리 뒤, 생성 순서
+    this.tickAttrition(); // 전장 붕괴
     this.updateCapture();
     this.checkVictory();
 
@@ -1391,8 +1480,8 @@ class Battle implements BattleSimulator {
       nx += -dy * wobble;
       ny += dx * wobble;
     }
-    u.x = clamp(nx, 0.5, map.width - 0.5);
-    u.y = clamp(ny, 0.5, map.height - 0.5);
+    u.x = clamp(nx, POS_MARGIN, map.width - POS_MARGIN);
+    u.y = clamp(ny, POS_MARGIN, map.height - POS_MARGIN);
     u.facing = Math.atan2(dy, dx);
   }
 
@@ -1460,10 +1549,10 @@ class Battle implements BattleSimulator {
         const push = (SEPARATION_DIST - d) * 0.5;
         const ux = dx / d;
         const uy = dy / d;
-        a.x = clamp(a.x - ux * push, 0.5, map.width - 0.5);
-        a.y = clamp(a.y - uy * push, 0.5, map.height - 0.5);
-        b.x = clamp(b.x + ux * push, 0.5, map.width - 0.5);
-        b.y = clamp(b.y + uy * push, 0.5, map.height - 0.5);
+        a.x = clamp(a.x - ux * push, POS_MARGIN, map.width - POS_MARGIN);
+        a.y = clamp(a.y - uy * push, POS_MARGIN, map.height - POS_MARGIN);
+        b.x = clamp(b.x + ux * push, POS_MARGIN, map.width - POS_MARGIN);
+        b.y = clamp(b.y + uy * push, POS_MARGIN, map.height - POS_MARGIN);
       }
     }
   }
@@ -2051,8 +2140,8 @@ class Battle implements BattleSimulator {
           const n = Math.max(1, Math.floor(e.count));
           for (let k = 0; k < n; k++) {
             const ang = u.facing + ((k - (n - 1) / 2) * Math.PI) / 4;
-            const sx = clamp(u.x + Math.cos(ang) * 1.5, 0.5, this.map.width - 0.5);
-            const sy = clamp(u.y + Math.sin(ang) * 1.5, 0.5, this.map.height - 0.5);
+            const sx = clamp(u.x + Math.cos(ang) * 1.5, POS_MARGIN, this.map.width - POS_MARGIN);
+            const sy = clamp(u.y + Math.sin(ang) * 1.5, POS_MARGIN, this.map.height - POS_MARGIN);
             const s = this.createSummonUnit(u, e.unit, sx, sy, e.durationSec);
             this.pushEvent({ t: this.time, kind: 'summon', owner: u.id, unitId: s.id });
           }
@@ -2075,8 +2164,8 @@ class Battle implements BattleSimulator {
           if (len < 0.0001) break;
           const move = Math.min(e.distance, Math.max(0, len - 0.8));
           if (move <= 0) break;
-          u.x = clamp(u.x + (dx / len) * move, 0.5, this.map.width - 0.5);
-          u.y = clamp(u.y + (dy / len) * move, 0.5, this.map.height - 0.5);
+          u.x = clamp(u.x + (dx / len) * move, POS_MARGIN, this.map.width - POS_MARGIN);
+          u.y = clamp(u.y + (dy / len) * move, POS_MARGIN, this.map.height - POS_MARGIN);
           u.facing = Math.atan2(dy, dx);
           break;
         }
@@ -2097,8 +2186,8 @@ class Battle implements BattleSimulator {
             }
             const resist = clamp(1 - clamp(t.strength, 0, 100) / 200, 0.3, 1);
             const d = e.distance * resist;
-            t.x = clamp(t.x + dx * d, 0.5, this.map.width - 0.5);
-            t.y = clamp(t.y + dy * d, 0.5, this.map.height - 0.5);
+            t.x = clamp(t.x + dx * d, POS_MARGIN, this.map.width - POS_MARGIN);
+            t.y = clamp(t.y + dy * d, POS_MARGIN, this.map.height - POS_MARGIN);
           }
           break;
         }
@@ -2196,6 +2285,7 @@ class Battle implements BattleSimulator {
       casterId: u.id,
       skillId: sk.id,
       skill: sk,
+      hazard: null,
       shape: 'circle',
       x: tx,
       y: ty,
@@ -2274,20 +2364,24 @@ class Battle implements BattleSimulator {
    */
   private escapePoint(z: Zone, u: Unit): { x: number; y: number } {
     const map = this.map;
-    const minX = 0.5;
-    const maxX = map.width - 0.5;
-    const minY = 0.5;
-    const maxY = map.height - 0.5;
+    const minX = POS_MARGIN;
+    const maxX = map.width - POS_MARGIN;
+    const minY = POS_MARGIN;
+    const maxY = map.height - POS_MARGIN;
     if (z.shape === 'circle') {
       let dx = u.x - z.x;
       let dy = u.y - z.y;
       const len = Math.sqrt(dx * dx + dy * dy);
       if (len < DODGE_CENTER_EPS) {
-        // 중심(≈자기 자리)에 떨어진 광역: 가장 가까운 밖이 없으므로 시전자 반대쪽으로. 시전자와 겹치면 바라보는 반대쪽.
-        const c = this.units[z.casterIdx];
-        dx = z.x - c.x;
-        dy = z.y - c.y;
-        const l2 = Math.sqrt(dx * dx + dy * dy);
+        // 중심(≈자기 자리)에 떨어진 광역: 가장 가까운 밖이 없으므로 시전자 반대쪽으로. 시전자와 겹치거나
+        // 시전자가 없으면(맵 기믹) 바라보는 반대쪽.
+        let l2 = 0;
+        if (z.casterIdx >= 0) {
+          const c = this.units[z.casterIdx];
+          dx = z.x - c.x;
+          dy = z.y - c.y;
+          l2 = Math.sqrt(dx * dx + dy * dy);
+        }
         if (l2 < 0.0001) {
           dx = -Math.cos(u.facing);
           dy = -Math.sin(u.facing);
@@ -2358,9 +2452,19 @@ class Battle implements BattleSimulator {
     return true;
   }
 
-  /** 예고 시작 시 영역 안의 적마다 회피 판정 1회 (GDD §4.4) */
+  /**
+   * 영역의 대상 유닛 목록 (순서 고정). 팀 영역이면 상대 팀 전원(소환물 포함), 중립(맵 기믹)이면 양 팀 전원(유닛 배열 순서).
+   * 생사·영역 포함 여부는 호출자가 거른다.
+   */
+  private zoneTargets(z: Zone): readonly Unit[] {
+    if (z.side === 'A') return this.teams.B.all;
+    if (z.side === 'B') return this.teams.A.all;
+    return this.units;
+  }
+
+  /** 예고 시작 시 영역 안의 대상마다 회피 판정 1회 (GDD §4.4). 맵 기믹 영역은 양 팀 모두 판정한다 */
   private rollDodges(z: Zone, telegraphSec: number): void {
-    const enemies = z.side === 'A' ? this.teams.B.all : this.teams.A.all;
+    const enemies = this.zoneTargets(z);
     for (let i = 0; i < enemies.length; i++) {
       const e = enemies[i];
       if (!e.alive || !this.zoneContains(z, e)) continue;
@@ -2390,45 +2494,240 @@ class Battle implements BattleSimulator {
     }
   }
 
-  /** impact: 영역 안의 적에게 스킬의 영역 대상 효과를 적용하고 장판을 시작한다 */
+  /** impact: 영역 안의 대상에게 효과(스킬 영역 대상 효과 / 기믹 피해)를 적용하고 장판을 시작한다 */
   private impactZone(z: Zone): void {
+    if (z.hazard) {
+      this.impactHazard(z, z.hazard);
+      z.impactDone = true;
+      z.telegraphTicksLeft = 0;
+      z.flashTicksLeft = ZONE_FLASH_TICKS;
+      const hl = z.hazard.linger;
+      if (hl && hl.durationSec > 0) {
+        const ticks = Math.max(1, Math.round(hl.durationSec * TICK_RATE));
+        z.lingerTicksTotal = ticks;
+        z.lingerTicksLeft = ticks;
+        z.lingerSchool = hazardDamageSchool(z.hazard);
+      }
+      return;
+    }
+    const sk = z.skill;
+    let src = z.src;
+    if (!sk || !src) return;
     const caster = this.units[z.casterIdx];
     if (caster.alive) {
       // 시전자가 살아 있으면 impact 시점 수치 (버프 반영). 은신/잃은 HP 는 시전 시점 기준 유지
       const fresh = this.snapshotSource(caster);
-      fresh.stealthedAtCast = z.src.stealthedAtCast;
-      fresh.missingPct = z.src.missingPct;
+      fresh.stealthedAtCast = src.stealthedAtCast;
+      fresh.missingPct = src.missingPct;
+      src = fresh;
       z.src = fresh;
     }
-    const enemies = z.side === 'A' ? this.teams.B.all : this.teams.A.all;
+    const enemies = this.zoneTargets(z);
     const targets: Unit[] = [];
     for (let i = 0; i < enemies.length; i++) {
       const e = enemies[i];
       if (e.alive && this.zoneContains(z, e)) targets.push(e);
     }
-    this.applyEffects(z.src, z.skill, 'harmful', () => targets, () => [caster], z.tx, z.ty, z.x, z.y, null, false);
+    this.applyEffects(src, sk, 'harmful', () => targets, () => [caster], z.tx, z.ty, z.x, z.y, null, false);
 
     z.impactDone = true;
     z.telegraphTicksLeft = 0;
     z.flashTicksLeft = ZONE_FLASH_TICKS;
-    const lg = z.skill.linger;
+    const lg = sk.linger;
     if (lg && lg.durationSec > 0) {
       const ticks = Math.max(1, Math.round(lg.durationSec * TICK_RATE));
       z.lingerTicksTotal = ticks;
       z.lingerTicksLeft = ticks;
-      const school = lingerSchoolOf(z.skill);
+      const school = lingerSchoolOf(sk);
       z.lingerSchool = school;
-      z.lingerAtk = school === 'phys' ? z.src.physAtk : z.src.magAtk;
-      z.lingerMult = school === 'magic' && z.skill.magic !== 'none' ? (this.map.schoolBonus[z.skill.magic] ?? 1) : 1;
+      z.lingerAtk = school === 'phys' ? src.physAtk : src.magAtk;
+      z.lingerMult = school === 'magic' && sk.magic !== 'none' ? (this.map.schoolBonus[sk.magic] ?? 1) : 1;
     }
   }
 
-  /** 장판 한 틱: 안에 있는 적에게 dpsCoef × 캐시된 공격력 × dt 피해(방어 적용)와 상태 */
+  // ───────── 맵 기믹 (hazard, GDD §5.1) ─────────
+
+  /** 기믹 피해 배율: adaptationScaled 면 hazardAdaptationMult(해당 맵 적응도), 아니면 1 */
+  private hazardMult(def: HazardDef, u: Unit): number {
+    return def.adaptationScaled ? hazardAdaptationMult(u.adapt) : 1;
+  }
+
+  /**
+   * 기믹 impact: 영역 안의 양 팀 유닛에게 최대 HP 의 damagePctMaxHp % 피해 (방어 무시, 보호막 적용, 적응도 보정).
+   * 가해자 없음 → damageDealt·킬 크레딧 없음. 이벤트 hazard_damage(phase 'impact') 는 결과 이벤트에도 남는다.
+   */
+  private impactHazard(z: Zone, def: HazardDef): void {
+    const targets = this.zoneTargets(z);
+    const school = hazardDamageSchool(def);
+    const pct = def.damagePctMaxHp / 100;
+    if (pct <= 0) return;
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
+      if (!t.alive || !this.zoneContains(z, t)) continue;
+      const dmg = t.eff.maxHp * pct * this.hazardMult(def, t);
+      // 이벤트 → 피해(킬) 순서 유지: 이벤트를 먼저 넣고 실제 HP 감소량을 채운다
+      const ev = { t: this.time, kind: 'hazard_damage' as const, hazardId: def.id, to: t.id, damage: 0, phase: 'impact' as const, school: def.magic };
+      this.pushEvent(ev);
+      ev.damage = Math.round(this.dealDamage(null, t, dmg, school, false, false));
+    }
+  }
+
+  /** 기믹 장판 한 틱: 안의 양 팀 유닛에게 초당 dpsPctMaxHp % × dt 피해(방어 무시, 적응도 보정)와 둔화 */
+  private tickHazardLinger(z: Zone, def: HazardDef): void {
+    const hl = def.linger;
+    if (!hl) return;
+    const targets = this.zoneTargets(z);
+    const school = hazardDamageSchool(def);
+    const pct = (hl.dpsPctMaxHp / 100) * TICK_DT;
+    const slow = hl.slow ?? 0;
+    for (let i = 0; i < targets.length; i++) {
+      const t = targets[i];
+      if (!t.alive || !this.zoneContains(z, t)) continue;
+      if (pct > 0) {
+        const dmg = t.eff.maxHp * pct * this.hazardMult(def, t);
+        const ev = { t: this.time, kind: 'hazard_damage' as const, hazardId: def.id, to: t.id, damage: 0, phase: 'linger' as const, school: def.magic };
+        this.pushEvent(ev);
+        ev.damage = this.dealDamage(null, t, dmg, school, false, false);
+        if (!t.alive) continue;
+      }
+      if (slow > 0) {
+        if (!this.refreshStatus(t, 'slow', HAZARD_SLOW_DURATION_SEC, slow, null)) {
+          this.applyStatus(t, 'slow', HAZARD_SLOW_DURATION_SEC, slow, null, 1);
+        }
+      }
+    }
+  }
+
+  /** 매 틱: 파도 시각이 된 기믹의 파도를 생성하고 다음 파도 시각을 정한다 (MapDef.hazards 순서) */
+  private tickHazards(): void {
+    const hs = this.hazardStates;
+    for (let i = 0; i < hs.length; i++) {
+      const h = hs[i];
+      // 간격 틱 수는 항상 1 이상이므로 종료한다
+      while (this.tick >= h.nextWaveTick) {
+        this.spawnHazardWave(h);
+        const n = h.wave;
+        h.wave++;
+        h.nextWaveTick += Math.max(1, Math.round(hazardIntervalSec(h.def, n) * TICK_RATE));
+      }
+    }
+  }
+
+  /** 파도 1회: targeting 규칙대로 중심을 고르고 중립 영역을 만든다 */
+  private spawnHazardWave(h: HazardState): void {
+    const def = h.def;
+    const radius = hazardRadiusAt(def, h.wave);
+    if (def.targeting === 'random_unit_each_side') {
+      // 팀 A → B 순서 고정. 각 팀에서 살아있는 유닛(소환물 포함) 하나를 시드 난수로 고른다. 비어 있으면 그 팀 것은 없다.
+      const sides: readonly TeamSide[] = ['A', 'B'];
+      for (let s = 0; s < sides.length; s++) {
+        const all = this.teams[sides[s]].all;
+        const alive: Unit[] = [];
+        for (let i = 0; i < all.length; i++) if (all[i].alive) alive.push(all[i]);
+        if (alive.length === 0) continue;
+        const target = this.rng.pick(alive);
+        this.createHazardZone(def, radius, target.x, target.y);
+      }
+    } else {
+      const x = this.rng.float(POS_MARGIN, this.map.width - POS_MARGIN);
+      const y = this.rng.float(POS_MARGIN, this.map.height - POS_MARGIN);
+      this.createHazardZone(def, radius, x, y);
+    }
+  }
+
+  /** 중립 영역 생성 + zone 이벤트 + (예고면) 양 팀 회피 판정 / (예고 없음) 즉시 impact */
+  private createHazardZone(def: HazardDef, radius: number, x: number, y: number): void {
+    this.zoneCounter++;
+    const z: Zone = {
+      id: 'z' + this.zoneCounter,
+      side: 'neutral',
+      casterIdx: -1,
+      casterId: HAZARD_CASTER_ID,
+      skillId: def.id,
+      skill: null,
+      hazard: def,
+      shape: 'circle',
+      x,
+      y,
+      radius,
+      dirX: 0,
+      dirY: 0,
+      length: 0,
+      halfWidth: 0,
+      tx: x,
+      ty: y,
+      createdTick: this.tick,
+      telegraphTicksTotal: 0,
+      telegraphTicksLeft: 0,
+      flashTicksLeft: 0,
+      lingerTicksTotal: 0,
+      lingerTicksLeft: 0,
+      impactDone: false,
+      displayOnly: false,
+      src: null,
+      lingerSchool: hazardDamageSchool(def),
+      lingerAtk: 0,
+      lingerMult: 1,
+    };
+    this.zones.push(z);
+    this.pushEvent({ t: this.time, kind: 'zone', from: HAZARD_CASTER_ID, skillId: def.id, x, y });
+    const tele = def.telegraphSec > 0 ? def.telegraphSec : 0;
+    if (tele > 0) {
+      const ticks = Math.max(1, Math.round(tele * TICK_RATE));
+      z.telegraphTicksTotal = ticks;
+      z.telegraphTicksLeft = ticks;
+      this.rollDodges(z, tele);
+    } else {
+      this.impactZone(z);
+    }
+  }
+
+  // ───────── 전장 붕괴 (attrition, GDD §6.6) ─────────
+
+  /** 현재 붕괴 감소율 (%/초). 붕괴 틱 전이면 0. 틱 기준으로 판정해 부동소수점 시각 오차에 흔들리지 않는다 */
+  private currentAttritionPct(): number {
+    if (this.tick < ATTRITION_START_TICK) return 0;
+    return attritionRatePctPerSec(Math.max(this.time, ATTRITION_START_SEC));
+  }
+
+  /**
+   * 매 틱: 붕괴 중이면 살아있는 모든 유닛(소환물 포함)이 최대 HP × rate(t)% × dt 를 잃는다.
+   * 방어·보호막·무적 무시, 가해자 없음 (damageTaken 에만 포함). 시작 틱에 attrition_start 이벤트 1회.
+   */
+  private tickAttrition(): void {
+    if (this.tick < ATTRITION_START_TICK) return;
+    if (!this.attritionStarted) {
+      this.attritionStarted = true;
+      this.pushEvent({ t: this.time, kind: 'attrition_start' });
+    }
+    const frac = (this.currentAttritionPct() / 100) * TICK_DT;
+    if (frac <= 0) return;
+    const units = this.units;
+    for (let i = 0; i < units.length; i++) {
+      const u = units[i];
+      if (!u.alive) continue;
+      const dmg = u.eff.maxHp * frac;
+      if (dmg <= 0) continue;
+      const ev = { t: this.time, kind: 'attrition' as const, to: u.id, damage: dmg };
+      this.pushEvent(ev);
+      u.hp -= dmg;
+      u.stats.damageTaken += dmg;
+      if (u.hp <= 0) this.kill(u, null);
+    }
+  }
+
+  /** 장판 한 틱: 안에 있는 적에게 dpsCoef × 캐시된 공격력 × dt 피해(방어 적용)와 상태. 기믹 영역은 tickHazardLinger */
   private tickLinger(z: Zone): void {
-    const lg = z.skill.linger;
+    if (z.hazard) {
+      this.tickHazardLinger(z, z.hazard);
+      return;
+    }
+    const sk = z.skill;
+    if (!sk) return;
+    const lg = sk.linger;
     if (!lg) return;
     const caster = this.units[z.casterIdx];
-    const enemies = z.side === 'A' ? this.teams.B.all : this.teams.A.all;
+    const enemies = this.zoneTargets(z);
     const base = z.lingerAtk * lg.dpsCoef * TICK_DT * z.lingerMult;
     const st = lg.status;
     for (let i = 0; i < enemies.length; i++) {
@@ -2438,7 +2737,7 @@ class Battle implements BattleSimulator {
         const def = z.lingerSchool === 'phys' ? e.eff.physDef : e.eff.magDef;
         const dmg = base * (100 / (100 + Math.max(0, def)));
         // 이벤트 → 피해(킬) 순서 유지: 이벤트를 먼저 넣고 실제 HP 감소량을 채운다
-        const ev = { t: this.time, kind: 'zone_damage' as const, from: caster.id, to: e.id, skillId: z.skill.id, damage: 0, school: z.lingerSchool };
+        const ev = { t: this.time, kind: 'zone_damage' as const, from: caster.id, to: e.id, skillId: sk.id, damage: 0, school: z.lingerSchool };
         this.pushEvent(ev);
         ev.damage = this.dealDamage(caster, e, dmg, z.lingerSchool, false, false);
         if (!e.alive) continue;
@@ -2543,7 +2842,11 @@ class Battle implements BattleSimulator {
     const aliveA = this.aliveCount('A');
     const aliveB = this.aliveCount('B');
     if (aliveA === 0 && aliveB === 0) {
-      this.finish('draw', 'annihilation');
+      // (v0.7) 같은 틱에 양 팀의 마지막 유닛이 함께 죽음 (눈보라·붕괴가 양쪽을 동시에 끝낼 때).
+      // 틱 시작 시점의 잔여 HP 합이 많던 쪽이 이긴다 (annihilation_or_hp 의 취지). 그마저 같으면 무승부.
+      if (this.tickStartHpA > this.tickStartHpB) this.finish('A', 'mutual_annihilation');
+      else if (this.tickStartHpB > this.tickStartHpA) this.finish('B', 'mutual_annihilation');
+      else this.finish('draw', 'annihilation');
       return;
     }
     if (aliveB === 0) {
@@ -2602,7 +2905,8 @@ class Battle implements BattleSimulator {
   private pushEvent(e: BattleEvent): void {
     this.events.push(e);
     // 틱 단위 이벤트(장판·지속 피해)는 프레임에만 싣는다. 결과 이벤트 상한을 그것들이 채우면 킬·종료 같은 이벤트가 잘린다
-    if (e.kind === 'zone_damage' || e.kind === 'dot') return;
+    if (e.kind === 'zone_damage' || e.kind === 'dot' || e.kind === 'attrition') return;
+    if (e.kind === 'hazard_damage' && e.phase === 'linger') return;
     if (this.allEvents.length < MAX_RESULT_EVENTS) this.allEvents.push(e);
   }
 
@@ -2678,6 +2982,7 @@ class Battle implements BattleSimulator {
         statuses,
         casting,
         targetId: u.alive && u.targetIdx >= 0 ? this.units[u.targetIdx].id : null,
+        spriteKey: u.spriteKey,
       };
       if (u.isSummon && u.ownerId) snap.ownerId = u.ownerId;
       snaps[i] = snap;
@@ -2695,6 +3000,7 @@ class Battle implements BattleSimulator {
       events,
       zones,
       capture,
+      attritionPctPerSec: this.currentAttritionPct(),
       finished: this._finished,
     };
   }
@@ -2736,6 +3042,7 @@ class Battle implements BattleSimulator {
       winner: this.winner,
       reason: this.reason,
       durationSec: Math.round(this.time * 100) / 100,
+      endedInAttrition: this.tick >= ATTRITION_START_TICK,
       totalTicks: this.tick,
       unitStats,
       mvpId,

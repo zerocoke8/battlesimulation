@@ -389,6 +389,15 @@ const TG_SHORT = SHORT_TELEGRAPH_SEC;
 /** 반경 3.5 이상 큰 광역의 예고 */
 const TG_LARGE = 1.0;
 
+/**
+ * v0.7 보정A (2026-09-17, 맵 28×20 · 전장 붕괴 · 눈보라 도입 후 재측정):
+ *  - 전투 시간은 stats.ts HP_SCALE(1.12) 로 되돌렸고 스킬 계수는 깎지 않았다 (설계 원칙: "전투 시간은 HP·방어 상수로").
+ *  - 회복 계수 −15% 도 시험했지만 붕괴 후 종료 비율(긴 꼬리)에 거의 효과가 없어(13.6% 예상 → 13.3% 실측) 되돌렸다.
+ *    긴 전투는 힐러 교착이 아니라 30초 이후 지구력 피로로 후반 DPS 가 30~50% 떨어지는 구조 때문이다 (sim FATIGUE_*).
+ *  - 암살자만 예외: HP 가 12% 오르자 10일차 승률이 32.6~35.5% 로 목표 하한(35%)에 걸렸다. 급습 14 → 16.5, 연막 단검 9.14 → 10.6,
+ *    그림자 처형 12.32 → 14.3 (+16~18%). 1회 피해는 급습 ≈ 27% · 연막 단검 ≈ 17% 로 각 목표 구간(18~30 / 12~20) 안.
+ */
+
 // ───────────────────────── 스킬 목록 (정의 순서 고정) ─────────────────────────
 //
 // 계수 메모 (v0.6 보정A 확정, 2026-09-16 헤드리스 측정):
@@ -463,14 +472,14 @@ const SKILL_LIST: SkillDef[] = [
 
   // ══════════ 암살자 ══════════
   active({ id: 'assassin_stealth', name: '은신', flavor: '타겟팅되지 않는다.', job: 'assassin', cd: 15, mp: 26, range: 0, target: 'self', effects: [{ kind: 'status', status: 'stealth', durationSec: 3 }], ai: 'not_stealthed', cost: 90 }),
-  active({ id: 'assassin_ambush', name: '급습', job: 'assassin', cd: 8, mp: 26, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 14, bonusIfStealth: 1.0 }], cost: 80 }),
-  active({ id: 'assassin_smoke_daggers', name: '연막 단검', flavor: '연막 속에서 단검을 사방으로 던진다.', job: 'assassin', cd: 9, mp: 34, range: MELEE, target: 'enemy_area', radius: 2.5, effects: [{ kind: 'damage', school: 'phys', coef: 9.14, bonusIfStealth: 0.5 }], cost: 100, telegraph: TG_SHORT }),
+  active({ id: 'assassin_ambush', name: '급습', job: 'assassin', cd: 8, mp: 26, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 16.5, bonusIfStealth: 1.0 }], cost: 80 }),
+  active({ id: 'assassin_smoke_daggers', name: '연막 단검', flavor: '연막 속에서 단검을 사방으로 던진다.', job: 'assassin', cd: 9, mp: 34, range: MELEE, target: 'enemy_area', radius: 2.5, effects: [{ kind: 'damage', school: 'phys', coef: 10.6, bonusIfStealth: 0.5 }], cost: 100, telegraph: TG_SHORT }),
   active({ id: 'assassin_shadowstep', name: '그림자 걸음', flavor: '대상 방향으로 8칸 순간 이동한다.', job: 'assassin', cd: 10, mp: 17, range: 9, target: 'enemy', effects: [{ kind: 'dash', distance: 8 }], ai: 'out_of_range', cost: 70 }),
   passive({ id: 'assassin_smoke', name: '연막', job: 'assassin', mods: { evasion: 15 }, cost: 70 }),
   passive({ id: 'assassin_lethal', name: '급소 파악', job: 'assassin', mods: { critChance: 10, critMult: 15 }, cost: 90 }),
   // 그림자 암살자
   active({ id: 'assassin_shadow_veil', name: '그림자 장막', job: 'assassin', magic: 'shadow', cd: 14, mp: 26, range: 0, target: 'self', effects: [{ kind: 'status', status: 'stealth', durationSec: 4 }, { kind: 'buff', stat: 'moveSpeed', pct: 30, durationSec: 4 }], ai: 'not_stealthed', cost: 120 }),
-  active({ id: 'assassin_shadow_execute', name: '그림자 처형', job: 'assassin', magic: 'shadow', cd: 12, mp: 43, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 12.32, bonusIfStealth: 0.5 }], ai: 'target_hp_below_30', cost: 140 }),
+  active({ id: 'assassin_shadow_execute', name: '그림자 처형', job: 'assassin', magic: 'shadow', cd: 12, mp: 43, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 14.3, bonusIfStealth: 0.5 }], ai: 'target_hp_below_30', cost: 140 }),
   // 독 암살자
   active({ id: 'assassin_poison_blade', name: '독칼', job: 'assassin', cd: 9, mp: 26, range: MELEE, target: 'enemy', effects: [{ kind: 'damage', school: 'phys', coef: 6.76 }, { kind: 'status', status: 'poison', durationSec: 6, value: 24 }], cost: 120 }),
   active({ id: 'assassin_poison_cloud', name: '독안개', job: 'assassin', cd: 10, mp: 43, range: 3, target: 'enemy_area', radius: 3, effects: [{ kind: 'damage', school: 'phys', coef: 6.81 }, { kind: 'status', status: 'poison', durationSec: 5, value: 20 }], cost: 120, telegraph: TG, linger: { durationSec: 4, dpsCoef: 2.1, status: { status: 'poison', durationSec: 2, value: 16 } }, lingerNoun: '독안개' }),

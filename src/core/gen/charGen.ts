@@ -10,7 +10,7 @@ import { JOBS } from '../data/jobs';
 import { getSkill, skillPoolFor } from '../data/skills';
 import { autoSynergies } from '../data/synergies';
 import { clampStat, powerRating, statTotal } from '../stats';
-import { applyEffect } from '../growth/choices';
+import { applyEffect, applySubJob } from '../growth/choices';
 
 // ───────────────────────── 이름 ─────────────────────────
 
@@ -174,6 +174,12 @@ function learnRandomFromPool(rng: Rng, c: Character): boolean {
  * 6일차에 상대가 전원 분화하는데, 분화는 전투력 '점수'보다 실전 값어치가 커서 그 구간부터 점수 목표를
  * 한 단계 낮춰야 승률이 평평해진다 (그래서 5일차 목표가 6일차보다 높다). 이 형태는 v0.6 에서도 유지했다.
  *
+ * ★ v0.7 재측정 (2026-09-17, 맵 28×20 · HP_SCALE 1.12 · 눈보라 · 전장 붕괴 도입 후) ★
+ * 같은 탐욕 정책 40시드 400판: 승률 52.2% (v0.6 표 그대로, 붕괴 후 종료 35/400). HP 배율은 양 팀에 똑같이 곱해지고
+ * 맵 축소는 양 팀의 접전 시점을 똑같이 앞당기므로 표를 손대지 않았다. 45~55% 를 벗어나면 이 표만 ±1% 씩 조정한다 (1% ≈ 승률 2.5~3%p).
+ * (v0.7 보정 2차: 붕괴 후 종료 비율 때문에 HP_SCALE 1.12 → 1.05. 역시 양 팀 비례 배율이라 이 표는 그대로 둔다.
+ *  시드 1·4242·9001 300판씩: A 승률 47.3 / 46.3 / 47.0%.)
+ *
  * 목표(GDD §11): 10일차 생성 상대 대비 플레이어 승률 45~55%, 4:4 전투 평균 60~120초.
  * 이 표는 팀 합계 척도라 TEAM_SIZE 가 바뀌면 반드시 다시 측정한다. generateOpponentTeam 의 fitTeamPower 가
  * 이 값에 맞춰 스탯을 가감하므로 이 표만 고치면 상대 강도 곡선 전체가 바뀐다.
@@ -238,7 +244,7 @@ function fitTeamPower(team: Team, target: number): void {
 /**
  * 일차에 맞게 스케일링된 4:4 상대팀 (GDD §7.6 1단계). 인원은 정확히 TEAM_SIZE 명.
  * - day ≥ 3: 탱커 또는 힐러 1명 이상. 같은 직업 최대 2명.
- * - day ≥ 6: 전원 세부 직업 분화 (statBonus + grantedSkills)
+ * - day ≥ 6: 전원 세부 직업 분화 (applySubJob: statBonus + adaptationBonus + grantedSkills)
  * - floor(day/4) 개의 추가 스킬, 맵 적응도 소폭 훈련, 자동 시너지
  * - 마지막에 fitTeamPower 로 팀 전투력을 opponentPowerTarget(day) 에 맞춘다.
  *   (스킬·분화로 얻은 전투력만큼 스탯이 줄어드므로, 강도 곡선은 위 표 하나로 결정된다)
@@ -273,13 +279,13 @@ export function generateOpponentTeam(rng: Rng, day: number, map: MapType, idPref
     }
   }
 
-  // 세부 직업 분화 (day ≥ 6)
+  // 세부 직업 분화 (day ≥ 6). 플레이어 선택지와 같은 applySubJob 경로 (statBonus + adaptationBonus + grantedSkills)
   if (day >= 6) {
     for (const c of members) {
       const subs = JOBS[c.mainJob].subJobs;
       if (subs.length === 0) continue;
       const sub = rng.pick(subs);
-      applyEffect(team, { kind: 'set_subjob', charId: c.id, subJob: sub.id });
+      applySubJob(c, sub.id);
     }
   }
 

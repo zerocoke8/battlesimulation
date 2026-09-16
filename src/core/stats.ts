@@ -52,12 +52,22 @@ export const COOLDOWN_REDUCTION_CAP = 40;
 export const BASIC_ATTACK_SPEED_BASE = 0.6;
 
 /**
- * 최대 HP 공식 상수: HP_BASE + 체력² × HP_VIT_SQ + 직업 보정 × 3.
+ * 최대 HP 공식 상수: (HP_BASE + 체력² × HP_VIT_SQ + 직업 보정 × 3) × HP_SCALE.
  * v0.5: 900 + 체력² × 0.8. v0.6: 600 + 체력² × 0.95 — 체력 45(1일차)에서는 거의 같고(2520 → 2524), 체력 60~70(10일차)에서는 6~9% 높다.
  * 스킬 위력을 올린 뒤 1일차 전투가 10일차보다 길어지는 문제를, 성장한 팀의 HP 만 더 늘리는 방식으로 풀었다 (1일차 < 10일차 목표).
+ * v0.7: 맵이 40×30 → 28×20 으로 줄어 접전이 빨리 붙으면서 4:4 평균 전투 시간이 목표 하한(60초) 근처로 내려갔다
+ * (10일차 평원 52~64초, 빙하 50~55초, 1일차 58초). 스킬 계수를 깎지 않고 HP 전체에 HP_SCALE 을 곱해 되돌린다.
+ * 체력² 형태(고정항 ↑ / 제곱항 ↓)를 바꾸는 방식은 체력이 낮은 다수 유닛(8기 떼 몬스터)에 유리하고 1기 보스에 불리해
+ * 몬스터 인원 구간 편차(±8%p)를 깨뜨리므로, 비례 배율만 쓴다 (플레이어·상대·몬스터 모두 같은 배율).
+ * v0.7 보정 2차: 1.12 에서는 탱커·힐러가 많은 편성(지원 4~5명, 탱커 3명)이 120초를 넘겨 전장 붕괴로 끝나는 비율이
+ * 시드 풀링 15.7% (시드 77 10일차 19.5%) 로 목표(< 15%)를 넘었다. 사막 지구력·이동속도, 힐 계수·쿨타임은 측정상 효과가 없었고
+ * (피로는 공·방을 같이 깎는다), HP 배율만이 붕괴 종료 비율을 움직였다 → 1.05 (시드 1·4242·9001 풀링 13.6%, 평균 전투 시간 67~72초,
+ * 1일차 64초, 스킬 비중 64~66%, 눈보라 비중 12~16%, 몬스터 승률은 양 팀 비례라 변화 없음).
  */
 export const HP_BASE = 600;
 export const HP_VIT_SQ = 0.95;
+/** 최대 HP 전체 배율 (v0.7). 1.0 = v0.6 값. 전투 시간·붕괴 종료 비율 보정 전용 — 승률·비중에는 거의 영향이 없다 */
+export const HP_SCALE = 1.05;
 
 /** 맵 보정이 곱해지는 파생 수치 */
 const MAP_SCALED: readonly DerivedStatKey[] = ['maxHp', 'physAtk', 'magAtk', 'physDef', 'magDef', 'atkSpeed', 'moveSpeed'];
@@ -105,7 +115,7 @@ export function computeDerived(c: Character, map: MapType, pctMods?: Partial<Rec
     // 고정항 300 → 900: 체력이 낮은 편성(하급 몬스터, 초반 4:4)의 전투가 목표 하한 40초를 크게 밑돌았다.
     // 고정항은 양 팀에 똑같이 더해지므로 승률은 그대로 두고 짧은 쪽 꼬리만 끌어올린다.
     // 체력 40 ≈ 2180, 체력 55 ≈ 3320 (+직업 보정 × 3).
-    maxHp: (HP_BASE + vitality * vitality * HP_VIT_SQ + hpBonus * 3) * mapMod,
+    maxHp: (HP_BASE + vitality * vitality * HP_VIT_SQ + hpBonus * 3) * HP_SCALE * mapMod,
     physAtk: (strength * 1.0 + mastery * 0.3) * mapMod,
     magAtk: (magicPower * 1.0 + mastery * 0.3) * mapMod,
     physDef: (defenseTech * 0.8 + vitality * 0.2) * mapMod,

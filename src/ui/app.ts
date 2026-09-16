@@ -16,6 +16,7 @@ import {
   MAX_PASSIVE_SKILLS,
   MONSTER_TIER_NAME_KO,
   MONSTER_TIER_ORDER,
+  RENDER_MODE_NAME_KO,
   STAT_CATEGORY_NAME_KO,
   STAT_MAX,
   STAT_NAME_KO,
@@ -24,6 +25,7 @@ import {
   TEAM_SIZE,
   TICK_RATE,
   TOTAL_DAYS,
+  type RenderMode,
   type BaseStatKey,
   type BattleEvent,
   type BattleFrame,
@@ -72,7 +74,10 @@ import {
   teamPower,
   trainStat,
 } from '../core/growth/run';
-import { BattleRenderer, monsterTiersOfInput } from './render';
+import { BattleRenderer, monsterTiersOfInput, type IBattleRenderer } from './render';
+import { PixelRenderer } from './pixel/pixelRenderer';
+import { preloadSprites, resolveSheet } from './pixel/loader';
+import { SUMMON_KINDS, spriteKeyForSummon, spriteKeyForUnit } from './pixel/spriteTypes';
 import * as storage from './storage';
 import {
   MONSTER_TIER_COLOR,
@@ -84,9 +89,11 @@ import {
   composition,
   monsterDifficultyKo,
   fmtNum,
+  fmtRate,
   fmtSec,
   fmtSigned,
   h,
+  schoolKo,
   jobLabel,
   phaseKo,
   rarityColor,
@@ -131,7 +138,12 @@ interface BattleSession {
   acc: number;
   lastTs: number;
   raf: number;
-  renderer: BattleRenderer | null;
+  /** 현재 렌더러 (도트/간단). 캔버스가 DOM 에 붙은 뒤 만들어진다 */
+  renderer: IBattleRenderer | null;
+  /** 현재 렌더 모드. 전환 시 같은 캔버스에 다른 렌더러를 붙인다 */
+  renderMode: RenderMode;
+  canvas: HTMLCanvasElement | null;
+  wrap: HTMLElement | null;
   frame: BattleFrame;
   /** 킬 로그 줄 (HTML). kill = 격파·점령·종료, skill = '이름: 스킬명!' (최근 KILL_LOG_SKILL_MAX 개만 유지) */
   killLog: KillLogLine[];
@@ -145,9 +157,17 @@ interface BattleSession {
     capture: HTMLElement | null;
     capA: HTMLElement | null;
     capB: HTMLElement | null;
+    /** 전장 붕괴 DOM 배너 (ATTRITION_START_SEC 이후 표시) */
+    attrition: HTMLElement | null;
     speedBtns: HTMLButtonElement[];
     pauseBtn: HTMLButtonElement | null;
+    modeBtn: HTMLButtonElement | null;
   };
+}
+
+/** 빈 HUD 참조 (전투 세션 생성 시) */
+function emptyHud(): BattleSession['hud'] {
+  return { time: null, hpA: null, hpB: null, hpAText: null, hpBText: null, kills: null, capture: null, capA: null, capB: null, attrition: null, speedBtns: [], pauseBtn: null, modeBtn: null };
 }
 
 interface LastResult {
@@ -966,12 +986,11 @@ function mapTraits(mapId: MapType): HTMLElement {
     if (mult && mult !== 1) items.push(`${schoolKo(school)} 이능 ×${mult}`);
   }
   if (m.capture) items.push(`거점 (${m.capture.x}, ${m.capture.y}) 반경 ${m.capture.radius} · ${m.capture.secondsToCapture}초 점유`);
+  for (const hz of m.hazards ?? []) {
+    items.push(`기믹: ${hz.name} — ${hz.startSec}초부터 ${hz.intervalSec}초 간격, 반경 ${hz.radius}, 최대 HP ${hz.damagePctMaxHp}%${hz.linger ? ` + 장판 ${hz.linger.durationSec}초` : ''}`);
+  }
+  items.push('120초부터 전장 붕괴 (초당 최대 HP 감소, 가속)');
   return h('div', { class: 'chips' }, items.map((t) => h('span', { class: 'chip' }, t)));
-}
-
-function schoolKo(s: string): string {
-  const m: Record<string, string> = { fire: '화염', lightning: '전기', ice: '냉기', holy: '신성', nature: '자연', shadow: '암흑', none: '무속성' };
-  return m[s] ?? s;
 }
 
 function historyStrip(state: RunState): HTMLElement | null {
@@ -996,6 +1015,7 @@ function historyStrip(state: RunState): HTMLElement | null {
 function startBattle(input: BattleInput, mode: BattleMode, title: string): void {
   stopBattleLoop();
   const sim = createBattle(input);
+  const frame = sim.currentFrame();
   battle = {
     mode,
     sim,
@@ -1007,17 +1027,78 @@ function startBattle(input: BattleInput, mode: BattleMode, title: string): void 
     lastTs: 0,
     raf: 0,
     renderer: null,
-    frame: sim.currentFrame(),
+    renderMode: storage.loadRenderMode(),
+    canvas: null,
+    wrap: null,
+    frame,
     killLog: [],
-    hud: { time: null, hpA: null, hpB: null, hpAText: null, hpBText: null, kills: null, capture: null, capA: null, capB: null, speedBtns: [], pauseBtn: null },
+    hud: emptyHud(),
   };
+  // 도트 스프라이트 사전 적재 (양 팀 유닛 + 소환물 4종). 실패해도 코드 생성 시트로 그린다. 몬스터·완성팀 대전 포함
+  preloadSprites(spriteKeysForFrame(frame)).catch(() => undefined);
   view = 'battle';
   render();
+}
+
+/** 프레임의 유닛 스프라이트 키 + 소환물 4종 (중복 제거, 순서 고정) */
+function spriteKeysForFrame(frame: BattleFrame): string[] {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  for (const u of frame.units) {
+    const k = spriteKeyForUnit(u);
+    if (!seen.has(k)) {
+      seen.add(k);
+      keys.push(k);
+    }
+  }
+  for (const kind of SUMMON_KINDS) {
+    const k = spriteKeyForSummon(kind);
+    if (!seen.has(k)) {
+      seen.add(k);
+      keys.push(k);
+    }
+  }
+  return keys;
 }
 
 function stopBattleLoop(): void {
   if (battle && battle.raf) cancelAnimationFrame(battle.raf);
   if (battle) battle.raf = 0;
+}
+
+/** 현재 모드에 맞는 렌더러를 캔버스에 붙인다. 이전 렌더러는 버린다 (같은 프레임을 이어서 그린다) */
+function attachRenderer(b: BattleSession): void {
+  if (!b.canvas) return;
+  const map = MAPS[b.input.map];
+  const monsters = monsterTiersOfInput(b.input);
+  if (b.renderMode === 'pixel') {
+    const r = new PixelRenderer(b.canvas, map, { monsters, sprites: { resolveSheet, preload: preloadSprites } });
+    r.preloadForFrame(b.frame);
+    b.renderer = r;
+  } else {
+    b.renderer = new BattleRenderer(b.canvas, map, monsters);
+  }
+  if (b.wrap) {
+    b.wrap.classList.toggle('mode-pixel', b.renderMode === 'pixel');
+    b.wrap.classList.toggle('mode-simple', b.renderMode !== 'pixel');
+  }
+  if (b.hud.modeBtn) b.hud.modeBtn.textContent = renderModeButtonLabel(b.renderMode);
+  b.renderer.draw(b.frame);
+}
+
+/** 버튼은 '전환할 모드' 이름을 보여준다: 도트 모드일 때 '간단 모드', 간단 모드일 때 '도트 모드' */
+function renderModeButtonLabel(mode: RenderMode): string {
+  return mode === 'pixel' ? RENDER_MODE_NAME_KO.simple : RENDER_MODE_NAME_KO.pixel;
+}
+
+/** 렌더 모드 즉시 전환 (전투 중에도). 설정은 localStorage 에 저장 */
+function toggleRenderMode(): void {
+  const b = battle;
+  if (!b) return;
+  b.renderMode = b.renderMode === 'pixel' ? 'simple' : 'pixel';
+  storage.saveRenderMode(b.renderMode);
+  attachRenderer(b);
+  toast(`${RENDER_MODE_NAME_KO[b.renderMode]}로 전환했습니다.`, 1400);
 }
 
 function renderBattle(): HTMLElement {
@@ -1028,7 +1109,9 @@ function renderBattle(): HTMLElement {
   }
   const map = MAPS[b.input.map];
   const canvas = h('canvas', { class: 'battle-canvas', width: 800, height: 600 });
-  const wrap = h('div', { class: `canvas-wrap map-${b.input.map}` }, canvas);
+  const wrap = h('div', { class: `canvas-wrap map-${b.input.map} mode-${b.renderMode}` }, canvas);
+  b.canvas = canvas;
+  b.wrap = wrap;
 
   const hpA = h('div', { class: 'fill side-A', style: 'width:100%' });
   const hpB = h('div', { class: 'fill side-B', style: 'width:100%' });
@@ -1045,14 +1128,17 @@ function renderBattle(): HTMLElement {
         h('div', { class: 'bar' }, capB),
       )
     : null;
+  // 전장 붕괴 배너 (DOM). 120초 전에는 숨긴다. 캔버스 안에도 같은 배너가 그려진다
+  const attrition = h('div', { class: 'attrition-banner', hidden: true }, '');
 
   const speedBtns: HTMLButtonElement[] = [1, 2, 4].map((sp) =>
     h('button', { class: `btn small ${b.speed === sp ? 'primary' : ''}`, onclick: () => setSpeed(sp) }, `${sp}x`),
   );
   const pauseBtn = h('button', { class: 'btn small', onclick: () => togglePause() }, b.paused ? '재생' : '일시정지');
   const skipBtn = h('button', { class: 'btn small warn', onclick: () => skipBattle() }, '스킵');
+  const modeBtn = h('button', { class: 'btn small ghost mode-btn', title: '렌더 모드 전환 (도트 / 간단)', onclick: () => toggleRenderMode() }, renderModeButtonLabel(b.renderMode));
 
-  b.hud = { time, hpA, hpB, hpAText, hpBText, kills, capture, capA, capB, speedBtns, pauseBtn };
+  b.hud = { time, hpA, hpB, hpAText, hpBText, kills, capture, capA, capB, attrition, speedBtns, pauseBtn, modeBtn };
 
   const dayLabel = b.mode !== 'pvp' && run ? `${run.day}일차 ${b.mode === 'monster' ? '3스텝 몬스터 전투' : `5스텝 ${VS_LABEL} 전투`}` : '완성 팀 대전';
 
@@ -1068,17 +1154,17 @@ function renderBattle(): HTMLElement {
       h('div', { class: 'battle-mid' }, h('div', { class: 'small muted' }, map.name), time),
       h('div', { class: 'team-hp side-B' }, h('div', { class: 'row between' }, hpBText, h('strong', null, b.input.teamB.name)), h('div', { class: 'bar rtl' }, hpB)),
     ),
+    attrition,
     wrap,
     capture,
-    h('div', { class: 'controls' }, ...speedBtns, pauseBtn, skipBtn),
+    h('div', { class: 'controls' }, ...speedBtns, pauseBtn, skipBtn, modeBtn),
     h('div', { class: 'card kill-card' }, h('div', { class: 'card-title' }, '킬 로그'), kills),
   );
 
   // 캔버스가 DOM 에 붙은 뒤 렌더러 생성 및 루프 시작
   requestAnimationFrame(() => {
     if (!battle || battle !== b) return;
-    b.renderer = new BattleRenderer(canvas, map, monsterTiersOfInput(b.input));
-    b.renderer.draw(b.frame);
+    attachRenderer(b);
     updateHud(b, b.frame);
     b.lastTs = performance.now();
     b.raf = requestAnimationFrame(loop);
@@ -1170,6 +1256,9 @@ function handleEvents(b: BattleSession, events: BattleEvent[], frame: BattleFram
     } else if (e.kind === 'capture' && e.progress >= 1) {
       pushKillLog(b, 'kill', `[${fmtSec(e.t)}] ${e.side === 'A' ? b.input.teamA.name : b.input.teamB.name} 거점 점령!`);
       touched = true;
+    } else if (e.kind === 'attrition_start') {
+      pushKillLog(b, 'kill', `[${fmtSec(e.t)}] <span class="attrition-text">전장 붕괴 시작</span> — 모든 유닛이 초당 최대 HP 를 잃습니다`);
+      touched = true;
     } else if (e.kind === 'end') {
       pushKillLog(b, 'kill', `[${fmtSec(e.t)}] 전투 종료 — ${e.winner === 'draw' ? '무승부' : `${winnerLabel(b.input, e.winner)} 승리`} (${reasonKo(e.reason)})`);
       touched = true;
@@ -1215,6 +1304,16 @@ function updateHud(b: BattleSession, frame: BattleFrame): void {
   if (frame.capture) {
     if (hud.capA) hud.capA.style.width = `${(Math.min(1, frame.capture.progressA) * 100).toFixed(1)}%`;
     if (hud.capB) hud.capB.style.width = `${(Math.min(1, frame.capture.progressB) * 100).toFixed(1)}%`;
+  }
+  // 전장 붕괴 배너: ATTRITION_START_SEC 이후 현재 초당 감소율
+  const attr = frame.attritionPctPerSec ?? 0;
+  if (hud.attrition) {
+    if (attr > 0) {
+      hud.attrition.hidden = false;
+      hud.attrition.textContent = `전장 붕괴 — 모든 유닛이 초당 최대 HP 의 ${fmtRate(attr)} 를 잃습니다`;
+    } else {
+      hud.attrition.hidden = true;
+    }
   }
 }
 
@@ -1699,7 +1798,7 @@ function renderPvpSetup(): HTMLElement {
 // ───────────────────────── 부트 ─────────────────────────
 
 window.addEventListener('resize', () => {
-  if (battle && battle.renderer) battle.renderer.draw(battle.frame);
+  if (battle && battle.renderer) battle.renderer.resize();
 });
 
 document.addEventListener('visibilitychange', () => {

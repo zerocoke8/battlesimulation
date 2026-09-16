@@ -6,6 +6,10 @@
  *  - 모든 메인 직업의 기본 풀(skillPool)에는 적 광역 피해 스킬이 최소 1개 있다 (검사 회전 베기, 탱커 충격파, 버서커 대지 강타,
  *    암살자 연막 단검, 궁수 화살비, 저격수 폭발탄, 마법사 마력 폭발·비전 폭풍·메테오, 소환사 정령 폭발, 힐러 심판의 빛).
  *  - 마법사 starterSkills 는 둘 다 광역이다. 기본 풀 5~7개, 세부 직업 풀 2~4개를 유지한다.
+ *
+ * v0.7: SubJobDef.adaptationBonus (맵 적응도 가산). 지금은 mage_ice { glacier: 25 } 만 쓴다.
+ *  분화 적용(statBonus + adaptationBonus + grantedSkills)은 growth/choices.ts 의 applySubJob 하나로만 한다
+ *  (플레이어 선택지·생성 상대팀·몬스터 어느 경로든). 이 파일은 skills.ts 가 import 하므로 스킬 슬롯 규칙을 여기 둘 수 없다.
  */
 import type { BaseStatKey, JobDef, MainJob, SubJobDef, SubJobId } from '../types';
 import { MAIN_JOBS } from '../types';
@@ -219,11 +223,13 @@ const MAGE_SUBJOBS: SubJobDef[] = [
   {
     id: 'mage_ice',
     name: '냉기 마법사',
-    desc: '둔화와 빙결로 전장을 얼린다. 침착과 저항이 오른다.',
+    desc: '둔화와 빙결로 전장을 얼린다. 침착과 저항이 오르고 빙하에 익숙해진다.',
     statBonus: { composure: 8, resistance: 8, magicPower: 4 },
     growthMod: { composure: 1.2, resistance: 1.2, magicPower: 1.1 },
     grantedSkills: ['mage_ice_shard'],
     skillPool: ['mage_ice_nova', 'mage_ice_blizzard'],
+    // v0.7: 분화 시 빙하 적응도 +25 (상한 100). 눈보라 피해 배율(hazardAdaptationMult)에 직접 반영된다.
+    adaptationBonus: { glacier: 25 },
   },
 ];
 

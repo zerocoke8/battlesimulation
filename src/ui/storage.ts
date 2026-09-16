@@ -20,16 +20,19 @@ import {
   MONSTER_TEAM_MIN,
   MONSTER_TIER_ORDER,
   TEAM_SIZE,
+  DEFAULT_RENDER_MODE,
   type Character,
   type ChoiceRarity,
   type GhostSnapshot,
   type MapType,
   type MonsterEncounter,
   type MonsterTier,
+  type RenderMode,
   type RunState,
   type Team,
 } from '../core/types';
 import { SKILLS } from '../core/data/skills';
+import { RENDER_MODE_STORAGE_KEY } from './pixel/spriteTypes';
 import { SUBJOBS, jobOfSubJob } from '../core/data/jobs';
 
 /**
@@ -363,4 +366,28 @@ export function clearAll(): void {
   remove(KEY_RUN);
   remove(KEY_GHOSTS);
   remove(KEY_TEAMS);
+}
+
+// ───────────── 렌더 모드 (v0.7) ─────────────
+
+/**
+ * 전투 화면 렌더 모드. 키 RENDER_MODE_STORAGE_KEY('bs:renderMode'), 값은 RenderMode 문자열 그대로 (봉투 없음).
+ * 없거나 이상하면 DEFAULT_RENDER_MODE('pixel').
+ */
+export function loadRenderMode(): RenderMode {
+  try {
+    const raw = localStorage.getItem(RENDER_MODE_STORAGE_KEY);
+    if (raw === 'pixel' || raw === 'simple') return raw;
+  } catch {
+    /* 무시 */
+  }
+  return DEFAULT_RENDER_MODE;
+}
+
+export function saveRenderMode(mode: RenderMode): void {
+  try {
+    localStorage.setItem(RENDER_MODE_STORAGE_KEY, mode);
+  } catch {
+    /* 무시 */
+  }
 }

@@ -1,5 +1,6 @@
 /**
- * 헤드리스 대량 시뮬레이션 / 밸런싱 CLI (v0.6 — 4:4, 몬스터 1~8인, 광역 예고·회피·장판, 스킬 피해 비중).
+ * 헤드리스 대량 시뮬레이션 / 밸런싱 CLI (v0.7 — 4:4, 몬스터 1~8인, 광역 예고·회피·장판, 스킬 피해 비중,
+ * 맵 기믹(눈보라) 피해 비중, 전장 붕괴 발동·종료 비율, 몬스터 맵별 승률).
  *
  *   npm run headless -- --games 200 --seed 1 [--map plains] [--day 5] [--json]
  *   npm run headless -- --skills [--games 200] [--seed 1] [--day 10] [--json]
@@ -33,6 +34,8 @@ import {
   TICK_DT,
   DEFAULT_TELEGRAPH_SEC,
   SHORT_TELEGRAPH_SEC,
+  ATTRITION_START_SEC,
+  HAZARD_CASTER_ID,
   TOTAL_DAYS,
   STEPS_PER_DAY,
   CHOICE_STEPS,
@@ -58,6 +61,7 @@ import {
   type Choice,
   type ChoiceKind,
   type ChoiceRarity,
+  type HazardDef,
   type MainJob,
   type MapType,
   type MonsterEncounter,
@@ -68,6 +72,7 @@ import {
   type Team,
   type TeamSide,
   type UnitSnapshot,
+  type ZoneSide,
   type ZoneSnapshot,
 } from '../src/core/types';
 import { Rng, hashSeed } from '../src/core/rng';
@@ -77,6 +82,7 @@ import { generateOpponentTeam } from '../src/core/gen/charGen';
 import { computeDerived, powerRating, statTotal } from '../src/core/stats';
 import { SKILLS, UTILITY_SKILL_IDS, skillPoolFor } from '../src/core/data/skills';
 import { JOBS } from '../src/core/data/jobs';
+import { HAZARD_BLIZZARD, MAPS } from '../src/core/data/maps';
 
 // ───────────────────────── 모듈 어댑터 ─────────────────────────
 //
@@ -444,7 +450,8 @@ function printHelp(): void {
       '',
       '사용법: npm run headless -- [옵션]',
       '',
-      '  --games N        시뮬레이션 판 수 (기본 100, 기본 모드). 광역·회피 통계, 스킬 피해 비중, 주력기 1회 피해 표도 함께 집계',
+      '  --games N        시뮬레이션 판 수 (기본 100, 기본 모드). 광역·회피 통계, 스킬 피해 비중, 주력기 1회 피해 표,',
+      '                   맵별 기믹(눈보라) 피해 비중·전장 붕괴 발동/종료 비율·빙하 전투 시간 비율도 함께 집계',
       '  --skills         --games N 판을 돌려 스킬 피해 비중·주력기 표를 스킬별 전체 목록으로 뽑고, 직업별 기본 풀에 광역 피해 스킬이 있는지 검사 (PASS/FAIL)',
       '  --seed S         루트 시드 (기본 1)',
       '  --map M          plains | dark | desert | glacier | random (기본 random)',
@@ -453,7 +460,7 @@ function printHelp(): void {
       '  --policy P       육성 자동 정책 greedy | first | random (기본 greedy)',
       '  --determinism    같은 입력으로 전투를 두 번 돌려 틱별 프레임 해시(영역 포함)를 비교',
       '  --growth         10일 × 5스텝 육성을 헤드리스로 진행하고 분화 보장을 검증',
-      '  --monster        일차별로 하급/중급/고급을 모두 싸워 승률표를 뽑는다 (난이도·인원 보정용)',
+      '  --monster        일차별로 하급/중급/고급을 모두 싸워 승률표를 뽑는다 (난이도·인원·맵별(빙하 ±10%p) 보정용)',
       '  --rarity         선택지 등급 분포와 등급별 예상 전투력 상승치를 집계',
       '  --dodge          광역 예고 회피율 측정 (판단력 80·민첩 70 vs 판단력 30·민첩 30)',
       `  --trials N       --dodge 유닛당 판정 횟수 (기본 ${DEFAULT_DODGE_TRIALS})`,
@@ -561,7 +568,7 @@ function deepClone<T>(v: T): T {
 
 // ───────────────────────── 프레임 해시 ─────────────────────────
 
-/** 프레임 전체(유닛·이벤트·영역·거점)를 직렬화해 FNV-1a 32비트 해시. 결정론 검증용. */
+/** 프레임 전체(유닛·이벤트·영역·거점·붕괴율)를 직렬화해 FNV-1a 32비트 해시. 결정론 검증용. */
 function hashFrame(frame: BattleFrame): number {
   const payload = JSON.stringify({
     tick: frame.tick,
@@ -570,15 +577,58 @@ function hashFrame(frame: BattleFrame): number {
     events: frame.events,
     zones: frame.zones ?? [],
     capture: frame.capture,
+    attritionPctPerSec: frame.attritionPctPerSec ?? 0,
     finished: frame.finished,
   });
   return hashSeed(payload);
 }
 
+// ───────────────────────── 맵 기믹(hazard) 조회 — v0.7 [2] ─────────────────────────
+
+/** 맵 정의의 기믹 목록. 구버전 maps.ts(hazards 없음)도 안전하게 빈 배열로 본다 */
+function hazardsOfMap(map: MapType): readonly HazardDef[] {
+  const def = MAPS[map];
+  return def && Array.isArray(def.hazards) ? def.hazards : [];
+}
+
+/** 이 맵의 기믹 id 인지 */
+function hazardDefOf(map: MapType, id: string): HazardDef | null {
+  for (const h of hazardsOfMap(map)) if (h.id === id) return h;
+  return null;
+}
+
+/**
+ * 기믹 영역인지. sim 계약(types.ts): side 'neutral', casterId 'map', skillId = HazardDef.id.
+ * 스냅샷에는 casterId 가 없으므로 side 와 skillId(맵 기믹 정의 / 'hazard_' 접두)로 판별한다.
+ */
+function isHazardZone(z: ZoneSnapshot, map: MapType): boolean {
+  if (z.side === 'neutral') return true;
+  if (hazardDefOf(map, z.skillId)) return true;
+  return z.skillId.startsWith('hazard_');
+}
+
+/** 기믹 id 인지 (이벤트의 skillId / hazardId 판별용) */
+function isHazardId(id: string, map: MapType): boolean {
+  return hazardDefOf(map, id) !== null || id.startsWith('hazard_');
+}
+
+/** 결과에 붕괴 시작 이벤트가 있거나(계약) 전투 시간이 붕괴 시작 시각에 닿았으면 '붕괴 발동' */
+function attritionStartedOf(result: BattleResult): boolean {
+  for (const ev of result.events) if (ev.kind === 'attrition_start') return true;
+  return result.durationSec >= ATTRITION_START_SEC;
+}
+
+/** 붕괴 시작 후 종료. sim 이 endedInAttrition 을 채우면 그 값, 아니면 전투 시간으로 추정 */
+function endedInAttritionOf(result: BattleResult): boolean {
+  const v = (result as { endedInAttrition?: unknown }).endedInAttrition;
+  if (typeof v === 'boolean') return v;
+  return result.durationSec > ATTRITION_START_SEC;
+}
+
 // ───────────────────────── 광역 영역(Zone) 기하 ─────────────────────────
 
-/** 시전자 쪽이 아닌, 피해를 받는 쪽인지 */
-function isEnemyOf(side: TeamSide, unit: UnitSnapshot): boolean {
+/** 시전자 쪽이 아닌, 피해를 받는 쪽인지. 'neutral'(맵 기믹) 영역은 양 팀 모두 대상 */
+function isEnemyOf(side: ZoneSide, unit: UnitSnapshot): boolean {
   return unit.side !== side;
 }
 
@@ -658,10 +708,26 @@ interface ZoneStats {
   dodgedEscaped: number;
   /** 인지(dodge 이벤트)했지만 impact 때 아직 영역 안이라 맞은 수 (이동속도 부족, 탈출점이 다른 영역 안, 밀림 등) */
   dodgedHit: number;
+  // ── (v0.7) 맵 기믹 영역. 위 스킬 통계에는 넣지 않고 따로 센다 (양 팀 모두 대상) ──
+  /** 기믹 'zone' 이벤트 수 (from = 'map') */
+  hazardZoneEvents: number;
+  /** 프레임에 새로 나타난 기믹 영역 수 */
+  hazardZones: number;
+  /** 기믹 예고 시작 시 영역 안에 있던, 회피 판정 가능한 유닛 수 (양 팀) */
+  hazardDodgeAttempts: number;
+  /** 기믹 'dodge' 이벤트 수 */
+  hazardDodgeEvents: number;
+  /** 기믹 예고 시작 시 안에 있었고 impact 때 살아 있던 유닛 수 */
+  hazardExposed: number;
+  /** 그중 impact 때 영역 밖 */
+  hazardAvoided: number;
 }
 
 function emptyZoneStats(): ZoneStats {
-  return { zoneEvents: 0, damageZones: 0, dodgeAttempts: 0, dodgeEvents: 0, impactExposed: 0, impactAvoided: 0, dodgedEscaped: 0, dodgedHit: 0 };
+  return {
+    zoneEvents: 0, damageZones: 0, dodgeAttempts: 0, dodgeEvents: 0, impactExposed: 0, impactAvoided: 0, dodgedEscaped: 0, dodgedHit: 0,
+    hazardZoneEvents: 0, hazardZones: 0, hazardDodgeAttempts: 0, hazardDodgeEvents: 0, hazardExposed: 0, hazardAvoided: 0,
+  };
 }
 
 function addZoneStats(into: ZoneStats, s: ZoneStats): void {
@@ -673,11 +739,19 @@ function addZoneStats(into: ZoneStats, s: ZoneStats): void {
   into.impactAvoided += s.impactAvoided;
   into.dodgedEscaped += s.dodgedEscaped;
   into.dodgedHit += s.dodgedHit;
+  into.hazardZoneEvents += s.hazardZoneEvents;
+  into.hazardZones += s.hazardZones;
+  into.hazardDodgeAttempts += s.hazardDodgeAttempts;
+  into.hazardDodgeEvents += s.hazardDodgeEvents;
+  into.hazardExposed += s.hazardExposed;
+  into.hazardAvoided += s.hazardAvoided;
 }
 
 interface TrackedZone {
   snapshot: ZoneSnapshot;
   def: SkillDef | null;
+  /** 맵 기믹 영역이면 true (스킬 통계와 분리해 센다) */
+  hazard: boolean;
   /** 예고 시작 시 영역 안에 있던 적 유닛 id (배열 순서 = 프레임 순서) */
   insideAtStart: string[];
   /** 그중 예고 시작 틱에 이 스킬의 dodge 이벤트를 받은 유닛 id (인지) */
@@ -688,6 +762,10 @@ interface TrackedBattle {
   result: BattleResult;
   zones: ZoneStats;
   damage: DamageStats;
+  /** (v0.7) 전장 붕괴가 발동했는지 (attrition_start 이벤트 또는 전투 시간 ≥ 120초) */
+  attritionStarted: boolean;
+  /** (v0.7) 붕괴 시작 후 끝났는지 (BattleResult.endedInAttrition) */
+  endedInAttrition: boolean;
 }
 
 // ───────────────────────── 피해 출처 분류 (스킬 vs 기본 공격) — v0.6 [3] ─────────────────────────
@@ -696,9 +774,23 @@ interface TrackedBattle {
 //  - 'attack' 에 skillId 가 있으면 스킬 피해 효과(즉시 또는 광역 impact), 없으면 기본 공격 (시전자 스냅샷의 job 이 'summon' 이면 소환물).
 //  - 'zone_damage' = 장판 한 틱의 피해 (skillId 포함). 'dot' = 화상·중독 한 틱. 'reflect' = 반사.
 // 그래서 추정 규칙 없이 이벤트만 더한다. 전체 피해 = Σ unitStats.damageTaken (양 팀).
-// 스킬 피해 비중 = (전체 − 캐릭터 기본 공격 − 소환물 기본 공격) / 전체.
+// 스킬 피해 비중 = (전체 − 캐릭터 기본 공격 − 소환물 기본 공격 − 기믹 − 붕괴) / 전체.
 // 분류 합과 전체의 차이('미분류')는 attack/reflect 이벤트 피해량의 반올림(이벤트당 ±0.5)뿐이다.
 // 화상·중독은 어느 스킬이 걸었는지 이벤트에 없어(상태에 skillId 가 없다) 전체 비중에는 들어가지만 스킬별 합에는 들어가지 않는다.
+// (v0.7) 'hazard_damage' = 맵 기믹(눈보라) impact/장판 피해, 'attrition' = 전장 붕괴 틱 피해. 둘 다 damageTaken 에 포함되므로
+// 전체에서 빼서 스킬 비중을 구하고, 각각의 비중(기믹 8~20%, 붕괴)을 따로 표시한다.
+// 구버전 sim 이 기믹 피해를 from = 'map' 인 'attack'/'zone_damage' 로 내면 그것도 기믹으로 분류한다 (기본 공격·장판에 섞이지 않게).
+
+/** 기믹 1종의 집계 (v0.7). impact 는 대상당 1회, 장판은 틱 단위 */
+interface HazardDamageAgg {
+  hazardId: string;
+  /** impact 피격 수 (hazard_damage phase 'impact' 또는 from='map' attack) */
+  impactHits: number;
+  impactDamage: number;
+  /** Σ (impact 피해 / 그 순간 대상 최대 HP) — impactHits 로 나누면 평균 % (눈보라 기준 HAZARD_BLIZZARD.damagePctMaxHp × 적응 배율) */
+  impactPctSum: number;
+  lingerDamage: number;
+}
 
 interface SkillDamageAgg {
   skillId: string;
@@ -734,12 +826,24 @@ interface DamageStats {
   dot: number;
   /** 반사 reflect 이벤트 피해 */
   other: number;
+  /** (v0.7) 맵 기믹 피해 합 (impact + 장판) */
+  hazard: number;
+  hazardImpact: number;
+  hazardLinger: number;
+  /** (v0.7) 전장 붕괴 틱 피해 합 */
+  attrition: number;
   /** 스킬 id → 집계 (등장 순서 고정) */
   perSkill: Map<string, SkillDamageAgg>;
+  /** (v0.7) 기믹 id → 집계 (등장 순서 고정) */
+  perHazard: Map<string, HazardDamageAgg>;
 }
 
 function emptyDamageStats(): DamageStats {
-  return { total: 0, basic: 0, basicHits: 0, summon: 0, skillDirect: 0, linger: 0, dot: 0, other: 0, perSkill: new Map() };
+  return {
+    total: 0, basic: 0, basicHits: 0, summon: 0, skillDirect: 0, linger: 0, dot: 0, other: 0,
+    hazard: 0, hazardImpact: 0, hazardLinger: 0, attrition: 0,
+    perSkill: new Map(), perHazard: new Map(),
+  };
 }
 
 function skillAggOf(stats: DamageStats, skillId: string): SkillDamageAgg {
@@ -751,6 +855,33 @@ function skillAggOf(stats: DamageStats, skillId: string): SkillDamageAgg {
   return a;
 }
 
+function hazardAggOf(stats: DamageStats, hazardId: string): HazardDamageAgg {
+  let a = stats.perHazard.get(hazardId);
+  if (!a) {
+    a = { hazardId, impactHits: 0, impactDamage: 0, impactPctSum: 0, lingerDamage: 0 };
+    stats.perHazard.set(hazardId, a);
+  }
+  return a;
+}
+
+/** 기믹 impact 피해 1건을 더한다 (hazard_damage 'impact' 또는 from='map' attack) */
+function addHazardImpact(stats: DamageStats, hazardId: string, damage: number, victim: UnitSnapshot | undefined): void {
+  const agg = hazardAggOf(stats, hazardId);
+  agg.impactHits++;
+  agg.impactDamage += damage;
+  if (victim && victim.maxHp > 0) agg.impactPctSum += damage / victim.maxHp;
+  stats.hazardImpact += damage;
+  stats.hazard += damage;
+}
+
+/** 기믹 장판 틱 피해 1건을 더한다 (hazard_damage 'linger' 또는 from='map' zone_damage) */
+function addHazardLinger(stats: DamageStats, hazardId: string, damage: number): void {
+  if (damage <= 0) return;
+  hazardAggOf(stats, hazardId).lingerDamage += damage;
+  stats.hazardLinger += damage;
+  stats.hazard += damage;
+}
+
 function addDamageStats(into: DamageStats, s: DamageStats): void {
   into.total += s.total;
   into.basic += s.basic;
@@ -760,6 +891,17 @@ function addDamageStats(into: DamageStats, s: DamageStats): void {
   into.linger += s.linger;
   into.dot += s.dot;
   into.other += s.other;
+  into.hazard += s.hazard;
+  into.hazardImpact += s.hazardImpact;
+  into.hazardLinger += s.hazardLinger;
+  into.attrition += s.attrition;
+  for (const [id, a] of s.perHazard) {
+    const t = hazardAggOf(into, id);
+    t.impactHits += a.impactHits;
+    t.impactDamage += a.impactDamage;
+    t.impactPctSum += a.impactPctSum;
+    t.lingerDamage += a.lingerDamage;
+  }
   for (const [id, a] of s.perSkill) {
     const t = skillAggOf(into, id);
     t.uses += a.uses;
@@ -793,6 +935,7 @@ function isDamageSkill(def: SkillDef): boolean {
 
 /**
  * 한 틱(프레임)의 이벤트를 출처별로 나눠 stats 에 더한다. sim 이 출처를 이벤트에 실어 주므로 추정 없이 합산만 한다.
+ * (v0.7) 'hazard_damage' → 기믹, 'attrition' → 붕괴. from 이 'map' 인 attack/zone_damage 도 기믹으로 본다.
  */
 function attributeFrameDamage(f: BattleFrame, stats: DamageStats): void {
   const events = f.events;
@@ -803,9 +946,22 @@ function attributeFrameDamage(f: BattleFrame, stats: DamageStats): void {
   for (const ev of events) {
     switch (ev.kind) {
       case 'skill':
+        if (ev.from === HAZARD_CASTER_ID) break; // 기믹은 스킬 사용으로 세지 않는다
         skillAggOf(stats, ev.skillId).uses++;
         break;
+      case 'hazard_damage':
+        if (ev.phase === 'impact') addHazardImpact(stats, ev.hazardId, ev.damage, unitById.get(ev.to));
+        else addHazardLinger(stats, ev.hazardId, ev.damage);
+        break;
+      case 'attrition':
+        stats.attrition += ev.damage;
+        break;
       case 'attack': {
+        if (ev.from === HAZARD_CASTER_ID) {
+          // 구버전 경로: 기믹 impact 를 attack 으로 낸 경우. miss 는 피해 0 이라 그대로 더해도 된다
+          if (!ev.miss) addHazardImpact(stats, ev.skillId ?? HAZARD_CASTER_ID, ev.damage, unitById.get(ev.to));
+          break;
+        }
         if (ev.skillId) {
           const agg = skillAggOf(stats, ev.skillId);
           if (ev.miss) agg.misses++;
@@ -829,6 +985,10 @@ function attributeFrameDamage(f: BattleFrame, stats: DamageStats): void {
       }
       case 'zone_damage': {
         if (ev.damage <= 0) break;
+        if (ev.from === HAZARD_CASTER_ID) {
+          addHazardLinger(stats, ev.skillId, ev.damage);
+          break;
+        }
         skillAggOf(stats, ev.skillId).lingerDamage += ev.damage;
         stats.linger += ev.damage;
         let list = lingerHits.get(ev.to);
@@ -888,13 +1048,16 @@ function runBattleTracked(
     attributeFrameDamage(f, damage);
 
     // 1) 이번 틱에 새로 나타난 영역: 예고 중이면 안에 있는 적 유닛을 기록한다
+    //    (v0.7) 맵 기믹 영역(side 'neutral')은 양 팀 모두 대상이며 스킬 통계와 분리해 hazard* 에 센다.
     for (const z of zones) {
       ids.add(z.id);
       if (prevIds.has(z.id)) continue;
-      const def = skillDefOf(z.skillId);
-      if (!isDamageAoe(def)) continue;
+      const hazard = isHazardZone(z, input.map);
+      const def = hazard ? null : skillDefOf(z.skillId);
+      if (!hazard && !isDamageAoe(def)) continue;
       if (zoneFilter && !zoneFilter(z, def)) continue;
-      stats.damageZones++;
+      if (hazard) stats.hazardZones++;
+      else stats.damageZones++;
       if (z.phase !== 'telegraph') continue; // 예고 없는 스킬은 회피 판정이 없다
       const inside: string[] = [];
       for (const u of f.units) {
@@ -902,15 +1065,19 @@ function runBattleTracked(
         if (unitFilter && !unitFilter(u)) continue;
         if (!insideZone(z, def, u.x, u.y)) continue;
         inside.push(u.id);
-        if (!cannotDodge(u)) stats.dodgeAttempts++;
+        if (!cannotDodge(u)) {
+          if (hazard) stats.hazardDodgeAttempts++;
+          else stats.dodgeAttempts++;
+        }
       }
       // 같은 틱의 dodge 이벤트(같은 스킬 id, 영역 안 유닛)를 이 영역의 '인지' 로 본다.
-      // (같은 틱에 같은 스킬의 영역이 둘 생기면 구분할 수 없어 둘 다에 센다 — 드물다)
+      // (같은 틱에 같은 스킬의 영역이 둘 생기면 구분할 수 없어 둘 다에 센다 — 눈보라는 파도마다 2개라 이 경우가 흔하지만
+      //  두 영역이 겹치지 않는 한 '영역 안 유닛' 조건으로 갈린다)
       const dodged = new Set<string>();
       for (const ev of f.events) {
         if (ev.kind === 'dodge' && ev.skillId === z.skillId && inside.indexOf(ev.unit) >= 0) dodged.add(ev.unit);
       }
-      tracked.set(z.id, { snapshot: z, def, insideAtStart: inside, dodged });
+      tracked.set(z.id, { snapshot: z, def, hazard, insideAtStart: inside, dodged });
     }
 
     // 2) 예고가 끝난(phase 변경 또는 소멸) 영역: 시작 시 안에 있던 유닛이 아직 안에 있는지 본다
@@ -931,8 +1098,13 @@ function runBattleTracked(
             }
           }
           if (!unit || !unit.alive) continue; // impact 전에 죽은 유닛은 회피와 무관
-          stats.impactExposed++;
           const outside = !insideZone(shape, tz.def, unit.x, unit.y);
+          if (tz.hazard) {
+            stats.hazardExposed++;
+            if (outside) stats.hazardAvoided++;
+            continue;
+          }
+          stats.impactExposed++;
           if (outside) stats.impactAvoided++;
           if (tz.dodged.has(uid)) {
             if (outside) stats.dodgedEscaped++;
@@ -950,18 +1122,27 @@ function runBattleTracked(
   const result = sim.result();
   if (!result) throw new Error('전투가 끝나지 않았습니다 (틱 상한 초과).');
   for (const ev of result.events) {
-    if (ev.kind === 'zone') stats.zoneEvents++;
-    else if (ev.kind === 'dodge') {
+    if (ev.kind === 'zone') {
+      if (ev.from === HAZARD_CASTER_ID || isHazardId(ev.skillId, input.map)) stats.hazardZoneEvents++;
+      else stats.zoneEvents++;
+    } else if (ev.kind === 'dodge') {
       if (unitFilter) {
         // unitFilter 는 스냅샷 기준이라 id 만으로 걸러야 한다: 마지막 프레임의 유닛에서 찾는다
         const snap = sim.currentFrame().units.find((u) => u.id === ev.unit);
         if (snap && !unitFilter(snap)) continue;
       }
-      stats.dodgeEvents++;
+      if (isHazardId(ev.skillId, input.map)) stats.hazardDodgeEvents++;
+      else stats.dodgeEvents++;
     }
   }
   for (const us of result.unitStats) damage.total += us.damageTaken;
-  return { result, zones: stats, damage };
+  return {
+    result,
+    zones: stats,
+    damage,
+    attritionStarted: attritionStartedOf(result),
+    endedInAttrition: endedInAttritionOf(result),
+  };
 }
 
 // ───────────────────────── 전투 입력 생성 ─────────────────────────
@@ -1085,12 +1266,23 @@ interface DamageSummary {
   dot: number;
   /** 반사 */
   other: number;
+  /** (v0.7) 맵 기믹 피해 (impact + 장판) */
+  hazard: number;
+  hazardImpact: number;
+  hazardLinger: number;
+  /** (v0.7) 전장 붕괴 피해 */
+  attrition: number;
   /** 전체 − (분류된 전부). 이벤트 피해량 반올림 차이뿐이어야 한다 */
   unexplained: number;
-  /** (전체 − 기본 공격 − 소환물) / 전체 */
+  /** (전체 − 기본 공격 − 소환물 − 기믹 − 붕괴) / 전체 */
   skillShare: number;
   basicShare: number;
   summonShare: number;
+  /** (v0.7) 기믹 피해 / 전체. 빙하 목표 8~20% (맵별 판정은 BatchSummary.hazardSummary 에서) */
+  hazardShare: number;
+  attritionShare: number;
+  /** (v0.7) 기믹별 집계 (등장 순서) */
+  hazards: { hazardId: string; name: string; impactHits: number; avgImpactPct: number; impactDamage: number; lingerDamage: number; totalDamage: number; share: number }[];
   skillShareTarget: { min: number; max: number; day: number; judged: boolean; ok: boolean | null };
   /** 사용된 액티브 스킬 전부 (비중 내림차순) */
   skills: SkillDamageRow[];
@@ -1102,11 +1294,34 @@ function skillCategoryOf(def: SkillDef): SkillCategory {
   return def.target === 'enemy_area' || def.target === 'line' ? '광역' : '단일';
 }
 
+/** 기믹 id 의 한국어 표시명. 어느 맵 정의에든 있으면 그 이름, 없으면 id */
+function hazardName(id: string): string {
+  for (const m of MAP_TYPES) {
+    const h = hazardDefOf(m, id);
+    if (h) return h.name;
+  }
+  return id;
+}
+
 function damageSummaryOf(totals: DamageStats, games: number, day: number): DamageSummary {
   const total = totals.total;
-  const classified = totals.basic + totals.summon + totals.skillDirect + totals.linger + totals.dot + totals.other;
-  const skillShare = total > 0 ? (total - totals.basic - totals.summon) / total : 0;
+  const classified = totals.basic + totals.summon + totals.skillDirect + totals.linger + totals.dot + totals.other + totals.hazard + totals.attrition;
+  const skillShare = total > 0 ? (total - totals.basic - totals.summon - totals.hazard - totals.attrition) / total : 0;
   const judged = day >= TOTAL_DAYS;
+  const hazards: DamageSummary['hazards'] = [];
+  for (const [id, a] of totals.perHazard) {
+    const totalDamage = a.impactDamage + a.lingerDamage;
+    hazards.push({
+      hazardId: id,
+      name: hazardName(id),
+      impactHits: a.impactHits,
+      avgImpactPct: a.impactHits > 0 ? a.impactPctSum / a.impactHits : 0,
+      impactDamage: a.impactDamage,
+      lingerDamage: a.lingerDamage,
+      totalDamage,
+      share: total > 0 ? totalDamage / total : 0,
+    });
+  }
   const rows: SkillDamageRow[] = [];
   for (const [id, a] of totals.perSkill) {
     const def = skillDefOf(id);
@@ -1163,10 +1378,17 @@ function damageSummaryOf(totals: DamageStats, games: number, day: number): Damag
     linger: totals.linger,
     dot: totals.dot,
     other: totals.other,
+    hazard: totals.hazard,
+    hazardImpact: totals.hazardImpact,
+    hazardLinger: totals.hazardLinger,
+    attrition: totals.attrition,
     unexplained: Math.max(0, total - classified),
     skillShare,
     basicShare: total > 0 ? totals.basic / total : 0,
     summonShare: total > 0 ? totals.summon / total : 0,
+    hazardShare: total > 0 ? totals.hazard / total : 0,
+    attritionShare: total > 0 ? totals.attrition / total : 0,
+    hazards,
     skillShareTarget: {
       min: SKILL_SHARE_MIN,
       max: SKILL_SHARE_MAX,
@@ -1227,17 +1449,39 @@ function printDamageShare(d: DamageSummary): void {
       ['미분류', fixed(d.unexplained, 0), share(d.unexplained), '이벤트 피해량 반올림 차이'],
       ['캐릭터 기본 공격', fixed(d.basic, 0), share(d.basic), "skillId 없는 'attack' 이벤트"],
       ['소환물 기본 공격', fixed(d.summon, 0), share(d.summon), "소환물의 'attack' 이벤트"],
+      ['맵 기믹 (눈보라 등)', fixed(d.hazard, 0), share(d.hazard), `'hazard_damage' 이벤트 (impact ${fixed(d.hazardImpact, 0)} + 장판 ${fixed(d.hazardLinger, 0)})`],
+      ['전장 붕괴', fixed(d.attrition, 0), share(d.attrition), "'attrition' 이벤트 (120초 이후 틱 피해)"],
     ],
     ['l', 'r', 'r', 'l'],
   );
   const t = d.skillShareTarget;
   const judge = t.judged ? (t.ok ? 'OK' : '조정 필요') : `참고 (목표는 ${TOTAL_DAYS}일차 기준, 지금은 ${t.day}일차)`;
   console.log(
-    `스킬 피해 비중 ${pctOf(d.skillShare)} (= 전체 − 기본 공격 − 소환물)  목표 ${Math.round(t.min * 100)}~${Math.round(t.max * 100)}%: ${judge}`,
+    `스킬 피해 비중 ${pctOf(d.skillShare)} (= 전체 − 기본 공격 − 소환물 − 기믹 − 붕괴)  목표 ${Math.round(t.min * 100)}~${Math.round(t.max * 100)}%: ${judge}`,
   );
   console.log(
-    `기본 공격 비중 ${pctOf(d.basicShare)} (목표 ${Math.round((1 - t.max) * 100)}~${Math.round((1 - t.min) * 100)}%)  소환물 기본 공격 ${pctOf(d.summonShare)}`,
+    `기본 공격 비중 ${pctOf(d.basicShare)} (목표 ${Math.round((1 - t.max) * 100)}~${Math.round((1 - t.min) * 100)}%)  소환물 기본 공격 ${pctOf(d.summonShare)}  ` +
+      `기믹 ${pctOf(d.hazardShare)}  붕괴 ${pctOf(d.attritionShare)}`,
   );
+  if (d.hazards.length > 0) {
+    printTable(
+      ['기믹', 'id', 'impact 피격', '평균 impact / 대상 HP', 'impact 피해', '장판 피해', '총 피해', '비중'],
+      d.hazards.map((h) => [
+        h.name,
+        h.hazardId,
+        String(h.impactHits),
+        h.impactHits > 0 ? pctOf(h.avgImpactPct) : '-',
+        fixed(h.impactDamage, 0),
+        fixed(h.lingerDamage, 0),
+        fixed(h.totalDamage, 0),
+        pctOf(h.share),
+      ]),
+      ['l', 'l', 'r', 'r', 'r', 'r', 'r', 'r'],
+    );
+    console.log(
+      `'평균 impact / 대상 HP' 는 눈보라 기준 ${HAZARD_BLIZZARD.damagePctMaxHp}% × 적응 배율(0.7~1.3)이어야 합니다 (장판 초당 ${HAZARD_BLIZZARD.linger?.dpsPctMaxHp ?? 0}%). 맵별 기믹 비중 판정(빙하 8~20%)은 '맵 기믹·전장 붕괴' 표에서 봅니다.`,
+    );
+  }
   if (d.total > 0 && d.unexplained / d.total > 0.1) {
     console.log('주의: 미분류 비중이 10% 를 넘습니다. sim 의 피해 경로 중 이벤트를 내지 않는 곳이 있는지 확인하세요 (반올림만으로는 이만큼 나올 수 없습니다).');
   }
@@ -1255,6 +1499,68 @@ function printMainSkillTable(d: DamageSummary): void {
   console.log("'보조' 는 기절·둔화·이동·MP 회복이 본체인 보조기(skills.ts UTILITY_SKILL_IDS)라 주력기 목표로 판정하지 않습니다 (참고 8~13%).");
 }
 
+// ───────────────────────── 맵 기믹·전장 붕괴 목표 — v0.7 [6] ─────────────────────────
+
+/** 빙하 전투 전체 피해 중 눈보라(기믹) 피해 비중 목표 */
+const HAZARD_SHARE_MIN = 0.08;
+const HAZARD_SHARE_MAX = 0.2;
+/** 기믹 비중 목표를 판정하는 맵 (기믹이 정의된 맵 = 빙하) */
+const HAZARD_TARGET_MAP: MapType = 'glacier';
+/** 붕괴 시작(120초) 후 끝나는 전투 비율 상한 */
+const ATTRITION_END_RATE_MAX = 0.15;
+/** 빙하 평균 전투 시간 / 다른 맵 평균 전투 시간 하한 */
+const GLACIER_DURATION_RATIO_MIN = 0.7;
+/** 맵별 A/B 승률 목표 구간 */
+const MAP_WIN_RATE_MIN = 0.4;
+const MAP_WIN_RATE_MAX = 0.6;
+/** 무승부 비율 상한 */
+const DRAW_RATE_MAX = 0.03;
+
+interface MapBatchStat {
+  games: number;
+  winsA: number;
+  winsB: number;
+  draws: number;
+  avgDurationSec: number;
+  /** 이 맵 판들의 Σ damageTaken */
+  totalDamage: number;
+  /** 기믹 피해 (hazard_damage 합) */
+  hazardDamage: number;
+  /** 기믹 피해 비중 = hazardDamage / totalDamage */
+  hazardShare: number;
+  /** 붕괴 피해 */
+  attritionDamage: number;
+  /** 붕괴 발동(attrition_start 도달) 판 수 */
+  attritionStarted: number;
+  /** 붕괴 시작 후 종료 판 수 (endedInAttrition) */
+  endedInAttrition: number;
+  attritionStartRate: number;
+  attritionEndRate: number;
+  /** A 승률이 40~60% 안인지 (표본 없으면 null) */
+  winRateOk: boolean | null;
+}
+
+interface HazardBatchSummary {
+  /** 기믹 목표 맵(빙하)의 기믹 피해 비중과 목표 판정 (빙하 표본 없으면 ok null) */
+  targetMap: MapType;
+  hazardShare: number;
+  hazardShareTarget: { min: number; max: number; ok: boolean | null };
+  /** 빙하 평균 전투 시간 / 다른 맵(풀링) 평균 전투 시간. 어느 한쪽 표본이 없으면 null */
+  glacierAvgDurationSec: number;
+  otherAvgDurationSec: number;
+  glacierDurationRatio: number | null;
+  glacierDurationOk: boolean | null;
+  /** 전체 붕괴 발동·종료 */
+  attritionStarted: number;
+  endedInAttrition: number;
+  attritionStartRate: number;
+  attritionEndRate: number;
+  attritionEndOk: boolean;
+  /** 무승부 비율 < 3% */
+  drawRate: number;
+  drawOk: boolean;
+}
+
 interface BatchSummary {
   mode: 'batch';
   games: number;
@@ -1267,13 +1573,23 @@ interface BatchSummary {
   draws: number;
   avgDurationSec: number;
   durationTarget: { min: number; max: number; ok: boolean };
-  perMap: Record<MapType, { games: number; winsA: number; winsB: number; draws: number; avgDurationSec: number }>;
+  perMap: Record<MapType, MapBatchStat>;
   perJob: Record<MainJob, JobAgg & { winRate: number; avgDamage: number; avgHealing: number; survivalRate: number }>;
   topSkills: { skillId: string; name: string; uses: number }[];
   reasons: Record<string, number>;
   zones: ZoneSummary;
   /** 스킬 피해 비중·주력기 표 (v0.6 [3]) */
   damage: DamageSummary;
+  /** (v0.7) 맵 기믹 피해 비중·전장 붕괴·빙하 전투 시간 비율 */
+  hazardSummary: HazardBatchSummary;
+}
+
+function emptyMapBatchStat(): MapBatchStat {
+  return {
+    games: 0, winsA: 0, winsB: 0, draws: 0, avgDurationSec: 0,
+    totalDamage: 0, hazardDamage: 0, hazardShare: 0, attritionDamage: 0,
+    attritionStarted: 0, endedInAttrition: 0, attritionStartRate: 0, attritionEndRate: 0, winRateOk: null,
+  };
 }
 
 function emptyJobAgg(): JobAgg {
@@ -1303,7 +1619,7 @@ function runBatch(opts: CliOptions): BatchSummary {
   const perJob = {} as Record<MainJob, JobAgg>;
   for (const j of MAIN_JOBS) perJob[j] = emptyJobAgg();
   const perMap = {} as BatchSummary['perMap'];
-  for (const m of MAP_TYPES) perMap[m] = { games: 0, winsA: 0, winsB: 0, draws: 0, avgDurationSec: 0 };
+  for (const m of MAP_TYPES) perMap[m] = emptyMapBatchStat();
   const mapDuration = {} as Record<MapType, number>;
   for (const m of MAP_TYPES) mapDuration[m] = 0;
 
@@ -1315,6 +1631,8 @@ function runBatch(opts: CliOptions): BatchSummary {
   let winsB = 0;
   let draws = 0;
   let durationSum = 0;
+  let attritionStarted = 0;
+  let endedInAttrition = 0;
 
   const showProgress = opts.games >= 20 && !opts.json;
   const progressEvery = Math.max(1, Math.floor(opts.games / 10));
@@ -1332,6 +1650,8 @@ function runBatch(opts: CliOptions): BatchSummary {
     else draws++;
     durationSum += result.durationSec;
     reasons[result.reason] = (reasons[result.reason] ?? 0) + 1;
+    if (tracked.attritionStarted) attritionStarted++;
+    if (tracked.endedInAttrition) endedInAttrition++;
 
     const pm = perMap[input.map];
     pm.games++;
@@ -1339,6 +1659,11 @@ function runBatch(opts: CliOptions): BatchSummary {
     else if (result.winner === 'B') pm.winsB++;
     else pm.draws++;
     mapDuration[input.map] += result.durationSec;
+    pm.totalDamage += tracked.damage.total;
+    pm.hazardDamage += tracked.damage.hazard;
+    pm.attritionDamage += tracked.damage.attrition;
+    if (tracked.attritionStarted) pm.attritionStarted++;
+    if (tracked.endedInAttrition) pm.endedInAttrition++;
 
     // 유닛 id → (직업, 진영). 소환물은 ownerId 로 소환사에 귀속.
     const memberInfo = new Map<string, { job: MainJob; side: TeamSide }>();
@@ -1398,8 +1723,47 @@ function runBatch(opts: CliOptions): BatchSummary {
   }
 
   for (const m of MAP_TYPES) {
-    perMap[m].avgDurationSec = perMap[m].games > 0 ? mapDuration[m] / perMap[m].games : 0;
+    const pm = perMap[m];
+    pm.avgDurationSec = pm.games > 0 ? mapDuration[m] / pm.games : 0;
+    pm.hazardShare = pm.totalDamage > 0 ? pm.hazardDamage / pm.totalDamage : 0;
+    pm.attritionStartRate = pm.games > 0 ? pm.attritionStarted / pm.games : 0;
+    pm.attritionEndRate = pm.games > 0 ? pm.endedInAttrition / pm.games : 0;
+    pm.winRateOk = pm.games > 0 ? pm.winsA / pm.games >= MAP_WIN_RATE_MIN && pm.winsA / pm.games <= MAP_WIN_RATE_MAX : null;
   }
+
+  // (v0.7) 빙하 기믹 비중·빙하 전투 시간 비율·붕괴 종료 비율
+  const glacier = perMap[HAZARD_TARGET_MAP];
+  let otherGames = 0;
+  let otherDuration = 0;
+  for (const m of MAP_TYPES) {
+    if (m === HAZARD_TARGET_MAP) continue;
+    otherGames += perMap[m].games;
+    otherDuration += mapDuration[m];
+  }
+  const otherAvg = otherGames > 0 ? otherDuration / otherGames : 0;
+  const ratio = glacier.games > 0 && otherGames > 0 && otherAvg > 0 ? glacier.avgDurationSec / otherAvg : null;
+  const attritionEndRate = opts.games > 0 ? endedInAttrition / opts.games : 0;
+  const drawRate = opts.games > 0 ? draws / opts.games : 0;
+  const hazardSummary: HazardBatchSummary = {
+    targetMap: HAZARD_TARGET_MAP,
+    hazardShare: glacier.hazardShare,
+    hazardShareTarget: {
+      min: HAZARD_SHARE_MIN,
+      max: HAZARD_SHARE_MAX,
+      ok: glacier.games > 0 && glacier.totalDamage > 0 ? glacier.hazardShare >= HAZARD_SHARE_MIN && glacier.hazardShare <= HAZARD_SHARE_MAX : null,
+    },
+    glacierAvgDurationSec: glacier.avgDurationSec,
+    otherAvgDurationSec: otherAvg,
+    glacierDurationRatio: ratio,
+    glacierDurationOk: ratio === null ? null : ratio >= GLACIER_DURATION_RATIO_MIN - 1e-9,
+    attritionStarted,
+    endedInAttrition,
+    attritionStartRate: opts.games > 0 ? attritionStarted / opts.games : 0,
+    attritionEndRate,
+    attritionEndOk: attritionEndRate < ATTRITION_END_RATE_MAX,
+    drawRate,
+    drawOk: drawRate < DRAW_RATE_MAX,
+  };
 
   const perJobOut = {} as BatchSummary['perJob'];
   for (const j of MAIN_JOBS) {
@@ -1442,7 +1806,50 @@ function runBatch(opts: CliOptions): BatchSummary {
     reasons,
     zones: zoneSummaryOf(zoneTotals, opts.games),
     damage: damageSummaryOf(damageTotals, opts.games, opts.day),
+    hazardSummary,
   };
+}
+
+/** (v0.7) 맵별 기믹 피해 비중·붕괴 발동/종료 비율·빙하 전투 시간 비율 표 */
+function printHazardSummary(s: BatchSummary): void {
+  const h = s.hazardSummary;
+  section(`맵 기믹·전장 붕괴 (v0.7. 기믹 비중 목표 ${MAP_NAME_KO[h.targetMap]} ${Math.round(h.hazardShareTarget.min * 100)}~${Math.round(h.hazardShareTarget.max * 100)}%, 붕괴 후 종료 < ${Math.round(ATTRITION_END_RATE_MAX * 100)}%)`);
+  printTable(
+    ['맵', '판수', '전체 피해', '기믹 피해', '기믹 피해 비중', '붕괴 피해', '붕괴 발동 비율', '붕괴 이후 종료 비율', '평균 시간'],
+    MAP_TYPES.map((m) => {
+      const pm = s.perMap[m];
+      const hasHazard = hazardsOfMap(m).length > 0;
+      return [
+        MAP_NAME_KO[m] + (hasHazard ? ` (${hazardsOfMap(m).map((z) => z.name).join('·')})` : ''),
+        String(pm.games),
+        pm.games > 0 ? fixed(pm.totalDamage, 0) : '-',
+        pm.games > 0 ? fixed(pm.hazardDamage, 0) : '-',
+        pm.games > 0 ? pctOf(pm.hazardShare) : '-',
+        pm.games > 0 ? fixed(pm.attritionDamage, 0) : '-',
+        pm.games > 0 ? `${pctOf(pm.attritionStartRate)} (${pm.attritionStarted})` : '-',
+        pm.games > 0 ? `${pctOf(pm.attritionEndRate)} (${pm.endedInAttrition})` : '-',
+        pm.games > 0 ? fixed(pm.avgDurationSec) + '초' : '-',
+      ];
+    }),
+    ['l', 'r', 'r', 'r', 'r', 'r', 'r', 'r', 'r'],
+  );
+  const shareJudge = h.hazardShareTarget.ok === null ? '표본 없음' : h.hazardShareTarget.ok ? 'OK' : h.hazardShare < h.hazardShareTarget.min ? '약함 (조정 필요)' : '강함 (조정 필요)';
+  console.log(
+    `${MAP_NAME_KO[h.targetMap]} 기믹 피해 비중 ${pctOf(h.hazardShare)} (목표 ${Math.round(h.hazardShareTarget.min * 100)}~${Math.round(h.hazardShareTarget.max * 100)}%): ${shareJudge}`,
+  );
+  console.log(
+    `${MAP_NAME_KO[h.targetMap]} 평균 전투 시간 ${fixed(h.glacierAvgDurationSec)}초 / 다른 맵 평균 ${fixed(h.otherAvgDurationSec)}초 = ` +
+      (h.glacierDurationRatio === null ? '비율 - (표본 부족)' : `${fixed(h.glacierDurationRatio, 2)}배`) +
+      ` (목표 ${GLACIER_DURATION_RATIO_MIN}배 이상: ${h.glacierDurationOk === null ? '표본 없음' : h.glacierDurationOk ? 'OK' : '조정 필요'})`,
+  );
+  console.log(
+    `붕괴 발동 비율 ${pctOf(h.attritionStartRate)} (${h.attritionStarted}/${s.games}, ${ATTRITION_START_SEC}초 도달)  ` +
+      `붕괴 이후 종료 비율 ${pctOf(h.attritionEndRate)} (${h.endedInAttrition}/${s.games}, 목표 < ${Math.round(ATTRITION_END_RATE_MAX * 100)}%: ${h.attritionEndOk ? 'OK' : '조정 필요'})`,
+  );
+  console.log(`무승부 비율 ${pctOf(h.drawRate)} (목표 < ${Math.round(DRAW_RATE_MAX * 100)}%: ${h.drawOk ? 'OK' : '조정 필요'})`);
+  if (s.perMap[h.targetMap].games > 0 && s.perMap[h.targetMap].hazardDamage === 0) {
+    console.log(`(${MAP_NAME_KO[h.targetMap]} ${s.perMap[h.targetMap].games}판에서 기믹 피해 이벤트가 하나도 없습니다. sim 이 hazard_damage 를 아직 내지 않거나 maps.ts 에 hazards 가 없습니다.)`);
+  }
 }
 
 function printZoneSummary(z: ZoneSummary, games: number): void {
@@ -1465,6 +1872,14 @@ function printZoneSummary(z: ZoneSummary, games: number): void {
   if (z.totals.zoneEvents === 0 && z.totals.damageZones === 0) {
     console.log(`(${games}판 동안 광역 영역이 하나도 생성되지 않았습니다. sim 이 Zone 을 아직 만들지 않거나 광역 스킬이 쓰이지 않았습니다.)`);
   }
+  const h = z.totals;
+  if (h.hazardZoneEvents > 0 || h.hazardZones > 0) {
+    console.log(
+      `맵 기믹 영역 (스킬 통계와 별도, 양 팀 대상): 생성 ${h.hazardZones}개 (zone 이벤트 ${h.hazardZoneEvents}), ` +
+        `회피 판정 ${h.hazardDodgeAttempts}, 회피 성공(인지) ${h.hazardDodgeEvents} (${pct(h.hazardDodgeEvents, h.hazardDodgeAttempts)}), ` +
+        `impact 때 영역 밖 ${h.hazardAvoided}/${h.hazardExposed} (${pct(h.hazardAvoided, h.hazardExposed)})`,
+    );
+  }
 }
 
 function printBatch(s: BatchSummary): void {
@@ -1479,9 +1894,9 @@ function printBatch(s: BatchSummary): void {
     `평균 전투 시간 ${fixed(s.avgDurationSec)}초 (목표 ${s.durationTarget.min}~${s.durationTarget.max}초: ${s.durationTarget.ok ? 'OK' : '조정 필요'})`,
   );
 
-  section('맵별 A 승률');
+  section(`맵별 A 승률 (목표 각 맵 ${Math.round(MAP_WIN_RATE_MIN * 100)}~${Math.round(MAP_WIN_RATE_MAX * 100)}%)`);
   printTable(
-    ['맵', '판수', 'A 승률', 'B 승률', '무승부', '평균 시간'],
+    ['맵', '판수', 'A 승률', 'B 승률', '무승부', '평균 시간', '판정'],
     MAP_TYPES.map((m) => {
       const pm = s.perMap[m];
       return [
@@ -1491,10 +1906,12 @@ function printBatch(s: BatchSummary): void {
         pct(pm.winsB, pm.games),
         pct(pm.draws, pm.games),
         pm.games > 0 ? fixed(pm.avgDurationSec) + '초' : '-',
+        pm.winRateOk === null ? '-' : pm.winRateOk ? 'OK' : '조정 필요',
       ];
     }),
-    ['l', 'r', 'r', 'r', 'r', 'r'],
+    ['l', 'r', 'r', 'r', 'r', 'r', 'l'],
   );
+  printHazardSummary(s);
 
   section('직업별 (소환물의 피해·킬은 소환사에 합산)');
   const jobRows = MAIN_JOBS.map((j) => {
@@ -1639,13 +2056,14 @@ function describeFrameDiff(a: BattleFrame, b: BattleFrame): string {
   }
   if (JSON.stringify(a.events) !== JSON.stringify(b.events)) return '이벤트 목록 불일치';
   if (JSON.stringify(a.capture) !== JSON.stringify(b.capture)) return '거점 상태 불일치';
+  if ((a.attritionPctPerSec ?? 0) !== (b.attritionPctPerSec ?? 0)) return `붕괴율 불일치: ${a.attritionPctPerSec} vs ${b.attritionPctPerSec}`;
   return '알 수 없는 차이 (직렬화 결과 불일치)';
 }
 
 function printDeterminism(r: DeterminismReport): void {
   section('결정론 검증');
   console.log(`맵 ${MAP_NAME_KO[r.map]}, 전투 시드 ${r.seed}, 진행 틱 ${r.ticks}, 관측된 광역 영역 ${r.zonesSeen}개`);
-  console.log(`프레임 해시 비교(유닛·이벤트·영역·거점): ${r.firstDiffTick === null ? 'PASS' : `FAIL (첫 불일치 틱 ${r.firstDiffTick})`}`);
+  console.log(`프레임 해시 비교(유닛·이벤트·영역·거점·붕괴율): ${r.firstDiffTick === null ? 'PASS' : `FAIL (첫 불일치 틱 ${r.firstDiffTick})`}`);
   if (r.detail) console.log(`  ${r.detail}`);
   console.log(`최종 결과 비교: ${r.resultMatch ? 'PASS' : 'FAIL'}`);
   console.log(`입력 불변 검사: ${r.inputMutated ? '경고 - 시뮬레이터가 입력 객체를 변조함' : 'PASS'}`);
@@ -1673,6 +2091,10 @@ interface DayRow {
   battleOutcome: Outcome | null;
   battleReason: string;
   battleDurationSec: number;
+  /** (v0.7) 4:4 전투가 붕괴 시작(120초) 후 끝났는지 */
+  battleEndedInAttrition: boolean;
+  /** (v0.7) 4:4 전투의 기믹 피해 비중 (기믹 없는 맵은 0) */
+  battleHazardShare: number;
   pointsEarned: number;
   skillsBought: number;
   avgStatTotal: number;
@@ -1863,6 +2285,8 @@ function newDayRow(day: number): DayRow {
     battleOutcome: null,
     battleReason: '',
     battleDurationSec: 0,
+    battleEndedInAttrition: false,
+    battleHazardShare: 0,
     pointsEarned: 0,
     skillsBought: 0,
     avgStatTotal: 0,
@@ -2043,6 +2467,8 @@ function driveRun(seed: number, policy: PolicyName, hooks: DriverHooks = {}): Ru
         row.battleOutcome = outcome;
         row.battleReason = result.reason;
         row.battleDurationSec = result.durationSec;
+        row.battleEndedInAttrition = tracked.endedInAttrition;
+        row.battleHazardShare = tracked.damage.total > 0 ? tracked.damage.hazard / tracked.damage.total : 0;
         if (outcome === 'win') wins++;
         else if (outcome === 'lose') loses++;
         else draws++;
@@ -2183,6 +2609,8 @@ interface GrowthReport {
   firstDayBattleSec: number;
   lastDayBattleSec: number;
   avgBattleSec: number;
+  /** (v0.7) 붕괴 시작 후 끝난 4:4 전투 수 */
+  battlesEndedInAttrition: number;
   finalAvgStatTotal: number;
   finalTeamPower: number;
   finalBonusPoints: number;
@@ -2202,12 +2630,14 @@ function runGrowth(opts: CliOptions): GrowthReport {
   let totalSkillsBought = 0;
   let battleSum = 0;
   let battles = 0;
+  let attritionEnded = 0;
   for (const d of out.days) {
     totalPoints += d.pointsEarned;
     totalSkillsBought += d.skillsBought;
     if (d.battleOutcome !== null) {
       battleSum += d.battleDurationSec;
       battles++;
+      if (d.battleEndedInAttrition) attritionEnded++;
     }
   }
   const first = out.days.find((d) => d.battleOutcome !== null);
@@ -2228,6 +2658,7 @@ function runGrowth(opts: CliOptions): GrowthReport {
     firstDayBattleSec: first ? first.battleDurationSec : 0,
     lastDayBattleSec: last ? last.battleDurationSec : 0,
     avgBattleSec: battles > 0 ? battleSum / battles : 0,
+    battlesEndedInAttrition: attritionEnded,
     finalAvgStatTotal: avgStatTotal(out.state.team),
     finalTeamPower: teamPower(out.state.team),
     finalBonusPoints: out.state.bonusPoints,
@@ -2253,7 +2684,7 @@ function printGrowth(r: GrowthReport): void {
 
   section('일차별 진행');
   printTable(
-    ['일차', '맵', '선택 3장 등급', '몬스터', '인원', VS_LABEL, '전투 시간', '포인트', '평균 스탯합', '팀 전투력'],
+    ['일차', '맵', '선택 3장 등급', '몬스터', '인원', VS_LABEL, '전투 시간', '기믹 비중', '포인트', '평균 스탯합', '팀 전투력'],
     r.days.map((d) => [
       String(d.day),
       d.map ? MAP_NAME_KO[d.map] : '-',
@@ -2263,13 +2694,15 @@ function printGrowth(r: GrowthReport): void {
         : '-',
       d.monsterUnits > 0 ? `${d.monsterUnits}명` : '-',
       outcomeKo(d.battleOutcome),
-      d.battleOutcome !== null ? fixed(d.battleDurationSec, 0) + '초' : '-',
+      d.battleOutcome !== null ? fixed(d.battleDurationSec, 0) + '초' + (d.battleEndedInAttrition ? '(붕괴)' : '') : '-',
+      d.battleOutcome !== null && d.map && hazardsOfMap(d.map).length > 0 ? pctOf(d.battleHazardShare) : '-',
       String(d.pointsEarned),
       fixed(d.avgStatTotal, 1),
       fixed(d.teamPower, 0),
     ]),
-    ['r', 'l', 'l', 'l', 'r', 'l', 'r', 'r', 'r', 'r'],
+    ['r', 'l', 'l', 'l', 'r', 'l', 'r', 'r', 'r', 'r', 'r'],
   );
+  console.log("'전투 시간' 의 (붕괴) 는 전장 붕괴 시작(120초) 후 끝난 전투. '기믹 비중' 은 기믹이 있는 맵(빙하)에서 전체 피해 중 기믹 피해 비중.");
 
   section('일차별 고른 선택지');
   printTable(
@@ -2285,7 +2718,8 @@ function printGrowth(r: GrowthReport): void {
   );
   console.log(
     `${VS_LABEL} 평균 전투 시간 ${fixed(r.avgBattleSec, 1)}초 (1일차 ${fixed(r.firstDayBattleSec, 0)}초 → 10일차 ${fixed(r.lastDayBattleSec, 0)}초` +
-      `${r.firstDayBattleSec < r.lastDayBattleSec ? ', 1일차가 더 짧음 OK' : ', 1일차가 더 짧지 않음 - 표본 하나라 참고만'})`,
+      `${r.firstDayBattleSec < r.lastDayBattleSec ? ', 1일차가 더 짧음 OK' : ', 1일차가 더 짧지 않음 - 표본 하나라 참고만'})` +
+      `, 붕괴 후 종료 ${r.battlesEndedInAttrition}/${r.wins + r.loses + r.draws}판`,
   );
   console.log(
     `최종 평균 스탯합 ${fixed(r.finalAvgStatTotal, 1)}, 최종 팀 전투력 ${fixed(r.finalTeamPower, 0)}, ` +
@@ -2325,6 +2759,10 @@ type CountBucket = '1~2' | '3~4' | '5~8';
 const COUNT_BUCKETS: readonly CountBucket[] = ['1~2', '3~4', '5~8'];
 /** 같은 난이도 안 인원 구간 승률 편차 허용치 (GDD §7.3.1: ±8%p) */
 const BUCKET_SPREAD_MAX = 0.08;
+/** (v0.7) 빙하맵 몬스터 승률과 다른 맵(풀링) 승률의 차이 허용치 (GDD §11: ±10%p) */
+const GLACIER_MONSTER_DIFF_MAX = 0.1;
+/** 맵별 승률 비교의 기준 맵 (기믹이 있는 맵) */
+const MONSTER_HAZARD_MAP: MapType = 'glacier';
 
 function bucketOf(unitCount: number): CountBucket {
   if (unitCount <= 2) return '1~2';
@@ -2358,6 +2796,10 @@ interface TierAgg {
   defs: Map<string, DefAgg>;
   /** 인원 구간별 집계 */
   buckets: Record<CountBucket, BucketAgg>;
+  /** (v0.7) 맵별 집계 (빙하 ±10%p 확인용) */
+  maps: Record<MapType, BucketAgg>;
+  /** (v0.7) 붕괴 시작 후 끝난 판 수 */
+  endedInAttrition: number;
 }
 
 interface TierStat {
@@ -2369,6 +2811,19 @@ interface TierStat {
   /** 40초 미만 / 120초 초과 비율 (목표 전투 시간 40~120초) */
   shortRate: number;
   longRate: number;
+  /** (v0.7) 붕괴 시작 후 끝난 판 수와 비율 */
+  endedInAttrition: number;
+  attritionEndRate: number;
+}
+
+/** (v0.7) 난이도 × 맵 승률. 빙하와 다른 맵(풀링)의 차이가 ±10%p 이내여야 한다 */
+interface TierMapStat {
+  tier: MonsterTier;
+  maps: Record<MapType, BucketStat>;
+  /** 빙하 승률 − 다른 맵 풀링 승률. 어느 한쪽 표본이 없으면 null */
+  glacierDiff: number | null;
+  otherWinRate: number;
+  pass: boolean;
 }
 
 /** 몬스터 종별 통계 (전투 시간 분포까지) */
@@ -2421,17 +2876,25 @@ interface MonsterReport {
   perDef: DefStat[];
   /** 난이도 × 인원 구간 승률 */
   perBucket: TierBucketStat[];
+  /** (v0.7) 난이도 × 맵 승률 (빙하 ±10%p) */
+  perMapTier: TierMapStat[];
   /** 인원 범위 밖(1~8 위반) 편성이 관측된 횟수 */
   unitCountViolations: number;
   runsCompleted: number;
 }
 
 const MONSTER_TARGET: Record<MonsterTier, number> = { low: 0.975, mid: 0.8, high: 0.5 };
-const MONSTER_TARGET_LABEL: Record<MonsterTier, string> = { low: '95~100%', mid: '80%', high: '50%' };
+const MONSTER_TARGET_LABEL: Record<MonsterTier, string> = { low: '95~100%', mid: '75~85%', high: '45~55%' };
 
 function emptyBuckets(): Record<CountBucket, BucketAgg> {
   const out = {} as Record<CountBucket, BucketAgg>;
   for (const b of COUNT_BUCKETS) out[b] = { games: 0, wins: 0, durationSum: 0 };
+  return out;
+}
+
+function emptyMapAggs(): Record<MapType, BucketAgg> {
+  const out = {} as Record<MapType, BucketAgg>;
+  for (const m of MAP_TYPES) out[m] = { games: 0, wins: 0, durationSum: 0 };
   return out;
 }
 
@@ -2444,6 +2907,8 @@ function emptyTierAgg(): TierAgg {
     monsterNames: new Map(),
     defs: new Map(),
     buckets: emptyBuckets(),
+    maps: emptyMapAggs(),
+    endedInAttrition: 0,
   };
 }
 
@@ -2467,7 +2932,33 @@ function tierStat(a: TierAgg): TierStat {
     medianDurationSec: median(sorted),
     shortRate: sorted.length > 0 ? short / sorted.length : 0,
     longRate: sorted.length > 0 ? long / sorted.length : 0,
+    endedInAttrition: a.endedInAttrition,
+    attritionEndRate: a.games > 0 ? a.endedInAttrition / a.games : 0,
   };
+}
+
+/** (v0.7) 난이도 × 맵 승률과 빙하 편차 */
+function mapStats(tier: MonsterTier, a: TierAgg): TierMapStat {
+  const maps = {} as Record<MapType, BucketStat>;
+  let otherGames = 0;
+  let otherWins = 0;
+  for (const m of MAP_TYPES) {
+    const agg = a.maps[m];
+    maps[m] = {
+      games: agg.games,
+      wins: agg.wins,
+      winRate: agg.games > 0 ? agg.wins / agg.games : 0,
+      avgDurationSec: agg.games > 0 ? agg.durationSum / agg.games : 0,
+    };
+    if (m !== MONSTER_HAZARD_MAP) {
+      otherGames += agg.games;
+      otherWins += agg.wins;
+    }
+  }
+  const otherWinRate = otherGames > 0 ? otherWins / otherGames : 0;
+  const glacier = maps[MONSTER_HAZARD_MAP];
+  const glacierDiff = glacier.games > 0 && otherGames > 0 ? glacier.winRate - otherWinRate : null;
+  return { tier, maps, glacierDiff, otherWinRate, pass: glacierDiff === null || Math.abs(glacierDiff) <= GLACIER_MONSTER_DIFF_MAX + 1e-9 };
 }
 
 function bucketStats(tier: MonsterTier, a: TierAgg): TierBucketStat {
@@ -2540,11 +3031,19 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
           const result = createBattle(input).runToEnd();
           const won = result.winner === 'A';
           const bucket = bucketOf(unitCount);
+          const attritionEnd = endedInAttritionOf(result);
           for (const agg of [rec[enc.tier], overall[enc.tier]]) {
             agg.games++;
             if (won) agg.wins++;
             agg.durationSum += result.durationSec;
             agg.durations.push(result.durationSec);
+            if (attritionEnd) agg.endedInAttrition++;
+            const mapAgg = agg.maps[enc.map];
+            if (mapAgg) {
+              mapAgg.games++;
+              if (won) mapAgg.wins++;
+              mapAgg.durationSum += result.durationSec;
+            }
             agg.monsterNames.set(enc.name, (agg.monsterNames.get(enc.name) ?? 0) + 1);
             let d = agg.defs.get(enc.name);
             if (!d) {
@@ -2619,6 +3118,7 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
   }
 
   const perBucket: TierBucketStat[] = MONSTER_TIER_ORDER.map((t) => bucketStats(t, overall[t]));
+  const perMapTier: TierMapStat[] = MONSTER_TIER_ORDER.map((t) => mapStats(t, overall[t]));
 
   return {
     mode: 'monster',
@@ -2633,6 +3133,7 @@ function runMonsterCalibration(opts: CliOptions): MonsterReport {
     topMonsters,
     perDef,
     perBucket,
+    perMapTier,
     unitCountViolations,
     runsCompleted,
   };
@@ -2670,7 +3171,8 @@ function printMonster(r: MonsterReport): void {
     MONSTER_TIER_ORDER.map((t) => {
       const s = r.overall[t];
       const diff = s.winRate - r.targets[t];
-      const inRange = t === 'low' ? s.winRate >= 0.95 : Math.abs(diff) <= 0.05;
+      // v0.7 목표: 하급 95~100 / 중급 75~85 / 고급 45~55 (= 중심값 ±5%p)
+      const inRange = t === 'low' ? s.winRate >= 0.95 : Math.abs(diff) <= 0.05 + 1e-9;
       return [
         MONSTER_TIER_NAME_KO[t],
         String(s.games),
@@ -2699,25 +3201,43 @@ function printMonster(r: MonsterReport): void {
   );
   console.log('인원 구간의 편차가 크면 TIER_POWER_RATIO 가 아니라 해당 인원 편성의 MonsterDef.powerScale 을 움직입니다 (1기 보스는 내리고, 8기 떼는 올리는 식).');
 
-  section(`난이도별 전투 시간 분포 (목표 ${DURATION_MIN_SEC}~${DURATION_MAX_SEC}초)`);
+  section(`난이도 × 맵 승률 (v0.7. ${MAP_NAME_KO[MONSTER_HAZARD_MAP]} 승률이 다른 맵 풀링 대비 ±${Math.round(GLACIER_MONSTER_DIFF_MAX * 100)}%p 이내 목표)`);
   printTable(
-    ['난이도', '평균', '중앙값', `${DURATION_MIN_SEC}초 미만`, `${DURATION_MAX_SEC}초 초과`, '판정'],
+    ['난이도', ...MAP_TYPES.map((m) => MAP_NAME_KO[m]), `${MAP_NAME_KO[MONSTER_HAZARD_MAP]} 외`, `${MAP_NAME_KO[MONSTER_HAZARD_MAP]} 차이`, '판정'],
+    r.perMapTier.map((tm) => [
+      MONSTER_TIER_NAME_KO[tm.tier],
+      ...MAP_TYPES.map((m) => {
+        const s = tm.maps[m];
+        return s.games === 0 ? '-' : `${pctOf(s.winRate)} (${s.games}판, ${fixed(s.avgDurationSec, 0)}초)`;
+      }),
+      pctOf(tm.otherWinRate),
+      tm.glacierDiff === null ? '-' : `${tm.glacierDiff >= 0 ? '+' : ''}${(tm.glacierDiff * 100).toFixed(1)}p`,
+      tm.glacierDiff === null ? '표본 부족' : tm.pass ? 'OK' : '조정 필요',
+    ]),
+    ['l', 'r', 'r', 'r', 'r', 'r', 'r', 'l'],
+  );
+  console.log(`${MAP_NAME_KO[MONSTER_HAZARD_MAP]} 승률이 다른 맵보다 크게 낮으면 눈보라(HazardDef damagePctMaxHp·간격)가 몬스터 전투 난이도를 바꾸고 있는 것입니다. 몬스터 preferredMaps 가 치우치면 맵별 표본이 고르지 않으니 판수를 함께 보세요.`);
+
+  section(`난이도별 전투 시간 분포 (목표 ${DURATION_MIN_SEC}~${DURATION_MAX_SEC}초, 붕괴 후 종료 < ${Math.round(ATTRITION_END_RATE_MAX * 100)}%)`);
+  printTable(
+    ['난이도', '평균', '중앙값', `${DURATION_MIN_SEC}초 미만`, `${DURATION_MAX_SEC}초 초과`, '붕괴 후 종료', '판정'],
     MONSTER_TIER_ORDER.map((t) => {
       const s = r.overall[t];
       const ok = s.medianDurationSec >= DURATION_MIN_SEC && s.medianDurationSec <= DURATION_MAX_SEC
-        && s.shortRate <= 0.35 && s.longRate <= 0.25;
+        && s.shortRate <= 0.35 && s.longRate <= 0.25 && s.attritionEndRate < ATTRITION_END_RATE_MAX;
       return [
         MONSTER_TIER_NAME_KO[t],
         fixed(s.avgDurationSec, 1) + '초',
         fixed(s.medianDurationSec, 1) + '초',
         pctOf(s.shortRate),
         pctOf(s.longRate),
+        `${pctOf(s.attritionEndRate)} (${s.endedInAttrition})`,
         ok ? 'OK' : '조정 필요',
       ];
     }),
-    ['l', 'r', 'r', 'r', 'r', 'l'],
+    ['l', 'r', 'r', 'r', 'r', 'r', 'l'],
   );
-  console.log('평균만 보면 긴 꼬리에 가려 중앙값이 하한 아래로 내려간 것을 놓칩니다. 중앙값과 두 비율을 함께 보세요.');
+  console.log('평균만 보면 긴 꼬리에 가려 중앙값이 하한 아래로 내려간 것을 놓칩니다. 중앙값과 두 비율을 함께 보세요. 붕괴 후 종료는 전장 붕괴(120초) 뒤에 끝난 전투 비율입니다.');
 
   section('몬스터 종별 승률과 전투 시간 (인원 오름차순)');
   if (r.perDef.length === 0) {

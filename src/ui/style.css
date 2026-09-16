@@ -245,14 +245,37 @@ button, input, select { font: inherit; }
 .canvas-wrap {
   width: 100%;
   max-width: 100%;
-  aspect-ratio: 40 / 30;
+  /* 맵 28×20 + 사방 1.5 유닛 여백 = 31 : 23 (MAP_DEFAULT_WIDTH/HEIGHT + 2 × MAP_MARGIN_UNITS) */
+  aspect-ratio: 31 / 23;
   border-radius: var(--radius);
   overflow: hidden;
   border: 1px solid var(--line);
-  background: #000;
+  background: #0b0e14;
 }
 .battle-canvas { width: 100%; height: 100%; display: block; }
+/* 도트 모드: 화면 캔버스도 최근접 보간으로 표시해 픽셀 느낌을 유지한다 */
+.canvas-wrap.mode-pixel .battle-canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
 .controls { display: flex; gap: 6px; justify-content: center; flex-wrap: wrap; }
+.controls .mode-btn { margin-left: 8px; }
+/* 전장 붕괴 배너 (120초 이후). 캔버스 안에도 같은 배너가 그려진다 */
+.attrition-banner {
+  text-align: center;
+  font-weight: 700;
+  font-size: 13px;
+  color: #ffe1e1;
+  background: linear-gradient(90deg, rgba(90, 20, 20, 0.3), rgba(140, 30, 30, 0.85), rgba(90, 20, 20, 0.3));
+  border: 1px solid rgba(255, 90, 90, 0.7);
+  border-radius: 8px;
+  padding: 4px 10px;
+  animation: attrition-pulse 1.1s ease-in-out infinite;
+}
+@keyframes attrition-pulse {
+  0%, 100% { box-shadow: 0 0 4px rgba(255, 70, 70, 0.3); border-color: rgba(255, 90, 90, 0.5); }
+  50% { box-shadow: 0 0 14px rgba(255, 70, 70, 0.8); border-color: rgba(255, 120, 120, 1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .attrition-banner { animation: none; }
+}
 .capture-bar { display: flex; align-items: center; gap: 8px; }
 .capture-bar .bar { height: 10px; }
 .kill-card { min-height: 60px; }
@@ -480,3 +503,4 @@ body.hud-on .sticky-bar { top: 48px; }
 .day-summary .taken-list li:last-child { border-bottom: none; }
 .day-points { margin-top: 10px; font-size: 16px; font-weight: 700; color: var(--warn); }
 .reward-box { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); text-align: left; display: inline-block; }
+.kill-log .attrition-text { color: #ff8a80; font-weight: 700; }

@@ -43,6 +43,13 @@
  *   보정 순서: ① EXPECTED_TEAM_POWER_BY_DAY 를 실측치로 교체 → ② 난이도별 TIER_POWER_RATIO / DAY_DIFFICULTY_EXPONENT
  *   → ③ 종별 powerScale(전체 승률) 과 SPECIES_DAY_EXPONENT_ADJUST(일차 기울기) 를 번갈아 수렴.
  *   같은 난이도 안에서 1기 보스와 8기 떼의 승률 편차 목표는 ±8%p (GDD §11).
+ * 보정 현황 (v0.7, 2026-09-17. 맵 28×20 축소·빙하 눈보라·전장 붕괴(120초) 도입 뒤 재보정. `--runs 40`, 시드 1 / 4242 / 9001 합산 1,200판/난이도)
+ *   도입 직후 실측: 하급 98.9 / 중급 83.7 / 고급 58.6%. 고급은 전 종이 55~64% 로 쉬워졌고(맵이 좁아져 보스 광역을 덜 맞고 접근이 빨라짐)
+ *   10일차 69% 로 후반이 더 쉬웠다. 중급은 하피 90.0 / 망령 88.3% 로 5~8 구간 편차 8.4p. 빙하 차이는 중급 +3.6p / 고급 +2.2p 로 처음부터 ±10p 안.
+ *   조치: ① EXPECTED_TEAM_POWER_BY_DAY 실측 교체(±5 이내) ② 고급 비율 1.011→1.018 + 지수 0.37→0.41 (후반 기울기) + 1일차 완화 0.925→0.935
+ *   ③ 종별 powerScale (아래 메모). 빙하 전용 보정은 필요 없어 두지 않았다.
+ *   결과: 하급 99.3 / 중급 81.5 / 고급 49.7%. 인원 구간 하급 100.0 / 97.8 / 100.0 (2.2p), 중급 82.8 / 80.6 / 81.7 (2.3p), 고급 49.8 / 49.2 / 49.6 (0.6p).
+ *   빙하 차이 중급 +1.8p / 고급 −2.4p. 고급 일차별 45.0~55.8% (1일차 47.5, 10일차 55.0). 평균 전투 시간 48.5 / 50.0 / 52.8초, 붕괴 후 종료 1.5~2.2%.
  * 주의 1: 결정론 시뮬레이션이라 승률이 전투력에 매우 민감하다. 전투력 1% 변화가 승률 4~8%p 를 움직인다
  *         (50% 근처인 고급이 가장 가파르다). TIER_POWER_RATIO / powerScale 은 0.005~0.01 단위로만 움직이고
  *         반드시 두 시드 그룹으로 재측정할 것. 종별 승률의 표준오차는 60회 육성 기준 ±5%p 다.
@@ -93,15 +100,15 @@ import { clampStat, powerRating } from '../stats';
  */
 export const EXPECTED_TEAM_POWER_BY_DAY: readonly number[] = [
   3774, // 1일차
-  3921, // 2일차
-  4073, // 3일차
-  4249, // 4일차
-  4421, // 5일차 (분화 시작)
-  4580, // 6일차
-  4702, // 7일차
-  4841, // 8일차
-  4967, // 9일차
-  5088, // 10일차
+  3927, // 2일차
+  4077, // 3일차
+  4254, // 4일차
+  4424, // 5일차 (분화 시작)
+  4581, // 6일차
+  4705, // 7일차
+  4843, // 8일차
+  4969, // 9일차
+  5092, // 10일차
 ];
 
 /** 일차를 1..TOTAL_DAYS 로 클램프 */
@@ -145,13 +152,14 @@ export function expectedPlayerPower(day: number): number {
  * 다른 시드군(9001~, 5001~)에서는 중급 -8p / 고급 -7p 였다. 세 시드군(각 난이도 600판) 평균으로 맞춘 값이다.
  * v0.6 (스킬 위력 상향 뒤): 하급 0.76→0.82 (전투 시간 중앙값 32→43초, 승률 98.7→97.6%), 중급 0.830→0.849 (86.3→82.0%),
  * 고급 0.980→1.011 (고급 지수를 0.48→0.37 로 내린 몫을 10일차 기준으로 되돌린 값. 지수와 세트로 움직인다).
+ * v0.7 (맵 축소·눈보라·붕괴 뒤): 고급 1.011→1.018 (58.6→49.7%, 지수 0.41 과 세트). 하급·중급은 종별 powerScale 만 움직였다.
  * 전투력 점수는 스탯 합이라 편성 형태를 모른다. 인원 차이는 countPowerFactor 가, 종별 효율 차이는
  * 각 MonsterDef.powerScale 이 흡수한다.
  */
 export const TIER_POWER_RATIO: Record<MonsterTier, number> = {
   low: 0.82,
   mid: 0.855,
-  high: 1.011,
+  high: 1.018,
 };
 
 /**
@@ -166,11 +174,13 @@ export const TIER_POWER_RATIO: Record<MonsterTier, number> = {
  * v0.6: 고급 0.48→0.37. 스킬 상향 뒤 고급 2~4일차가 5~10일차보다 10p 쉬웠다(67/62/58 vs 51). 지수를 내리고 TIER_POWER_RATIO.high 를
  * 0.980→1.011 로 올려 10일차 강도는 그대로 두고 2~4일차만 1~2% 올렸다 (결과 2~4일차 59/51/43, 5~10일차 44~55).
  * 하급·중급은 1일차를 뺀 곡선이 평평해 그대로 두었다 (1일차는 EARLY_DAY_RELIEF 가 맡는다).
+ * v0.7: 고급 0.37→0.41. 맵 축소 뒤 고급 1~4일차 55.6% / 5~10일차 60.6% (10일차 69%) 로 후반이 쉬워져 지수를 올렸다
+ * (10일차 기준 +1.5%). 결과 1일차 47.5 / 10일차 55.0, 전 일차 45~56%.
  */
 export const DAY_DIFFICULTY_EXPONENT: Record<MonsterTier, number> = {
   low: 0.30,
   mid: 0.28,
-  high: 0.37,
+  high: 0.41,
 };
 
 /**
@@ -218,11 +228,12 @@ function dayDifficulty(tier: MonsterTier, day: number, dayExpAdjust: number = 0)
  * 보정B: 난이도별로 나눴다. 하급 1일차가 세 시드 그룹 합산 90~92.5% 로 95% 하한 아래에 남아 하급만 0.925→0.90.
  * 중급 1일차는 합산 75.8~82% 로 하한 근처라 공통 값을 내리면 안 되므로 고급은 0.925 그대로. 중급은 TIER_POWER_RATIO.mid 와
  * 하피·망령 powerScale 을 올린 뒤 1일차가 합산 70.8% (67.5 / 77.5 / 67.5) 로 내려가 0.925→0.91 (73.3%) →0.89 (2~10일차는 목표 안이라 그대로).
+ * v0.7: 고급 0.925→0.935. 맵 축소 뒤 고급 1일차가 합산 56.7~59.2% 로 2~10일차보다 5~8p 쉬워 1일차만 1% 올렸다 (결과 47.5%).
  */
 const EARLY_DAY_RELIEF: Record<MonsterTier, readonly number[]> = {
   low: [0.9],
   mid: [0.89],
-  high: [0.925],
+  high: [0.935],
 };
 
 function earlyDayRelief(tier: MonsterTier, day: number): number {
@@ -640,6 +651,11 @@ const T_FALLEN_PRIEST = tpl('healer', '타락 사제', {
 //    HP 편중 derivedMult(maxHp 1.4 / 공격 0.8)를 붙여 중급 전투 시간을 늘렸는데 mixFactor 보정만으로는 승률이 90% 대로 올라
 //    하피 1.335→1.43, 망령 1.030→1.06 으로 되돌렸다 (하피는 derivedMult 뒤 powerScale 1% 당 승률 1p 정도만 움직여 크게 올렸다). 스킬 계수 보정B(플레이어 광역·주력기 상향)로 중급 전체가 86.5% 가 되어
 //    TIER_POWER_RATIO.mid 0.849→0.855.
+//  - v0.7 (맵 28×20·눈보라·붕괴, 시드 1 / 4242 / 9001 합산): 중급은 하피 1.43→1.465 (90.0→81.7%. 이번엔 1% 당 4p 움직였다), 망령 1.06→1.075 (88.3→81.5),
+//    리빙 아머 0.643→0.658 (85.3→84.8. +0.8% 에서 89.0 으로 올라간 것은 표본 잡음이었고 +1.5% 에서 내려왔다), 대족장 0.358→0.355 (77.7→80.9).
+//    고급은 골렘 0.276→0.2735 (58.7→52.0), 드래곤 0.311→0.316 (63.6→48.5), 화염 거인 0.479→0.483 (59.9→49.1), 리치 1.000→1.006 (59.9→50.5),
+//    심연 1.180→1.168 (55.1→48.8), 마신 군단 0.909→0.903 (54.4→49.2). 결과 종별 승률: 하급 96.3~100%, 중급 79.6~84.8%, 고급 48.5~52.0%.
+//    빙하맵 승률은 중급 +1.8p / 고급 −2.4p 로 다른 맵과 같아 빙하 전용 종·난이도 보정은 두지 않았다 (필요해지면 makeEncounter 뒤 map 별 배율로 붙인다).
 
 const MONSTER_LIST: MonsterDef[] = [
   // ══════════ 하급 ══════════
@@ -728,7 +744,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_HARPY_RAIDER, count: 2 },
     ],
     preferredMaps: ['plains', 'glacier'],
-    powerScale: 1.43,
+    powerScale: 1.465,
   },
   {
     id: 'living_armor',
@@ -740,7 +756,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_AWAKENED_GREATSWORD, count: 1 },
     ],
     preferredMaps: ['dark', 'glacier'],
-    powerScale: 0.643,
+    powerScale: 0.658,
   },
   {
     id: 'bandit_crew',
@@ -766,7 +782,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_SORROW_PRIEST, count: 1 },
     ],
     preferredMaps: ['dark', 'glacier'],
-    powerScale: 1.06,
+    powerScale: 1.075,
   },
   {
     id: 'orc_chieftain',
@@ -775,7 +791,7 @@ const MONSTER_LIST: MonsterDef[] = [
     desc: '부족을 홀로 이끄는 거대한 오크. 충격파(예고 1.2초, 반경 4)로 뭉친 적을 밀어내고 흔들리는 땅이 장판으로 남는다.',
     units: [{ template: T_ORC_CHIEFTAIN, count: 1 }],
     preferredMaps: ['plains', 'desert'],
-    powerScale: 0.358,
+    powerScale: 0.355,
   },
 
   // ══════════ 고급 ══════════
@@ -786,7 +802,7 @@ const MONSTER_LIST: MonsterDef[] = [
     desc: '태고의 바위 거인 1기. 대지진(예고 1.4초, 반경 5, 3초 장판)과 대지 분쇄로 전열을 통째로 부순다. 예고를 보고 흩어지는 팀만 살아남는다.',
     units: [{ template: T_ANCIENT_GOLEM, count: 1 }],
     preferredMaps: ['desert', 'plains'],
-    powerScale: 0.276,
+    powerScale: 0.2735,
   },
   {
     id: 'frost_dragon',
@@ -795,7 +811,7 @@ const MONSTER_LIST: MonsterDef[] = [
     desc: '홀로 하늘을 덮는 용. 빙하 감옥(예고 1.3초, 반경 4.5, 4초 냉기 장판)과 서리 숨결로 뭉친 적을 얼린다.',
     units: [{ template: T_FROST_DRAGON, count: 1 }],
     preferredMaps: ['glacier'],
-    powerScale: 0.311,
+    powerScale: 0.316,
   },
   {
     id: 'inferno_lord',
@@ -807,7 +823,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_DEMON_GUARD, count: 1 },
     ],
     preferredMaps: ['desert', 'dark'],
-    powerScale: 0.479,
+    powerScale: 0.483,
   },
   {
     id: 'lich_host',
@@ -820,7 +836,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_WRAITH_PRIEST, count: 1 },
     ],
     preferredMaps: ['dark', 'glacier'],
-    powerScale: 1.000,
+    powerScale: 1.006,
   },
   {
     id: 'abyss_pack',
@@ -832,7 +848,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_SHADOW_TENDRIL, count: 5 },
     ],
     preferredMaps: ['dark'],
-    powerScale: 1.180,
+    powerScale: 1.168,
   },
   {
     id: 'demon_legion',
@@ -846,7 +862,7 @@ const MONSTER_LIST: MonsterDef[] = [
       { template: T_FALLEN_PRIEST, count: 1 },
     ],
     preferredMaps: [],
-    powerScale: 0.909,
+    powerScale: 0.903,
   },
 ];
 
@@ -929,7 +945,9 @@ interface UnitDraft {
  * - 유닛 스탯을 일차와 def.powerScale 에 맞춰 스케일하고, 스탯 상한 때문에 모자란 강도는 derivedMult 로 채운다.
  * - 결과 팀의 실효 전투력(monsterTeamPower) 합은 monsterPowerTarget(tier, day, powerScale, 인원) 에 맞춰진다.
  *   즉 떼는 한 기당 목표/인원(×1.15), 단독 보스는 목표 전체(×1.25)를 한 몸에 싣는다.
- * - 모든 유닛은 monster 표식, 한국어 이름(여러 마리면 'A'~'H' 구분), 전 맵 적응도 50 을 갖는다.
+ * - 모든 유닛은 monster 표식(kind = 템플릿 이름, species = MonsterDef.id), 한국어 이름(여러 마리면 'A'~'H' 구분),
+ *   전 맵 적응도 50 을 갖는다 (v0.7: 기믹 피해 배율 hazardAdaptationMult(50) = 1.0, 즉 몬스터는 눈보라를 기준 피해로 받는다).
+ * - 몬스터는 세부 직업을 갖지 않는다 (subJob null). 언젠가 분화를 붙인다면 growth/choices.ts 의 applySubJob 을 써야 한다.
  */
 export function buildMonsterTeam(def: MonsterDef, day: number, rng: Rng, idPrefix: string): Team {
   const d = clampDay(day);
@@ -1032,7 +1050,8 @@ export function buildMonsterTeam(def: MonsterDef, day: number, rng: Rng, idPrefi
       growthVariance: {},
       skills: t.skills.slice(),
       rarity: TIER_RARITY[def.tier],
-      monster: { kind: t.name, tier: def.tier },
+      // species = MonsterDef.id → 도트 스프라이트 키 'monster_<species>' (spriteTypes.ts MONSTER_SPECIES 와 일치)
+      monster: { kind: t.name, tier: def.tier, species: def.id },
       derivedMult,
     });
   }

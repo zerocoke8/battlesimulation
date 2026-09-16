@@ -27,8 +27,11 @@
 - `src/core/gen/charGen.ts` 캐릭터 풀 / 상대팀 랜덤 생성
 - `src/core/growth/choices.ts` 로그라이크 선택지 생성·적용, 희귀도, `estimatePowerDelta`
 - `src/core/growth/run.ts` 육성 상태 머신 (10일 × 5스텝)
-- `src/ui/storage.ts` localStorage 저장(`SAVE_VERSION = 3`), 고스트 스냅샷
-- `src/ui/app.ts` 화면 흐름, `src/ui/render.ts` 캔버스 렌더러, `src/ui/style.css`
+- `src/ui/storage.ts` localStorage 저장(`SAVE_VERSION = 3`), 고스트 스냅샷, 렌더 모드(`bs:renderMode`)
+- `src/ui/app.ts` 화면 흐름, `src/ui/render.ts` 캔버스 렌더러(간단 모드), `src/ui/style.css`
+- `src/ui/pixel/spriteTypes.ts` 도트 스프라이트 계약 (`SpriteMeta`, `DEFAULT_META`, `spriteKeyForUnit`, `ALL_SPRITE_KEYS`)
+- `src/ui/pixel/*` 도트 렌더러(기본 모드): 코드 생성 임시 스프라이트, `public/sprites/` 로더(폴백), 픽셀 지형·이펙트
+- `docs/SPRITES.md` 스프라이트 에셋 규격 (작가용). `spriteTypes.ts` 와 항상 일치시킬 것
 - `tools/headless.ts` 대량 시뮬레이션 CLI
 
 ## 용어 (v0.4)
@@ -54,3 +57,20 @@
 - 스킬 데이터: `isZoneSkill(id)` (skills.ts) = enemy_area/line 이거나 예고·장판이 있는 스킬. UI 의 스킬명 외치기 말풍선 크기에 쓴다.
   모든 메인 직업 기본 풀에 광역 피해 스킬 1개 이상, 마법사 `starterSkills` 는 전부 광역 (`npm run headless -- --skills` 가 검사, 종료 코드 반영).
 - 스킬 `desc` 는 손으로 쓰지 않는다. `describeActive`/`describePassive` 가 스펙 숫자로 문장을 만든다.
+
+## v0.7 계약 (types.ts)
+- 맵 28×20 (`MAP_DEFAULT_WIDTH/HEIGHT`). 스폰 기준 열 A x=4, B x=24, 세로 중심 10. 캔버스는 맵 사방에 `MAP_MARGIN_UNITS = 1.5` 여백 프레임을 그린다 (유닛은 맵 안에만).
+- 승리 조건: 전 맵 `annihilation_or_hp`, `timeLimitSec = MAP_TIME_LIMIT_SEC(240)`. 빙하 거점(capture) 제거 (타입은 남김, `BattleFrame.capture` 는 항상 null).
+- **맵 기믹** `MapDef.hazards: HazardDef[]` (없으면 `[]`). 기믹 영역은 기존 Zone: `side: 'neutral'`, casterId `HAZARD_CASTER_ID('map')`, skillId = hazard.id. 양 팀 모두 피해·회피 판정.
+  - 파도 n: `interval(n) = max(minIntervalSec, intervalSec − intervalDecayPerWave × n)`, `radius(n) = min(maxRadius, radius + radiusGrowthPerWave × n)`. 첫 파도 `startSec`.
+  - 피해는 대상 최대 HP 의 % (방어 무시, 보호막 적용). `adaptationScaled` 면 × `hazardAdaptationMult(적응도)` = `1 − (적응도 − 50) × HAZARD_ADAPT_SCALE(0.006)`. 소환물은 소환사 적응도.
+  - 이벤트: `{ kind: 'hazard_damage'; hazardId; to; damage; phase: 'impact' | 'linger'; school }`. impact 는 결과 이벤트에도, linger 는 프레임 이벤트에만. `zone`/`dodge` 이벤트의 from/skillId 는 'map'/hazard.id.
+  - 빙하 눈보라 = `hazard_blizzard` (`name '눈보라'`, ice, 10초 시작, 12초 간격 −0.5/파도 → 최소 4, 반경 3.5 +0.1/파도 → 최대 5, 예고 1.2, 최대 HP 5% + 장판 3초 1.2%/초 둔화 0.5 (보정값)).
+- **전장 붕괴** (전 맵): `ATTRITION_START_SEC = 120` 부터 살아있는 모든 유닛(소환물 포함)이 초당 최대 HP 의 `attritionRatePctPerSec(t)` % 를 잃는다 (`ATTRITION_BASE_PCT 0.3 + ATTRITION_ACCEL_PCT 0.05 × (t − 120)`). 방어·보호막 무시, 회복 유효.
+  - 이벤트: `{ kind: 'attrition_start' }` 1회(결과에도), `{ kind: 'attrition'; to; damage }` 틱마다(프레임만). `damageTaken` 에 포함, 가해자 없음.
+  - `BattleFrame.attritionPctPerSec` (붕괴 전 0), `BattleResult.endedInAttrition`. UI 는 120초 이후 '전장 붕괴' 배너 + 현재 %/초, HP 바 붉은 표시.
+- `ZoneSnapshot.side: ZoneSide = TeamSide | 'neutral'`. 렌더러·헤드리스는 'neutral' 을 처리해야 한다.
+- `SubJobDef.adaptationBonus?: Partial<Adaptation>` — 분화(`set_subjob`) 시 가산, 상한 `STAT_MAX`. mage_ice `{ glacier: 25 }`. 플레이어·생성 상대·몬스터 분화 경로 모두 같은 함수.
+- `UnitSnapshot.spriteKey?` — sim 이 채운다: 직업 = mainJob id, 소환물 = `summon_<kind>`, 몬스터 = `monster_<Character.monster.species ?? kind>`. `Character.monster.species?` = MonsterDef.id (monsters.ts 가 채움).
+- `RenderMode = 'pixel' | 'simple'` (`DEFAULT_RENDER_MODE 'pixel'`, `RENDER_MODE_NAME_KO`). 저장 키 `RENDER_MODE_STORAGE_KEY = 'bs:renderMode'` (spriteTypes.ts). 두 렌더러는 같은 `BattleFrame` 만 소비한다.
+- 헤드리스 피해 분류에 `hazard_damage`(기믹)·`attrition`(붕괴)을 추가한다. 빙하 기믹 피해 비중 목표 8~20%, 붕괴 후 종료 비율 < 15% (GDD §11).
