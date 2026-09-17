@@ -212,8 +212,9 @@ export function tintForSubJob(subJob: SubJobId | null | undefined): string | und
 /**
  * RGBA 픽셀 배열의 채도 있는 픽셀만 tint 의 색상(hue)으로 돌린다. 명도·채도는 유지. 제자리 변경.
  * 피부·금속·외곽선처럼 채도가 낮은 픽셀과 매우 밝거나 어두운 픽셀은 그대로 둔다.
+ * 명시적 RGBA 마스크가 있으면 채도 기준 대신 마스크의 알파로 영역을 한정한다.
  */
-export function applyHueTint(data: Uint8ClampedArray, tint: string): void {
+export function applyHueTint(data: Uint8ClampedArray, tint: string, mask?: Uint8ClampedArray): void {
   const [tr, tg, tb] = hexToRgb(tint);
   const [th, ts] = rgbToHsl(tr, tg, tb);
   // 회색 계열 틴트(채도 낮음)면 아무것도 바꾸지 않는다
@@ -222,6 +223,7 @@ export function applyHueTint(data: Uint8ClampedArray, tint: string): void {
   for (let i = 0; i < data.length; i += 4) {
     const a = data[i + 3];
     if (a === 0) continue;
+    if (mask && !mask[i + 3]) continue;
     const r = data[i];
     const g = data[i + 1];
     const b = data[i + 2];
@@ -235,7 +237,7 @@ export function applyHueTint(data: Uint8ClampedArray, tint: string): void {
     }
     const [, s, l] = rgbToHsl(r, g, b);
     let out = packed;
-    if (s >= TINT_SAT_MIN && l >= TINT_LIGHT_MIN && l <= TINT_LIGHT_MAX) {
+    if (mask || (s >= TINT_SAT_MIN && l >= TINT_LIGHT_MIN && l <= TINT_LIGHT_MAX)) {
       const [nr, ng, nb] = hslToRgb(th, s, l);
       out = (nr << 16) | (ng << 8) | nb;
     }

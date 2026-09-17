@@ -96,7 +96,12 @@ export async function loadExternalSheet(key: SpriteKey): Promise<SpriteSheet | n
   const [img, meta] = await Promise.all([loadImage(urls.png), loadMeta(urls.json)]);
   if (!img) return null;
   checkSheetSize(key, img, meta);
-  return { key, image: img, meta, tintable: isTintableKey(key) };
+  let tintMask: HTMLImageElement | null = null;
+  if (meta.tintMask) {
+    const loaded = await loadImage(urls.png.slice(0, urls.png.lastIndexOf('/') + 1) + meta.tintMask);
+    if (loaded && loaded.naturalWidth === img.naturalWidth && loaded.naturalHeight === img.naturalHeight) tintMask = loaded;
+  }
+  return { key, image: img, meta, tintable: isTintableKey(key), ...(tintMask ? { tintMask } : {}) };
 }
 
 /** 로드를 한 번만 시작한다. 이미 시작했으면 그 Promise */
@@ -143,6 +148,8 @@ export function hasExternalSheet(key: SpriteKey): boolean {
 
 /** 외부 시트(이미지)에 팔레트 틴트를 적용한 복사본 (캐시). 캔버스에 그려 픽셀을 바꾼다 */
 function tintExternal(sheet: SpriteSheet, tint: string): SpriteSheet {
+  // If an authored mask fails to load, preserve the source art's face colors.
+  if (sheet.meta.tintMask && !sheet.tintMask) return sheet;
   const ck = `${sheet.key}|${tint}`;
   const hit = TINTED_EXTERNAL.get(ck);
   if (hit) return hit;
@@ -158,7 +165,13 @@ function tintExternal(sheet: SpriteSheet, tint: string): SpriteSheet {
     if (ctx) {
       ctx.drawImage(img, 0, 0);
       const data = ctx.getImageData(0, 0, w, h);
-      applyHueTint(data.data, tint);
+      let mask: Uint8ClampedArray | undefined;
+      if (sheet.tintMask) {
+        ctx.clearRect(0, 0, w, h);
+        ctx.drawImage(sheet.tintMask, 0, 0);
+        mask = ctx.getImageData(0, 0, w, h).data;
+      }
+      applyHueTint(data.data, tint, mask);
       ctx.putImageData(data, 0, 0);
       result = { key: sheet.key, image: canvas, meta: sheet.meta, tintable: true };
     }

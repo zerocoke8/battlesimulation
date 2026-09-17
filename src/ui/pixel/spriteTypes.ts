@@ -32,6 +32,8 @@ export interface SpriteMeta {
   /** 발 위치. 이 점이 유닛의 (x, y) 에 놓인다 */
   anchor: { x: number; y: number };
   anims: Record<AnimName, AnimDef>;
+  /** Optional authored clothing-only mask, relative filename beside the PNG. */
+  tintMask?: string;
 }
 
 export interface SpriteSheet {
@@ -40,6 +42,8 @@ export interface SpriteSheet {
   meta: SpriteMeta;
   /** true 면 세부 직업·팀 색에 따라 팔레트 틴트를 적용할 수 있다 (직업 시트). 몬스터·소환물은 false */
   tintable: boolean;
+  /** Authored mask protects face, blush, hair and equipment from class recolors. */
+  tintMask?: CanvasImageSource;
 }
 
 /** 기본 프레임 크기 */
@@ -205,5 +209,7 @@ export function parseSpriteMeta(raw: unknown): SpriteMeta | null {
       anims[name] = { ...base };
     }
   }
-  return { frameW, frameH, anchor, anims };
+  const tintMask = typeof o.tintMask === 'string' && /^[a-z0-9_]+\.tint\.png$/.test(o.tintMask)
+    ? o.tintMask : undefined;
+  return { frameW, frameH, anchor, anims, ...(tintMask ? { tintMask } : {}) };
 }
