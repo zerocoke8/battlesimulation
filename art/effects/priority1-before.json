@@ -1,0 +1,254 @@
+﻿[
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\crit_star.json",
+        "Hash":  "AC9A227A05EAC3DC248E4DDCEE0FDCB627F8B81A34535F0DADDA2068B8AE93C8"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\crit_star.png",
+        "Hash":  "A3F76DC9F0CC1A98070A78D70436800F6679D738ED3ADAE827E8A811E0607BF6"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\death_poof.json",
+        "Hash":  "D81DD566E4A6975F4E1B6DFFB9069E7414AABE11FE436D9F7F72D6D4373A23FB"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\death_poof.png",
+        "Hash":  "6DBEF0559993C29D3B9D8CEAEBEA6A1050C714DB86AC204548C1D6FC999F85C7"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\heal_burst.json",
+        "Hash":  "81AF45E5E0925FD22F8A9FAA3E273E01642B2FF6D82BDDC366DA33C3C72B0322"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\heal_burst.png",
+        "Hash":  "10265C8BE7BC98F2780C2E93FA2D8FFF63FE2DE03540B83FC76691441792FD0C"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_fire.json",
+        "Hash":  "4AF92B8F6064BA177E21763BD5BE12B477223DD36C39D63EA3A5ABDFC98EF906"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_fire.png",
+        "Hash":  "E406EE5D248050BCD4860093AAEAA22B29D027CA7F4C1090EB561A55C5485807"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_holy.json",
+        "Hash":  "4AF92B8F6064BA177E21763BD5BE12B477223DD36C39D63EA3A5ABDFC98EF906"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_holy.png",
+        "Hash":  "D69ECB63F5D5B46EE72B829A1D789725DBB36448214A30E112BF0443A42D494D"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_ice.json",
+        "Hash":  "4AF92B8F6064BA177E21763BD5BE12B477223DD36C39D63EA3A5ABDFC98EF906"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_ice.png",
+        "Hash":  "6303EE9DC6E9E0876E647A3D4EF2B276422C878A35BA7777A7092A4E15D9E5B5"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_lightning.json",
+        "Hash":  "4AF92B8F6064BA177E21763BD5BE12B477223DD36C39D63EA3A5ABDFC98EF906"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_lightning.png",
+        "Hash":  "10F50EDAB8078CE2164E2704C31E9990C3F96FBFE426F35E3BCA0CC9393EE0BD"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_nature.json",
+        "Hash":  "4AF92B8F6064BA177E21763BD5BE12B477223DD36C39D63EA3A5ABDFC98EF906"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_nature.png",
+        "Hash":  "A6F527D9FF2C671B2E6C765C284B630C1B765A2709116582745D83EC7280E830"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_phys.json",
+        "Hash":  "3FE4E85EE7089F6D23CAD5BCE31C98C3A27DFA929B8154D930608A3AC8B17C5A"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_phys.png",
+        "Hash":  "AD0B2C3B348D846BDE389F48951775CAF8F249A968E54E7E7743806187ECFE78"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_shadow.json",
+        "Hash":  "4AF92B8F6064BA177E21763BD5BE12B477223DD36C39D63EA3A5ABDFC98EF906"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\impact_shadow.png",
+        "Hash":  "B95A168F5F1EB18DCA1091E2832784070ABB20423FC0A6829D2248931D86B92B"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_arrow.json",
+        "Hash":  "81D20B0B8A40250D2C87D3709559615D1A08636100CBD92552606ACA79194D11"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_arrow.png",
+        "Hash":  "F388CF82BE0A30E178D1CCC298B38725BC6600C494DB5CC8920FB1B2C46C17D8"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_bullet.json",
+        "Hash":  "1DFDB940EE9185B9152EEE842B99D9A0C68EB3698264A7280468454E95E51823"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_bullet.png",
+        "Hash":  "3774FA27F64D028C4CFBB2C09AF085B227DFDF2A42A36B476B3BEA1399435185"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_fire.json",
+        "Hash":  "1DFDB940EE9185B9152EEE842B99D9A0C68EB3698264A7280468454E95E51823"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_fire.png",
+        "Hash":  "768D52F0F153654089C7F46127A4CA9B65F9DCE21D4EE759F3FA79E7C81FB200"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_holy.json",
+        "Hash":  "1DFDB940EE9185B9152EEE842B99D9A0C68EB3698264A7280468454E95E51823"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_holy.png",
+        "Hash":  "5DCFB3AF2C79555341D1936084CF6981119605BAF7360E290CE5DEF5F4E34B40"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_ice.json",
+        "Hash":  "1DFDB940EE9185B9152EEE842B99D9A0C68EB3698264A7280468454E95E51823"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_ice.png",
+        "Hash":  "B3907B9A48C4C64866246D54E99DDA68B1A4CFDA136626300CFE7800832976EE"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_lightning.json",
+        "Hash":  "1DFDB940EE9185B9152EEE842B99D9A0C68EB3698264A7280468454E95E51823"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_lightning.png",
+        "Hash":  "CEE2D7430DD13D7A23FFF740F9C015BBAEE534649AA5EE0F119491A2861609F2"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_nature.json",
+        "Hash":  "1DFDB940EE9185B9152EEE842B99D9A0C68EB3698264A7280468454E95E51823"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_nature.png",
+        "Hash":  "26420BD468E0652BE61B05530BD3980DC226798EE4A1E9A988E9F1CCCA61BCB7"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_shadow.json",
+        "Hash":  "1DFDB940EE9185B9152EEE842B99D9A0C68EB3698264A7280468454E95E51823"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\proj_orb_shadow.png",
+        "Hash":  "CFF03392DA09378C9C66A80C7863256D73421F713A0B5AF6A750B86EFE77E7FC"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\slash_heavy.json",
+        "Hash":  "22DE7BBBC62B420138C92F7428559FAF099FD98C1754965778DB2288F21ACBBD"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\slash_heavy.png",
+        "Hash":  "213421B56CD1F271063D0D26CAA66EDC6C8E3F44AB8ADBDD82F1404341279D1B"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\slash_light.json",
+        "Hash":  "22DE7BBBC62B420138C92F7428559FAF099FD98C1754965778DB2288F21ACBBD"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\slash_light.png",
+        "Hash":  "6D97B90780952CB84DF979E57D611B858CC75B104D6607E97941C706C207B3C2"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\slash_pierce.json",
+        "Hash":  "22DE7BBBC62B420138C92F7428559FAF099FD98C1754965778DB2288F21ACBBD"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\public\\effects\\slash_pierce.png",
+        "Hash":  "C6D30F41C26512A14F9BFE2E752F2B4B3D374C6944C70CA827EC378CC56413D1"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\crit_star.aseprite",
+        "Hash":  "901D6FC3CC7B3FF5D9EB11A01C99A7CB2924606392A4157FFE035A920DB34899"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\death_poof.aseprite",
+        "Hash":  "4A1AFF1F185DC5B2F8916C19C22B6059BCB8FE1CC7F62B697AFC61FDB8D504F3"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\heal_burst.aseprite",
+        "Hash":  "09A923510A4EFACBE838B69D9EDD0516FB239617F945224B3B099E7B20C2B221"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\impact_fire.aseprite",
+        "Hash":  "95C5A4795C637B2E57C151BCFC51AF878C5E0F0C50586150940A35A1D576F27E"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\impact_holy.aseprite",
+        "Hash":  "6AA0A8A9B2EE82FC69781FE7F0BF747A885178B4C478A2512BA1ADA93A00C087"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\impact_ice.aseprite",
+        "Hash":  "BED711208E99A647EA9E09620DB86FC676288B68E81DC09AF4E185438819EDDE"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\impact_lightning.aseprite",
+        "Hash":  "B7C2339EE971DC44CC587F0980E0F7CEF5702B7857B40CDBEE6A40656B27F428"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\impact_nature.aseprite",
+        "Hash":  "AD128D6F463F244B295C61F6AC75021017490307243A7DBECBC713BF1AFA2AFA"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\impact_phys.aseprite",
+        "Hash":  "845FAC3FE2F85FFEF3378AB2A129010143E0A67FB5F493DF04271B0807A7CA66"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\impact_shadow.aseprite",
+        "Hash":  "BEC1B5895EEC50874AA8F1CCB7D06B026BD12281480B96457BA5A0D167E4481F"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_arrow.aseprite",
+        "Hash":  "D5E6A28FB5625A4D91B97BAB282B4CB6C943E6517F69345C0482E94856FCD5DE"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_bullet.aseprite",
+        "Hash":  "385AB5742520A5B7FB2A02B4D494F154FC84B0EB7E7B0B1982662ABCCD4C71F8"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_orb_fire.aseprite",
+        "Hash":  "F35F3E188E00F045183E711850184D8A7AED03A134ACB9F894C757709EF3AF13"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_orb_holy.aseprite",
+        "Hash":  "79FDCD475B09A1203597AA9D5F1F1150611125E25EBE5AB9556DC24E31D7E22D"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_orb_ice.aseprite",
+        "Hash":  "A36B19086167F051A5AB1A25BFDA3BE18D4E5A215CC7618FC042586DA6D5C200"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_orb_lightning.aseprite",
+        "Hash":  "B874D29FFDC01F5FFE951B966F7BEC30610C0583EBB0C473AF4991AA60BD4F7F"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_orb_nature.aseprite",
+        "Hash":  "82935FBF18C0A79B1772FB875BB2E9B583B14681F9942509175C76A50D261E53"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\proj_orb_shadow.aseprite",
+        "Hash":  "EA5ABC34EA8D65C87955333C3BE53C1AC57E1C2EDB4862FF23D1EE08C5E08BE6"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\slash_heavy.aseprite",
+        "Hash":  "590421BECF0B364118264E6A15B664195FD495E383D38AADEB41CCD2A0D1D49E"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\slash_light.aseprite",
+        "Hash":  "BB9561432A218EB5460F11A2C869DEBB6071E170A0A5564F8B890591F01FA260"
+    },
+    {
+        "Path":  "C:\\Users\\민철\\Desktop\\battlesimulation\\art\\aseprite\\effects\\slash_pierce.aseprite",
+        "Hash":  "F4F41306DD22D2688DAE8B92FCA495E62E0ED9B45618D2E53E7B249771537C18"
+    }
+]

@@ -20,6 +20,23 @@ end
 local function draw(dst,src,dx,dy,add)
   for y=0,src.height-1 do for x=0,src.width-1 do over(dst,dx+x,dy+y,src:getPixel(x,y),add) end end
 end
+local function areaGlyph(src,n)
+  local out=P.image(n,n)
+  for dy=0,n-1 do for dx=0,n-1 do
+    local x0,x1=dx*src.width/n,(dx+1)*src.width/n
+    local y0,y1=dy*src.height/n,(dy+1)*src.height/n
+    local area,r,g,b=0,0,0,0
+    for y=math.floor(y0),math.ceil(y1)-1 do for x=math.floor(x0),math.ceil(x1)-1 do
+      local c=src:getPixel(x,y)
+      if pc.rgbaA(c)>=128 then
+        local w=(math.min(x+1,x1)-math.max(x,x0))*(math.min(y+1,y1)-math.max(y,y0))
+        area=area+w;r=r+pc.rgbaR(c)*w;g=g+pc.rgbaG(c)*w;b=b+pc.rgbaB(c)*w
+      end
+    end end
+    if area>=(x1-x0)*(y1-y0)*.24 then out:drawPixel(dx,dy,pc.rgba(math.floor(r/area+.5),math.floor(g/area+.5),math.floor(b/area+.5),255)) end
+  end end
+  return out
+end
 local keys={'swordsman','tank','berserker','assassin','archer','sniper','mage','summoner','healer'}
 local icons={};local audit={icons={},backgrounds={},passed=false}
 local contact=P.image(9*96,4*96);contact:clear(P.color('252a39'))
@@ -32,9 +49,10 @@ for i,key in ipairs(keys) do
   assert(empty>0 and r>l and b>t,key..': transparent glyph required')
   local size=math.max(r-l+1,b-t+1);local trim=P.image(size,size)
   for y=t,b do for x=l,r do trim:drawPixel(x-l+math.floor((size-r+l-1)/2),y-t+math.floor((size-b+t-1)/2),im:getPixel(x,y)) end end
-  icons[key]=nearest(trim,10,10)
+  trim=nearest(trim,128,128)
+  icons[key]=areaGlyph(trim,10)
   for row,n in ipairs({7,8,10,12}) do
-    local small=P.image(12,12);small:clear(P.color('252a39'));draw(small,nearest(trim,n,n),math.floor((12-n)/2),math.floor((12-n)/2))
+    local small=P.image(12,12);small:clear(P.color('252a39'));draw(small,areaGlyph(trim,n),math.floor((12-n)/2),math.floor((12-n)/2))
     P.blit(contact,P.zoom(small,8),(i-1)*96,(row-1)*96)
   end
   audit.icons[#audit.icons+1]={key=key,width=im.width,height=im.height,transparentPixels=empty}
@@ -65,4 +83,3 @@ end
 audit.passed=true
 local f=assert(io.open(root..'/art/imagegen/verification.json','w'));f:write(json.encode(audit));f:close()
 print('PASS: 4 backgrounds / 9 transparent job glyphs')
-

@@ -1,5 +1,7 @@
 /**
- * 직업 픽셀 아이콘 (v0.8). 도트 모드 HP 바 왼쪽에 붙는 작은 진영 썸네일용.
+ * 직업 픽셀 아이콘. 생성한 PNG 문양을 HP 바 왼쪽 진영 배지에 그린다.
+ * 작은 크기는 면적 기반 불투명 픽셀로 표본화해 가는 자루가 사라지지 않게 한다.
+ * 아래 16×16 마스크는 이미지 로드 전/실패 시의 폴백이다.
  *
  *  - 직업 9종을 16×16 알파 마스크(흑백)로 정의한다. 데이터는 문자열 16줄 × 16칸 ('#' = 칠함, '.' = 빈칸).
  *    마스크는 가장자리 1칸(0행/15행, 0열/15열)을 비워 두어 테두리와 겹치지 않는다.
@@ -314,11 +316,39 @@ function requestJobArtwork(job: MainJob): void {
     }
     if (x1 < x0) return;
     const w = x1 - x0 + 1, h = y1 - y0 + 1;
-    const trimmed = createCanvas(Math.max(w, h), Math.max(w, h));
-    ctx2d(trimmed).drawImage(source, x0, y0, w, h, Math.floor((trimmed.width - w) / 2), Math.floor((trimmed.height - h) / 2), w, h);
+    const edge = Math.max(w, h);
+    const trimmed = createCanvas(128, 128);
+    const tw = Math.max(1, Math.round(w / edge * 128));
+    const th = Math.max(1, Math.round(h / edge * 128));
+    ctx2d(trimmed).drawImage(source, x0, y0, w, h, Math.floor((128 - tw) / 2), Math.floor((128 - th) / 2), tw, th);
     GENERATED_ICONS.set(job, trimmed);
     for (const key of ICON_CACHE.keys()) if (key.startsWith(`${job}|`)) ICON_CACHE.delete(key);
   });
+}
+
+/** Opaque area sampling keeps narrow generated strokes readable at 7–12 px. */
+function drawGeneratedGlyph(ctx: CanvasRenderingContext2D, art: HTMLCanvasElement, x: number, y: number, n: number): void {
+  const data = ctx2d(art).getImageData(0, 0, art.width, art.height).data;
+  for (let dy = 0; dy < n; dy++) {
+    const y0 = dy * art.height / n, y1 = (dy + 1) * art.height / n;
+    for (let dx = 0; dx < n; dx++) {
+      const x0 = dx * art.width / n, x1 = (dx + 1) * art.width / n;
+      let area = 0, red = 0, green = 0, blue = 0;
+      for (let sy = Math.floor(y0); sy < Math.ceil(y1); sy++) {
+        const hy = Math.min(sy + 1, y1) - Math.max(sy, y0);
+        for (let sx = Math.floor(x0); sx < Math.ceil(x1); sx++) {
+          const at = (sy * art.width + sx) * 4;
+          if (data[at + 3] < 128) continue;
+          const weight = hy * (Math.min(sx + 1, x1) - Math.max(sx, x0));
+          area += weight;
+          red += data[at] * weight; green += data[at + 1] * weight; blue += data[at + 2] * weight;
+        }
+      }
+      if (area < (x1 - x0) * (y1 - y0) * 0.24) continue;
+      ctx.fillStyle = `rgb(${Math.round(red / area)},${Math.round(green / area)},${Math.round(blue / area)})`;
+      ctx.fillRect(x + dx, y + dy, 1, 1);
+    }
+  }
 }
 
 /**
@@ -346,39 +376,38 @@ export function jobIconCanvas(job: MainJob, size: number, fg: string, bg: string
 
   const artwork = GENERATED_ICONS.get(job);
   if (artwork) {
-    ctx.drawImage(artwork, b, b, inner, inner);
+    drawGeneratedGlyph(ctx, artwork, b, b, inner);
   } else {
-  // 글리프 (안쪽 상자 기준) + 배경색 1px 외곽선
-  const mask = sampleJobMask(job, inner);
-  const outline = new Uint8Array(px * px);
-  ctx.fillStyle = bg;
-  for (let y = 0; y < inner; y++) {
-    for (let x = 0; x < inner; x++) {
-      if (!mask[y * inner + x]) continue;
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const ax = b + x + ox;
-          const ay = b + y + oy;
-          // 안쪽 상자 밖(= 진영 색 테두리 링)은 건드리지 않는다. 작은 크기로 줄이면 마스크가
-          // 가장자리 칸까지 차기 때문에, 캔버스 경계만 자르면 외곽선이 링을 갉아먹는다 (v0.8 수정).
-          if (ax < b || ay < b || ax >= px - b || ay >= px - b) continue;
-          outline[ay * px + ax] = 1;
+    // 글리프 (안쪽 상자 기준) + 배경색 1px 외곽선
+    const mask = sampleJobMask(job, inner);
+    const outline = new Uint8Array(px * px);
+    ctx.fillStyle = bg;
+    for (let y = 0; y < inner; y++) {
+      for (let x = 0; x < inner; x++) {
+        if (!mask[y * inner + x]) continue;
+        for (let oy = -1; oy <= 1; oy++) {
+          for (let ox = -1; ox <= 1; ox++) {
+            const ax = b + x + ox;
+            const ay = b + y + oy;
+            // 안쪽 상자 밖(= 진영 색 테두리 링)은 건드리지 않는다. 작은 크기로 줄이면 마스크가
+            // 가장자리 칸까지 차기 때문에, 캔버스 경계만 자르면 외곽선이 링을 갉아먹는다 (v0.8 수정).
+            if (ax < b || ay < b || ax >= px - b || ay >= px - b) continue;
+            outline[ay * px + ax] = 1;
+          }
         }
       }
     }
-  }
-  for (let y = 0; y < px; y++) {
-    for (let x = 0; x < px; x++) {
-      if (outline[y * px + x]) ctx.fillRect(x, y, 1, 1);
+    for (let y = 0; y < px; y++) {
+      for (let x = 0; x < px; x++) {
+        if (outline[y * px + x]) ctx.fillRect(x, y, 1, 1);
+      }
     }
-  }
-  ctx.fillStyle = fg;
-  for (let y = 0; y < inner; y++) {
-    for (let x = 0; x < inner; x++) {
-      if (mask[y * inner + x]) ctx.fillRect(b + x, b + y, 1, 1);
+    ctx.fillStyle = fg;
+    for (let y = 0; y < inner; y++) {
+      for (let x = 0; x < inner; x++) {
+        if (mask[y * inner + x]) ctx.fillRect(b + x, b + y, 1, 1);
+      }
     }
-  }
-
   }
 
   if (ICON_CACHE.size >= CACHE_MAX) {

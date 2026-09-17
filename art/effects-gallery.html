@@ -14,6 +14,7 @@
 <label>재생 속도 <select id="speed"><option value="1">1배</option><option value=".25">¼배</option></select></label>
 <label><input id="showFx" type="checkbox" checked> 전장 이펙트</label>
 <a href="gallery.html">캐릭터 보기</a>
+<a href="areas-gallery.html">시전·장판 보기</a>
 <span class="status" id="status"></span>
 </div>
 <div class="scene"><canvas id="scene" width="896" height="640" aria-label="배경, 캐릭터, 이펙트 합성 미리보기"></canvas></div>
@@ -22,7 +23,7 @@
 <div class="grid" id="grid"></div>
 <div class="section"><h2>직업 문양</h2><span class="muted">HP바 옆 작은 배지에 사용</span></div>
 <div class="icons" id="icons"></div>
-<p class="note">이펙트: Aseprite Lua 제작, 0/255 알파, 3개 편집 레이어. 배경과 문양: 이미지 생성 도구 제작.<br>아직 제작하지 않은 시전·장판·상태 이펙트는 게임의 임시 에셋을 사용합니다.</p>
+<p class="note">이펙트: Aseprite Lua 제작, 0/255 알파, 3개 편집 레이어. 배경과 문양: 이미지 생성 도구 제작.<br>시전·장판 40종은 별도 갤러리에서 확인할 수 있습니다. 3순위 상태·보조 이펙트 7종은 게임의 임시 에셋을 사용합니다.</p>
 </main>
 <dialog id="detail">
 <div class="row"><h2 id="detailName"></h2><button id="close">닫기</button></div>
@@ -44,7 +45,7 @@ function load(path){const im=new Image();im.src=base+path;im.onerror=()=>documen
 const backgrounds=Object.fromEntries(['plains','dark','desert','glacier'].map(k=>[k,load('backgrounds/'+k+'.png')]));
 const sprites=Object.fromEntries(jobs.map(([k])=>[k,load('sprites/'+k+'.png')]));
 const glyphs=Object.fromEntries(jobs.map(([k])=>[k,load('icons/'+k+'.png')]));
-const cropped={};
+const cropped={};let gameIconDraw;if(location.protocol!=='file:')import('../src/ui/pixel/icons.ts').then(m=>gameIconDraw=m.drawJobIcon).catch(()=>{});
 function iconImage(key){if(cropped[key])return cropped[key];const im=glyphs[key];if(!im.complete||!im.naturalWidth)return null;if(location.protocol==='file:')return im;const c=document.createElement('canvas');c.width=im.naturalWidth;c.height=im.naturalHeight;const ctx=c.getContext('2d');ctx.drawImage(im,0,0);const d=ctx.getImageData(0,0,c.width,c.height).data;let l=c.width,t=c.height,r=-1,b=-1;for(let y=0;y<c.height;y++)for(let x=0;x<c.width;x++)if(d[(y*c.width+x)*4+3]>=128){l=Math.min(l,x);r=Math.max(r,x);t=Math.min(t,y);b=Math.max(b,y)}if(r<l)return null;const out=document.createElement('canvas');out.width=out.height=Math.max(r-l+1,b-t+1);out.getContext('2d').drawImage(c,l,t,r-l+1,b-t+1,Math.floor((out.width-r+l-1)/2),Math.floor((out.height-b+t-1)/2),r-l+1,b-t+1);return cropped[key]=out}
 let map='plains',time=0,last=performance.now(),playing=true,speed=1,selected=null;
 const dialog=document.querySelector('#detail');
@@ -54,7 +55,7 @@ const iconCanvases=jobs.map(([key,name])=>{const el=document.createElement('div'
 function background(ctx,w,h,crop=false){const im=backgrounds[map];ctx.fillStyle='#252a39';ctx.fillRect(0,0,w,h);if(im.complete&&im.naturalWidth){if(crop)ctx.drawImage(im,Math.floor(im.naturalWidth/2)-64,Math.floor(im.naturalHeight/2)-64,128,128,0,0,w,h);else ctx.drawImage(im,0,0,w,h)}}
 function frame(c){const raw=Math.floor(time*c.fps);return c.loop?raw%c.n:raw%(c.n+Math.round(c.fps*.7))}
 function effect(ctx,c,f,x,y,scale=1,angle=0){if(f>=c.n||!c.img.complete||!c.img.naturalWidth)return;ctx.save();ctx.imageSmoothingEnabled=false;ctx.globalCompositeOperation=c.blend==='add'?'lighter':'source-over';ctx.translate(Math.round(x),Math.round(y));ctx.rotate(angle);ctx.drawImage(c.img,f*c.w,0,c.w,c.w,-c.ax*scale,-c.ay*scale,c.w*scale,c.w*scale);ctx.restore()}
-function badge(ctx,key,x,y,side){const im=iconImage(key);ctx.fillStyle=side?'#e09191':'#83bcdd';ctx.fillRect(x,y,12,12);ctx.fillStyle='#252d3c';ctx.fillRect(x+1,y+1,10,10);if(im)ctx.drawImage(im,x+1,y+1,10,10)}
+function badge(ctx,key,x,y,side){if(gameIconDraw){gameIconDraw(ctx,key,x,y,12,side?'B':'A');return}const im=iconImage(key);ctx.fillStyle=side?'#e09191':'#83bcdd';ctx.fillRect(x,y,12,12);ctx.fillStyle='#252d3c';ctx.fillRect(x+1,y+1,10,10);if(im)ctx.drawImage(im,x+1,y+1,10,10)}
 const units=[['tank',305,255,0],['swordsman',352,374,0],['mage',196,295,0],['healer',235,445,0],['berserker',575,267,1],['assassin',538,391,1],['archer',682,304,1],['sniper',666,453,1]];
 function scene(){const canvas=document.querySelector('#scene'),ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;background(ctx,896,640);for(const [k,x,y,side]of units){const im=sprites[k];if(im.complete&&im.naturalWidth){ctx.save();ctx.translate(x,y);if(side)ctx.scale(-1,1);ctx.drawImage(im,Math.floor(time*6)%4*64,0,64,64,-32,-58,64,64);ctx.restore()}badge(ctx,k,x-28,y-73,side);ctx.fillStyle='#19212e';ctx.fillRect(x-13,y-70,43,6);ctx.fillStyle=side?'#ec929b':'#91dba8';ctx.fillRect(x-12,y-69,Math.floor(34+6*Math.sin(x)),4)}if(document.querySelector('#showFx').checked){effect(ctx,fx.impact_fire,frame(fx.impact_fire),571,270);effect(ctx,fx.heal_burst,frame(fx.heal_burst),235,419);effect(ctx,fx.slash_light,frame(fx.slash_light),362,350);effect(ctx,fx.crit_star,frame(fx.crit_star),535,356);effect(ctx,fx.proj_orb_ice,frame(fx.proj_orb_ice),390+Math.floor(time*130)%160,286);effect(ctx,fx.proj_arrow,frame(fx.proj_arrow),680-Math.floor(time*220)%280,322,1,Math.PI)}}
 function tick(now){if(playing)time+=(now-last)/1000*speed;last=now;scene();for(const c of cards){const ctx=c.canvas.getContext('2d');ctx.imageSmoothingEnabled=false;background(ctx,192,192,true);effect(ctx,c,frame(c),96+(c.ax-c.w/2)*3,96+(c.ay-c.w/2)*3,3)}for(const [k,canvas]of iconCanvases){const ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;ctx.clearRect(0,0,64,64);const im=iconImage(k);if(im)ctx.drawImage(im,0,0,64,64)}if(dialog.open&&selected){const c=selected;const n=+document.querySelector('#detailFrame').value;const ctx=document.querySelector('#large').getContext('2d');ctx.imageSmoothingEnabled=false;background(ctx,512,512,true);const z=6;effect(ctx,c,n,256+(c.ax-c.w/2)*z,256+(c.ay-c.w/2)*z,z);document.querySelector('#frameLabel').textContent=(n+1)+' / '+c.n}requestAnimationFrame(tick)}requestAnimationFrame(tick);

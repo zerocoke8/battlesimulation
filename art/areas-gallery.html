@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>이능 전투 · 시전과 장판</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#171c27;color:#ece7dc}*{box-sizing:border-box}body{margin:0}main{max-width:1200px;margin:auto;padding:36px 24px}header{display:flex;justify-content:space-between;align-items:end;gap:20px;border-bottom:1px solid #414959;padding-bottom:22px}small{letter-spacing:3px;font-size:11px;color:#bfd4c7}h1{font-size:34px;margin:10px 0;letter-spacing:-1px}p{color:#aebacb;font-size:13px;line-height:1.8;margin:8px 0}.count{font:18px monospace;color:#c9dfc9;white-space:nowrap}.toolbar,.schools,.toggles{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:18px 0}button,select,a{border:1px solid #495466;background:#262e3b;color:#f0eadf;padding:9px 12px;border-radius:5px;font:12px system-ui;text-decoration:none;cursor:pointer}button:hover,a:hover{border-color:#afc9be}button[aria-pressed=true]{background:#c6dfc7;color:#20352b;border-color:#c6dfc7}.schools button{border-top:3px solid var(--accent);min-width:72px}label{font-size:12px;color:#bdc5d1}input{vertical-align:middle;accent-color:#bfd8c4}#frame{width:120px}.workbench{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:18px}.stage{background:#10151e;border:1px solid #3c4858;padding:16px}.stage canvas{display:block;margin:auto;max-width:100%;height:auto}canvas{image-rendering:pixelated;image-rendering:crisp-edges}.readout{display:flex;justify-content:space-between;gap:16px;margin:13px 0 0;font:11px monospace;color:#acbccf}.sidebar{display:grid;gap:14px}.sample{background:#222b39;border:1px solid #3c4858;padding:14px}.sample h2{font-size:14px;margin:0 0 12px}.sample canvas{display:block;margin:0 auto;max-width:100%;height:auto}.sample p{font-size:11px;margin:10px 0 0}.links{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}.links a{font-size:11px;padding:6px 9px}h2{font-size:19px}section{margin:30px 0}#radii{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.radius-row{background:#222b39;border:1px solid #394555;padding:14px}.radius-row strong{display:block;font-size:13px;margin-bottom:10px}.radius-row button{margin:0 5px 5px 0;min-width:58px}.muted{font-size:11px;color:#91a1b7}.status{font-size:12px;color:#e5ba96}.footer{border-top:1px solid #394555;padding-top:16px;margin-top:26px;font-size:12px}.toggles{margin:12px 0 0}#tileGrid{margin-right:6px}@media(max-width:850px){.workbench{grid-template-columns:1fr}.sidebar{grid-template-columns:1fr 1fr}.sample{min-width:0}#radii{grid-template-columns:1fr}header{display:block}.count{margin-top:16px}}@media(max-width:500px){main{padding:24px 12px}h1{font-size:28px}.sidebar{grid-template-columns:1fr}.stage{padding:8px}}
+</style>
+<main>
+<header><div><small>BATTLE SIMULATION / EFFECTS II</small><h1>시전과 장판</h1><p>발밑에서 모이는 마력, 전장에 남는 여덟 가지 무늬.<br>계열과 반경을 고르고, 4프레임의 움직임을 살펴보세요.</p></div><div class="count">7 CAST · 25 RINGS · 8 FILLS</div></header>
+<div class="toolbar">
+<label>바탕 <select id="map"><option value="plains">초원</option><option value="dark">어둠</option><option value="desert">사막</option><option value="glacier">빙하</option><option value="solid">단색</option></select></label>
+<button id="play">일시정지</button><button id="next">다음 프레임</button>
+<label>속도 <select id="speed"><option value="1">1배</option><option value=".25">¼배</option></select></label>
+<label>프레임 <input id="frame" type="range" min="0" max="3" value="0" step="1"></label><span id="frameLabel" class="muted"></span>
+<a href="effects-gallery.html">폭발·투사체·베기</a><a href="gallery.html">캐릭터</a>
+</div>
+<nav id="schools" class="schools" aria-label="이펙트 계열"></nav>
+<div class="workbench">
+<div class="stage">
+<canvas id="scene" width="512" height="448" aria-label="실제 크기의 장판과 캐릭터 합성"></canvas>
+<div class="readout"><span id="ringName"></span><span id="ringSize"></span></div>
+<div class="toggles">
+<label><input id="ringOn" type="checkbox" checked> 테두리</label>
+<label><input id="fillOn" type="checkbox" checked> 내부</label>
+<label><input id="castOn" type="checkbox" checked> 시전</label>
+<label><input id="unitOn" type="checkbox" checked> 캐릭터</label>
+<label>내부 밝기 <input id="opacity" type="range" min="0" max="100" value="42" step="1" style="width:90px"></label>
+</div>
+<div id="ringLinks" class="links"></div>
+<p class="muted">장판과 캐릭터는 원본 픽셀 크기로 합성합니다. 내부 밝기 42%는 게임의 기본 예고 표시를 참고한 값입니다.</p>
+</div>
+<div class="sidebar">
+<div class="sample">
+<h2 id="castTitle">시전 · 4배 확대</h2>
+<canvas id="cast" width="240" height="192" aria-label="시전 확대"></canvas>
+<p id="castCaption"></p><div id="castLinks" class="links"></div>
+</div>
+<div class="sample">
+<h2>내부 · 3×3 타일</h2>
+<canvas id="tile" width="240" height="192" aria-label="내부 타일 9장 연결, 2배 확대"></canvas>
+<p><label><input id="tileGrid" type="checkbox">32px 타일 경계</label> · 원본 색 / 2배 확대</p>
+<div id="fillLinks" class="links"></div>
+</div>
+</div>
+</div>
+<section>
+<h2>반경별 원본 25종</h2>
+<p>반경을 누르면 해당 크기의 장판으로 바뀝니다. 모든 원본은 4프레임·8fps이며, 테두리의 두께는 일정합니다.</p>
+<div id="radii"></div>
+</section>
+<p id="status" class="status" role="status"></p>
+<p class="footer">Aseprite Lua 제작 · 160프레임 · 3개 편집 레이어 · 0/255 알파<br>밝은 계열은 가산 합성, 물리와 눈보라는 일반 합성입니다. 위 화면은 에셋 검수용 합성 미리보기입니다.</p>
+</main>
+<script>
+'use strict';
+const base=location.protocol==='file:'?'../public/':'../';
+const schoolDefs=[
+ ['fire','화염','#ef956f',[30,35,40]],['ice','냉기','#96cde9',[30,35,40,45]],
+ ['lightning','번개','#ddc87c',[30,40]],['holy','신성','#efdeb0',[30,40]],
+ ['nature','자연','#9dd19b',[25,30]],['shadow','암흑','#c1a0e6',[30,50]],
+ ['phys','물리','#bec2cc',[25,30,35,40,50,60]],['neutral','눈보라','#accfe5',[35,40,45,50]]
+];
+const query=s=>document.querySelector(s);
+const backgroundImages={},assets={},unitImages={};
+function load(path){const im=new Image();im.src=base+path;im.onerror=()=>{query('#status').textContent='이미지를 읽지 못했습니다: '+path;};return im;}
+for(const k of ['plains','dark','desert','glacier'])backgroundImages[k]=load('backgrounds/'+k+'.png');
+for(const k of ['mage','swordsman','healer'])unitImages[k]=load('sprites/'+k+'.png');
+function asset(key,w,fps,school){const im=load('effects/'+key+'.png');return assets[key]={key,w,fps,im,blend:school==='phys'||school==='neutral'?'source-over':'lighter'};}
+for(const [s,, ,radii] of schoolDefs){
+ if(s!=='neutral')asset('cast_'+s,48,10,s);
+ asset('zone_fill_'+s,32,8,s);
+ for(const r of radii)asset('zone_ring_'+s+'_r'+r,Math.round(r*6.4),8,s);
+}
+let school='fire',radius=35,time=0,last=performance.now(),playing=true,manual=0;
+function frame(a){return playing?Math.floor(time*a.fps)%4:manual;}
+function ready(im){return im.complete&&im.naturalWidth>0;}
+function sheet(ctx,a,n,x,y,zoom=1,opacity=1){
+ if(!a||!ready(a.im))return;
+ ctx.save();ctx.imageSmoothingEnabled=false;ctx.globalCompositeOperation=a.blend;ctx.globalAlpha=opacity;
+ ctx.drawImage(a.im,n*a.w,0,a.w,a.w,Math.round(x),Math.round(y),a.w*zoom,a.w*zoom);ctx.restore();
+}
+function paper(ctx,w,h,terrain){
+ ctx.imageSmoothingEnabled=false;ctx.fillStyle='#252a39';ctx.fillRect(0,0,w,h);
+ const im=backgroundImages[query('#map').value];
+ if(terrain&&im&&ready(im))ctx.drawImage(im,0,0,im.naturalWidth,im.naturalHeight,0,0,w,h);
+}
+function links(id,key){const el=query(id);el.replaceChildren();if(!key)return;
+ for(const [title,url] of [['Aseprite','aseprite/effects/'+key+'.aseprite'],['PNG',base+'effects/'+key+'.png'],['JSON',base+'effects/'+key+'.json']]){
+  const a=document.createElement('a');a.textContent=title;a.href=url;if(title!=='Aseprite')a.target='_blank';el.append(a);
+ }
+}
+function select(s,r){school=s;radius=r;const ring=assets['zone_ring_'+s+'_r'+r];
+ query('#ringName').textContent=ring.key;query('#ringSize').textContent=ring.w+' × '+ring.w+' px / r '+r/10;
+ query('#castTitle').textContent=(s==='neutral'?'눈보라에는 시전 이펙트가 없습니다':'시전 · 4배 확대');
+ query('#castCaption').textContent=s==='neutral'?'다른 계열을 선택하면 시전을 볼 수 있습니다.':'cast_'+s+' · 48px / 10fps';
+ links('#ringLinks',ring.key);links('#castLinks',s==='neutral'?null:'cast_'+s);links('#fillLinks','zone_fill_'+s);
+ for(const b of document.querySelectorAll('[data-school]'))b.setAttribute('aria-pressed',String(b.dataset.school===s&&(!b.dataset.radius||+b.dataset.radius===r)));
+}
+for(const [s,name,color,radii] of schoolDefs){
+ const b=document.createElement('button');b.textContent=name;b.dataset.school=s;b.style.setProperty('--accent',color);b.onclick=()=>select(s,radii.includes(radius)?radius:radii[0]);query('#schools').append(b);
+ const row=document.createElement('div');row.className='radius-row';const strong=document.createElement('strong');strong.textContent=name;strong.style.color=color;row.append(strong);
+ for(const r of radii){const b=document.createElement('button');b.textContent='r '+r/10;b.title=Math.round(r*6.4)+'px';b.dataset.school=s;b.dataset.radius=r;b.onclick=()=>select(s,r);row.append(b);}
+ query('#radii').append(row);
+}
+function drawUnit(ctx,key,x,y){const im=unitImages[key];if(!ready(im))return;ctx.drawImage(im,0,0,64,64,x-32,y-58,64,64);}
+function scene(){
+ const ctx=query('#scene').getContext('2d');paper(ctx,512,448,true);
+ const ring=assets['zone_ring_'+school+'_r'+radius],fill=assets['zone_fill_'+school],cast=assets['cast_'+school];
+ const x=256,y=240,r=ring.w/2;
+ if(query('#fillOn').checked){
+  ctx.save();ctx.beginPath();ctx.arc(x,y,r-2,0,Math.PI*2);ctx.clip();
+  for(let ty=Math.floor((y-r)/32)*32;ty<y+r;ty+=32)for(let tx=Math.floor((x-r)/32)*32;tx<x+r;tx+=32)
+   sheet(ctx,fill,frame(fill),tx,ty,1,+query('#opacity').value/100);
+  ctx.restore();
+ }
+ if(query('#ringOn').checked)sheet(ctx,ring,frame(ring),x-r,y-r);
+ const units=[['mage',256,240],['swordsman',202,293],['healer',311,300]];
+ for(const [k,ux,uy] of units){
+  if(k==='mage'&&cast&&query('#castOn').checked)sheet(ctx,cast,frame(cast),ux-24,uy-24);
+  if(query('#unitOn').checked)drawUnit(ctx,k,ux,uy);
+ }
+ const cc=query('#cast').getContext('2d');paper(cc,240,192,false);
+ if(cast)sheet(cc,cast,frame(cast),24,0,4);
+ const tc=query('#tile').getContext('2d');paper(tc,240,192,false);
+ for(let ty=0;ty<3;ty++)for(let tx=0;tx<3;tx++)sheet(tc,fill,frame(fill),24+tx*64,ty*64,2);
+ if(query('#tileGrid').checked){tc.fillStyle='#ec9fb1';for(let n=0;n<=3;n++){tc.fillRect(24+n*64,0,1,192);tc.fillRect(24,n*64,192,1);}}
+ query('#frameLabel').textContent='장판 '+(frame(ring)+1)+'/4'+(cast?' · 시전 '+(frame(cast)+1)+'/4':'');
+ if(playing)query('#frame').value=frame(ring);
+}
+function pause(n){manual=n;playing=false;query('#play').textContent='재생';query('#frame').value=n;}
+query('#play').onclick=()=>{if(playing)pause(Math.floor(time*8)%4);else{playing=true;time=manual/8;query('#play').textContent='일시정지';}};
+query('#next').onclick=()=>pause((+query('#frame').value+1)%4);
+query('#frame').oninput=e=>pause(+e.target.value);
+select(school,radius);
+function tick(now){if(playing)time+=Math.min(.1,(now-last)/1000)*+query('#speed').value;last=now;scene();requestAnimationFrame(tick);}
+requestAnimationFrame(tick);
+</script>
+</html>
+

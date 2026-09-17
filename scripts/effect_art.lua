@@ -3,6 +3,7 @@ local root=app.params.root or '.'
 local P=dofile(root..'/scripts/pixel_art.lua')
 local C=P.color
 local E={}
+local Areas=dofile(root..'/scripts/effect_area_art.lua')
 local PALETTES={
  fire={'da4421','ff832c','ffd278','fff1ba','fff9e9'},
  ice={'3978d9','58aeef','9fe0ff','e1fbff','ffffff'},
@@ -11,6 +12,7 @@ local PALETTES={
  nature={'369b48','5bbe56','a1e773','eaffc8','f6ffe9'},
  shadow={'8235b5','a650cf','c387ed','dec3ff','f3e6ff'},
  phys={'787d88','a8adb6','cdd0d7','edf0f3','ffffff'},
+ neutral={'749bb7','a9d6ef','dcf5ff','f2fcff','ffffff'},
 }
 local function pal(name)local p={};for i,c in ipairs(PALETTES[name]) do p[i]=C(c) end;return p end
 local function xy(cx,cy,r,a)return math.floor(cx+math.cos(a)*r+.5),math.floor(cy+math.sin(a)*r+.5)end
@@ -179,6 +181,7 @@ local function slash(key,f,back,main,core)
   end
 end
 function E.render(d,f)
+  if d.priority==2 then return Areas.render(d,f,pal(d.school)) end
   local m=d.meta;local back,main,core=P.image(m.frameW,m.frameH),P.image(m.frameW,m.frameH),P.image(m.frameW,m.frameH)
   local key=d.key
   if key:sub(1,7)=='impact_' then impact(key:sub(8),f,back,main,core)

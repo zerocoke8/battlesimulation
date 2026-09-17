@@ -14,6 +14,7 @@
     "sprites:check": "tsx tools/check-sprite-assets.ts",
     "effects:check": "tsx tools/check-effect-assets.ts",
     "effects:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-effects.ps1",
+    "effects:verify": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-effects.ps1 -VerifyOnly",
     "effects:list": "tsx tools/list-effect-assets.ts"
   },
   "devDependencies": {
