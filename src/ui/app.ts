@@ -77,6 +77,7 @@ import {
 import { BattleRenderer, monsterTiersOfInput, type IBattleRenderer } from './render';
 import { PixelRenderer } from './pixel/pixelRenderer';
 import { preloadSprites, resolveSheet } from './pixel/loader';
+import { preloadAllArt, type PreloadProgress } from './preload';
 import { SUMMON_KINDS, spriteKeyForSummon, spriteKeyForUnit } from './pixel/spriteTypes';
 import * as storage from './storage';
 import {
@@ -112,7 +113,7 @@ import {
 
 // ───────────────────────── 앱 상태 ─────────────────────────
 
-type View = 'start' | 'run' | 'pvp_setup' | 'battle' | 'result';
+type View = 'loading' | 'start' | 'run' | 'pvp_setup' | 'battle' | 'result';
 /** 'run' = 4:4 전투, 'monster' = 몬스터 전투, 'pvp' = 완성팀 대전 */
 type BattleMode = 'run' | 'monster' | 'pvp';
 
@@ -180,7 +181,8 @@ interface LastResult {
   monster: { tier: MonsterTier; name: string; won: boolean; reward: MonsterEncounter['reward'] } | null;
 }
 
-let view: View = 'start';
+/** 앱을 열면 먼저 로딩 화면. 끝나거나 건너뛰면 시작 화면으로 가고 같은 세션에서 다시 보이지 않는다 */
+let view: View = 'loading';
 let run: RunState | null = null;
 let battle: BattleSession | null = null;
 let lastResult: LastResult | null = null;
@@ -506,6 +508,9 @@ function render(): void {
   const prevY = window.scrollY;
   clear(root);
   switch (view) {
+    case 'loading':
+      root.appendChild(renderLoading());
+      break;
     case 'start':
       root.appendChild(renderStart());
       break;
@@ -538,6 +543,106 @@ function persistentDetails(key: string, summary: string, ...body: Child[]): HTML
     else openDetails.delete(key);
   });
   return el;
+}
+
+// ───────────────────────── 0. 로딩 (첫 실행 프리로드) ─────────────────────────
+
+/** 이 시간이 지나면 '건너뛰고 시작' 버튼이 나타난다 (ms) */
+const SKIP_BUTTON_DELAY_MS = 3000;
+
+/** 로딩 화면 DOM 참조. 진행률은 화면 전체를 다시 그리지 않고 이 요소만 갱신한다 */
+const loadingUi = {
+  fill: null as HTMLElement | null,
+  count: null as HTMLElement | null,
+  pct: null as HTMLElement | null,
+  label: null as HTMLElement | null,
+  skip: null as HTMLButtonElement | null,
+};
+/** 로딩 화면을 이미 지났는가 (끝났거나 건너뛰었다). 같은 세션에서 다시 보이지 않는다 */
+let loadingDone = false;
+/** 건너뛰기 버튼이 보이는가 (재렌더에도 유지) */
+let skipVisible = false;
+let skipTimer = 0;
+let loadingProgress: PreloadProgress = { loaded: 0, total: 0, failed: 0, label: '' };
+
+function loadingPercent(p: PreloadProgress): number {
+  if (p.total <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.floor((p.loaded / p.total) * 100)));
+}
+
+/**
+ * 진행 막대 아래 한 줄: 방금 받은 자산 이름 + 폴백(임시 그림)으로 대체된 개수.
+ * 실패한 자산은 코드 생성 시트·임시 이펙트로 그려지므로 경고가 아니라 안내다.
+ */
+function loadingLabelText(p: PreloadProgress): string {
+  const base = p.label !== '' ? p.label : '준비 중';
+  return p.failed > 0 ? `${base} · 임시 그림 ${p.failed}개` : base;
+}
+
+/** 진행 막대·숫자·퍼센트·자산 이름만 갱신 (DOM 재생성 없음) */
+function syncLoadingUi(): void {
+  const p = loadingProgress;
+  const pct = loadingPercent(p);
+  if (loadingUi.fill) loadingUi.fill.style.width = `${pct}%`;
+  if (loadingUi.count) loadingUi.count.textContent = `그림 불러오는 중 ${p.loaded}/${p.total}`;
+  if (loadingUi.pct) loadingUi.pct.textContent = `${pct}%`;
+  if (loadingUi.label) loadingUi.label.textContent = loadingLabelText(p);
+  if (loadingUi.skip) loadingUi.skip.hidden = !skipVisible;
+}
+
+/** 로딩 화면을 닫고 시작 화면으로. 남은 자산은 백그라운드에서 계속 받는다 */
+function finishLoading(): void {
+  if (loadingDone) return;
+  loadingDone = true;
+  window.clearTimeout(skipTimer);
+  skipTimer = 0;
+  loadingUi.fill = null;
+  loadingUi.count = null;
+  loadingUi.pct = null;
+  loadingUi.label = null;
+  loadingUi.skip = null;
+  view = 'start';
+  render();
+}
+
+function renderLoading(): HTMLElement {
+  const fill = h('div', { class: 'loading-fill', style: `width:${loadingPercent(loadingProgress)}%` });
+  const count = h('span', { class: 'loading-count' }, '그림 불러오는 중');
+  const pct = h('span', { class: 'loading-pct' }, '0%');
+  const label = h('div', { class: 'loading-label' }, loadingLabelText(loadingProgress));
+  const skip = h('button', { class: 'btn ghost small', hidden: !skipVisible, onclick: finishLoading }, '건너뛰고 시작');
+  loadingUi.fill = fill;
+  loadingUi.count = count;
+  loadingUi.pct = pct;
+  loadingUi.label = label;
+  loadingUi.skip = skip;
+
+  const el = h(
+    'div',
+    { class: 'screen loading-screen' },
+    h('div', { class: 'loading-box' },
+      h('h1', { class: 'loading-title' }, `이능 ${VS_LABEL} 전투 시뮬레이터`),
+      h('p', { class: 'muted small loading-sub' }, '캐릭터 · 이펙트 · 배경 그림을 미리 받는 중입니다. 처음 한 번만 기다리면 됩니다.'),
+      h('div', { class: 'loading-bar' }, fill),
+      h('div', { class: 'row between loading-status' }, count, pct),
+      label,
+      h('div', { class: 'row center loading-skip-row' }, skip),
+    ),
+  );
+  syncLoadingUi();
+  return el;
+}
+
+/** 첫 실행 프리로드 시작. 끝나거나 건너뛰면 시작 화면으로 넘어간다 */
+function bootPreload(): void {
+  skipTimer = window.setTimeout(() => {
+    skipVisible = true;
+    syncLoadingUi();
+  }, SKIP_BUTTON_DELAY_MS);
+  void preloadAllArt((p) => {
+    loadingProgress = p;
+    if (!loadingDone && view === 'loading') syncLoadingUi();
+  }).then(finishLoading, finishLoading);
 }
 
 // ───────────────────────── 1. 시작 ─────────────────────────
@@ -1809,3 +1914,5 @@ document.addEventListener('visibilitychange', () => {
 // 탭 제목도 팀 인원 표기(4:4)를 따른다. index.html 의 정적 제목은 부팅 시 덮어쓴다.
 document.title = `이능 ${VS_LABEL} 전투 시뮬레이터`;
 render();
+// 시작 화면보다 먼저 그림을 모아 받는다 (전투 시작 시의 preload 는 안전망으로 남겨 둔다)
+bootPreload();

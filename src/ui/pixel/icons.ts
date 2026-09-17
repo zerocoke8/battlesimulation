@@ -294,13 +294,13 @@ type IconCanvas = HTMLCanvasElement | OffscreenCanvas;
 
 const ICON_CACHE = new Map<string, IconCanvas>();
 const GENERATED_ICONS = new Map<MainJob, HTMLCanvasElement>();
-const REQUESTED_ICONS = new Set<MainJob>();
+const REQUESTED_ICONS = new Map<MainJob, Promise<boolean>>();
 
-function requestJobArtwork(job: MainJob): void {
-  if (REQUESTED_ICONS.has(job)) return;
-  REQUESTED_ICONS.add(job);
-  void loadArtImage(`icons/${job}.png`).then((image) => {
-    if (!image) return;
+function requestJobArtwork(job: MainJob): Promise<boolean> {
+  const pending = REQUESTED_ICONS.get(job);
+  if (pending) return pending;
+  const p = loadArtImage(`icons/${job}.png`).then((image) => {
+    if (!image) return false;
     // Trim transparent padding for legibility in the tiny HP-bar badge.
     const source = createCanvas(image.naturalWidth, image.naturalHeight);
     const sourceCtx = ctx2d(source);
@@ -314,7 +314,7 @@ function requestJobArtwork(job: MainJob): void {
         x1 = Math.max(x1, x); y1 = Math.max(y1, y);
       }
     }
-    if (x1 < x0) return;
+    if (x1 < x0) return false;
     const w = x1 - x0 + 1, h = y1 - y0 + 1;
     const edge = Math.max(w, h);
     const trimmed = createCanvas(128, 128);
@@ -323,7 +323,18 @@ function requestJobArtwork(job: MainJob): void {
     ctx2d(trimmed).drawImage(source, x0, y0, w, h, Math.floor((128 - tw) / 2), Math.floor((128 - th) / 2), tw, th);
     GENERATED_ICONS.set(job, trimmed);
     for (const key of ICON_CACHE.keys()) if (key.startsWith(`${job}|`)) ICON_CACHE.delete(key);
-  });
+    return true;
+  }).catch(() => false);
+  REQUESTED_ICONS.set(job, p);
+  return p;
+}
+
+/**
+ * 직업 아이콘 PNG 를 미리 받는다 (첫 실행 프리로드용). 잘라내기·캐시는 그리기 경로와 같은 것을 쓰고,
+ * 같은 직업을 여러 번 불러도 요청은 한 번뿐이다. 성공하면 true (없거나 실패하면 false → 폴백 마스크로 그린다).
+ */
+export function preloadJobIcon(job: MainJob): Promise<boolean> {
+  return requestJobArtwork(job);
 }
 
 /** Opaque area sampling keeps narrow generated strokes readable at 7–12 px. */
@@ -356,7 +367,7 @@ function drawGeneratedGlyph(ctx: CanvasRenderingContext2D, art: HTMLCanvasElemen
  * fg = 글리프 색, bg = 바탕(= 글리프 외곽선 색), border = 테두리 링 색.
  */
 export function jobIconCanvas(job: MainJob, size: number, fg: string, bg: string, border: string): IconCanvas {
-  requestJobArtwork(job);
+  void requestJobArtwork(job);
   const px = Math.max(6, Math.round(size));
   const key = `${job}|${px}|${fg}|${bg}|${border}`;
   const hit = ICON_CACHE.get(key);

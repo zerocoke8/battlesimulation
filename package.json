@@ -15,7 +15,8 @@
     "effects:check": "tsx tools/check-effect-assets.ts",
     "effects:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-effects.ps1",
     "effects:verify": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-effects.ps1 -VerifyOnly",
-    "effects:list": "tsx tools/list-effect-assets.ts"
+    "effects:list": "tsx tools/list-effect-assets.ts",
+    "art:optimize": "tsx tools/optimize-art.ts"
   },
   "devDependencies": {
     "@types/node": "^26.5.1",

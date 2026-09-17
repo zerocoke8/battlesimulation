@@ -165,6 +165,22 @@ export function preloadFx(keys: readonly FxKey[]): void {
   }
 }
 
+/**
+ * preloadFx 와 같지만 전부 끝나면(성공·실패 무관) resolve 한다. 첫 실행 프리로드(src/ui/preload.ts)가
+ * 개별 완료를 세는 데 쓴다. 성공 여부는 hasExternalFx(key) 로 확인한다.
+ */
+export function preloadFxSheets(keys: readonly FxKey[]): Promise<void> {
+  const seen = new Set<FxKey>();
+  const ps: Promise<FxSheet | null>[] = [];
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    if (seen.has(k)) continue;
+    seen.add(k);
+    ps.push(ensureLoading(k));
+  }
+  return Promise.all(ps).then(() => undefined);
+}
+
 /** FX_KEYS 전부 미리 로드 */
 export function preloadAllFx(): void {
   preloadFx(FX_KEYS);
