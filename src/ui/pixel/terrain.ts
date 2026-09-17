@@ -9,6 +9,7 @@
 import type { MapDef, MapType } from '../../core/types';
 import { MAP_MARGIN_UNITS } from '../../core/types';
 import { PIXELS_PER_UNIT } from './spriteTypes';
+import { loadArtImage } from './imageAssets';
 
 /** 프레임(여백) 색. 간단 모드의 FRAME_COLOR 와 같은 톤 */
 export const PIXEL_FRAME_COLOR = '#0b0e14';
@@ -141,6 +142,21 @@ export function buildTerrain(map: MapDef, pxPerUnit = PIXELS_PER_UNIT, margin = 
   ctx.fillRect(ox - 2, oy + mh, mw + 4, 2);
   ctx.fillRect(ox - 2, oy - 2, 2, mh + 4);
   ctx.fillRect(ox + mw, oy - 2, 2, mh + 4);
+
+  // Paint the generated map into this layer once decoded. Existing terrain is
+  // immediately available while loading and remains the fallback on failure.
+  void loadArtImage(`backgrounds/${map.id}.png`).then((image) => {
+    if (!image) return;
+    const ratio = Math.max(mw / image.naturalWidth, mh / image.naturalHeight);
+    const sw = Math.min(image.naturalWidth, Math.round(mw / ratio));
+    const sh = Math.min(image.naturalHeight, Math.round(mh / ratio));
+    const sx = Math.floor((image.naturalWidth - sw) / 2);
+    const sy = Math.floor((image.naturalHeight - sh) / 2);
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(image, sx, sy, sw, sh, ox, oy, mw, mh);
+    ctx.restore();
+  });
 
   return { canvas, width, height, pxPerUnit, originX: ox, originY: oy, mapId: map.id };
 }

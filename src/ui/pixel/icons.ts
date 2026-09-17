@@ -15,6 +15,7 @@ import type { MainJob, TeamSide } from '../../core/types';
 import { MAIN_JOBS } from '../../core/types';
 import { ICON_BG_COLOR, ICON_BORDER_COLOR, ICON_FG_COLOR } from './palette';
 import { createCanvas, ctx2d } from './terrain';
+import { loadArtImage } from './imageAssets';
 
 /** 마스크 격자 한 변 */
 export const ICON_MASK_SIZE = 16;
@@ -290,12 +291,42 @@ export function iconBorderPx(size: number): number {
 type IconCanvas = HTMLCanvasElement | OffscreenCanvas;
 
 const ICON_CACHE = new Map<string, IconCanvas>();
+const GENERATED_ICONS = new Map<MainJob, HTMLCanvasElement>();
+const REQUESTED_ICONS = new Set<MainJob>();
+
+function requestJobArtwork(job: MainJob): void {
+  if (REQUESTED_ICONS.has(job)) return;
+  REQUESTED_ICONS.add(job);
+  void loadArtImage(`icons/${job}.png`).then((image) => {
+    if (!image) return;
+    // Trim transparent padding for legibility in the tiny HP-bar badge.
+    const source = createCanvas(image.naturalWidth, image.naturalHeight);
+    const sourceCtx = ctx2d(source);
+    sourceCtx.drawImage(image, 0, 0);
+    const pixels = sourceCtx.getImageData(0, 0, source.width, source.height).data;
+    let x0 = source.width, y0 = source.height, x1 = -1, y1 = -1;
+    for (let y = 0; y < source.height; y++) {
+      for (let x = 0; x < source.width; x++) {
+        if (pixels[(y * source.width + x) * 4 + 3] < 128) continue;
+        x0 = Math.min(x0, x); y0 = Math.min(y0, y);
+        x1 = Math.max(x1, x); y1 = Math.max(y1, y);
+      }
+    }
+    if (x1 < x0) return;
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    const trimmed = createCanvas(Math.max(w, h), Math.max(w, h));
+    ctx2d(trimmed).drawImage(source, x0, y0, w, h, Math.floor((trimmed.width - w) / 2), Math.floor((trimmed.height - h) / 2), w, h);
+    GENERATED_ICONS.set(job, trimmed);
+    for (const key of ICON_CACHE.keys()) if (key.startsWith(`${job}|`)) ICON_CACHE.delete(key);
+  });
+}
 
 /**
  * 직업 아이콘 캔버스 (size × size). 같은 인자면 캐시된 같은 캔버스를 돌려준다 — 호출자는 내용을 바꾸면 안 된다.
  * fg = 글리프 색, bg = 바탕(= 글리프 외곽선 색), border = 테두리 링 색.
  */
 export function jobIconCanvas(job: MainJob, size: number, fg: string, bg: string, border: string): IconCanvas {
+  requestJobArtwork(job);
   const px = Math.max(6, Math.round(size));
   const key = `${job}|${px}|${fg}|${bg}|${border}`;
   const hit = ICON_CACHE.get(key);
@@ -313,6 +344,10 @@ export function jobIconCanvas(job: MainJob, size: number, fg: string, bg: string
   ctx.fillStyle = bg;
   ctx.fillRect(b, b, inner, inner);
 
+  const artwork = GENERATED_ICONS.get(job);
+  if (artwork) {
+    ctx.drawImage(artwork, b, b, inner, inner);
+  } else {
   // 글리프 (안쪽 상자 기준) + 배경색 1px 외곽선
   const mask = sampleJobMask(job, inner);
   const outline = new Uint8Array(px * px);
@@ -342,6 +377,8 @@ export function jobIconCanvas(job: MainJob, size: number, fg: string, bg: string
     for (let x = 0; x < inner; x++) {
       if (mask[y * inner + x]) ctx.fillRect(b + x, b + y, 1, 1);
     }
+  }
+
   }
 
   if (ICON_CACHE.size >= CACHE_MAX) {

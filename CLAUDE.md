@@ -32,6 +32,8 @@
 - `src/ui/pixel/spriteTypes.ts` 도트 스프라이트 계약 (`SpriteMeta`, `DEFAULT_META`, `spriteKeyForUnit`, `ALL_SPRITE_KEYS`)
 - `src/ui/pixel/*` 도트 렌더러(기본 모드): 코드 생성 임시 스프라이트, `public/sprites/` 로더(폴백), 픽셀 지형·이펙트
 - `docs/SPRITES.md` 스프라이트 에셋 규격 (작가용). `spriteTypes.ts` 와 항상 일치시킬 것
+- `src/ui/pixel/fx/fxTypes.ts` 도트 이펙트 계약 (`FxMeta`, `FX_KEYS`, `FX_DEFAULT_META`). 장판 테두리 키는 `SKILLS`·`HAZARDS` 의 (계열, 반경) 조합에서 자동 생성
+- `docs/EFFECTS.md` 스킬 이펙트 에셋 규격 (작가용). `fxTypes.ts` 와 항상 일치시킬 것. 목록은 `npm run effects:list`, 검사는 `npm run effects:check`
 - `tools/headless.ts` 대량 시뮬레이션 CLI
 
 ## 용어 (v0.4)

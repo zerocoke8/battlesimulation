@@ -11,7 +11,10 @@
     "headless": "tsx tools/headless.ts",
     "sprites:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-sprites.ps1",
     "sprites:verify": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-sprites.ps1 -VerifyOnly",
-    "sprites:check": "tsx tools/check-sprite-assets.ts"
+    "sprites:check": "tsx tools/check-sprite-assets.ts",
+    "effects:check": "tsx tools/check-effect-assets.ts",
+    "effects:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-effects.ps1",
+    "effects:list": "tsx tools/list-effect-assets.ts"
   },
   "devDependencies": {
     "@types/node": "^26.5.1",

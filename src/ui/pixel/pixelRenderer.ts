@@ -3,8 +3,17 @@
  *
  * 파이프라인 (docs/SPRITES.md §7)
  *  1. 오프스크린 캔버스 (1 유닛 = PIXELS_PER_UNIT(32) px, 맵 + 사방 MAP_MARGIN_UNITS 여백):
- *     지형(terrain.ts, 캐시) → 어둠 맵 안개(시야로 뚫음) → 예고·장판(디더링) → 죽은 유닛 → 살아있는 유닛(y 오름차순)
- *     → 폭발 플래시 → 이펙트(effects.ts)
+ *     지형(terrain.ts, 캐시) → 어둠 맵 안개(시야로 뚫음) → 예고·장판(zone_fill 타일 + zone_ring 테두리, 시트가 없으면 디더링)
+ *     → 시전·발밑 상태 이펙트 → 죽은 유닛 → 살아있는 유닛(y 오름차순) → 폭발 플래시(impact 시트 + 기존 플래시)
+ *     → 이펙트(effects.ts) → 머리 위 상태 이펙트
+ *
+ * 이펙트 시트(v0.9): `src/ui/pixel/fx/*` 의 fx 시트를 우선 쓰고, 시트를 못 쓰면 effects.ts 의 코드 파티클·디더로 폴백한다.
+ * 규격은 docs/EFFECTS.md. 전투 시작 시 `preloadBattleFx()` 로 외부 시트를 미리 로드한다.
+ *
+ * 장판 테두리(zone_ring)는 **반경마다 그 크기로 만든 원 한 장**이다 (`zone_ring_<계열>_r<반경×10>`, 한 변 = 반경 × 2 × 32 px).
+ * 늘리지도(배율 1) 둘레에 이어 붙이지도 않으므로 캐릭터와 픽셀 밀도가 같고, 고리를 미리 조립할 필요가 없어 **영역당 draw 는 1회**다
+ * — effects.ts 의 프레임당 상한(MAX_FX_PER_ZONE 3 = 바탕 채움 + 진행 채움 + 테두리 1장, MAX_FX_PER_FRAME 200)이 그대로 유효하다.
+ * 정확히 맞는 키가 없을 때만 가장 가까운 반경의 키를 ZONE_RING_SCALE_MIN~MAX 안에서 쓰고, 그 밖이면 벡터 테두리로 폴백한다.
  *  2. 화면 캔버스로 `imageSmoothingEnabled = false` 로 확대·축소. 정수로 내려도 캔버스의 90% 이상을 채우면 정수 배율,
  *     아니면 소수 배율 최근접 보간 (검은 띠 최소화). 가운데 정렬.
  *  3. 화면 캔버스에 벡터 오버레이: HP·MP·시전 바, 상태 점, 이름표, 보호막 링, 영역 라벨, 플로팅 텍스트·말풍선(BattleOverlay),
@@ -21,7 +30,7 @@
  * 스프라이트 시트는 `SpriteProvider.resolveSheet(key, tint)` 로 매 프레임 조회한다 (비동기 로드가 끝나면 다음 프레임부터 바뀐다).
  * 제공자가 없거나 예외를 던지면 이 파일의 내장 자리표시(placeholder) 시트로 그린다 — 절대 멈추지 않는다.
  */
-import type { BattleFrame, MapDef, MonsterTier, UnitSnapshot, ZoneSide, ZoneSnapshot } from '../../core/types';
+import type { BattleFrame, MagicSchool, MapDef, MonsterTier, UnitSnapshot, ZoneSide, ZoneSnapshot } from '../../core/types';
 import { MAP_MARGIN_UNITS } from '../../core/types';
 import {
   BattleOverlay,
@@ -67,7 +76,21 @@ import {
 import { BLIZZARD_COLORS, SIDE_COLOR, SIDE_MP_COLOR, tintForSubJob } from './palette';
 import { drawJobIcon } from './icons';
 import { buildTerrain, createCanvas, ctx2d, hashNoise, makeDitherPattern, type TerrainLayer } from './terrain';
-import { EffectSystem } from './effects';
+import {
+  EffectSystem,
+  MAX_ZONE_FX_ZONES,
+  drawFx,
+  fxFrameCanvas,
+  fxFrameIndex,
+  fxSheetDuration,
+  impactFxKey,
+  preloadBattleFx,
+  schoolOfSkill,
+  tryFx,
+  zoneFillFxKey,
+  zoneRingFxKey,
+  zoneRingFxScale,
+} from './effects';
 
 // ───────────────────────── 스프라이트 제공자 계약 ─────────────────────────
 
@@ -142,6 +165,16 @@ const ICON_GAP_PX = 2;
  * 밀집 분기가 영영 실행되지 않는다 (v0.8 수정).
  */
 const ICON_DENSE_SKIP_UNITS = 8;
+
+// ───────────────────────── 장판 테두리 (반경별 원본 시트) ─────────────────────────
+
+/**
+ * 테두리 시트는 반경마다 '실제 크기 그대로' 만들어져 있어 보통 **배율 1** 로 1:1 그린다.
+ * 정확히 맞는 키가 없을 때만 가장 가까운 반경의 키로 살짝 늘리는데, 그 배율이 이 범위를 벗어나면
+ * 시트를 쓰지 않고 기존 벡터 테두리로 폴백한다 (뭉툭한 픽셀로 그리느니 선이 낫다).
+ */
+export const ZONE_RING_SCALE_MIN = 0.9;
+export const ZONE_RING_SCALE_MAX = 1.1;
 
 interface UnitAnimState {
   anim: AnimName;
@@ -307,8 +340,9 @@ export class PixelRenderer implements IBattleRenderer {
     if (this.lastFrame) this.draw(this.lastFrame);
   }
 
-  /** 전투 시작 시 이 프레임의 유닛 키 + 소환물 4종을 미리 적재한다 */
+  /** 전투 시작 시 이 프레임의 유닛 키 + 소환물 4종 + 이펙트 시트 전체를 미리 적재한다 */
   preloadForFrame(frame: BattleFrame): void {
+    preloadBattleFx();
     const keys: SpriteKey[] = [];
     const seen = new Set<string>();
     for (const u of frame.units) {
@@ -426,11 +460,19 @@ export class PixelRenderer implements IBattleRenderer {
     o.drawImage(this.terrain.canvas, 0, 0);
     if (this.map.visionRadius > 0) this.drawFog(frame);
 
+    // 영역: 앞에서부터 MAX_ZONE_FX_ZONES 개만 fx 시트를 쓴다 (나머지는 기존 디더 표현. 프레임당 이펙트 상한)
     const zones: ZoneSnapshot[] = frame.zones ?? [];
+    let zoneFxLeft = MAX_ZONE_FX_ZONES;
     for (const z of zones) {
-      if (z.phase === 'telegraph') this.drawTelegraph(o, z, now);
-      else if (z.phase === 'active') this.drawLinger(o, z, now);
+      const useFx = zoneFxLeft > 0;
+      if (z.phase === 'telegraph') this.drawTelegraph(o, z, now, useFx);
+      else if (z.phase === 'active') this.drawLinger(o, z, now, useFx);
+      else continue;
+      if (useFx) zoneFxLeft -= 1;
     }
+
+    // 시전 원·발밑 상태(빙결·보호막)는 유닛 아래에 깔린다
+    this.effects.drawUnitFxUnder(o, frame.units, now, (x) => this.px(x), (y) => this.py(y), PIXELS_PER_UNIT);
 
     const dead = frame.units.filter((u) => !u.alive).sort((a, b) => a.y - b.y);
     const alive = frame.units.filter((u) => u.alive).sort((a, b) => a.y - b.y || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -440,8 +482,17 @@ export class PixelRenderer implements IBattleRenderer {
       this.drawSprite(o, u, now);
     }
 
-    for (const z of zones) if (z.phase === 'flash') this.drawFlash(o, z);
+    for (const z of zones) {
+      if (z.phase !== 'flash') continue;
+      const useFx = zoneFxLeft > 0;
+      this.drawFlash(o, z, useFx);
+      if (useFx) zoneFxLeft -= 1;
+    }
     this.effects.draw(o, now, (x) => this.px(x), (y) => this.py(y), PIXELS_PER_UNIT);
+    // 머리 위 상태(기절·화상)는 유닛·이펙트 위에 얹는다
+    this.effects.drawUnitFxOver(o, frame.units, now, (x) => this.px(x), (y) => this.py(y), PIXELS_PER_UNIT, (u) =>
+      SPRITE_HEAD_UNITS * this.sizeMult(u),
+    );
     o.restore();
 
     // 2. 화면으로 확대·축소 (최근접)
@@ -743,15 +794,92 @@ export class PixelRenderer implements IBattleRenderer {
     o.globalAlpha = 1;
   }
 
-  /** 예고: 성긴 디더 바탕 + 진행률만큼 촘촘한 안쪽 + 점선 테두리. 기믹은 흰 눈송이 */
-  private drawTelegraph(o: CanvasRenderingContext2D, z: ZoneSnapshot, now: number): void {
+  /** 영역의 계열. 맵 기믹(neutral)은 계열 대신 zone_*_neutral 을 쓰므로 값이 무시된다 */
+  private zoneSchool(z: ZoneSnapshot): MagicSchool {
+    return schoolOfSkill(z.skillId);
+  }
+
+  /**
+   * 영역 내부 타일 채우기: zone_fill 시트의 현재 프레임을 `repeat` 패턴으로 만들어 영역 경로 안에 깐다.
+   * 패턴 원점이 오프스크린 캔버스 원점이라 영역이 움직여도 타일 격자가 흔들리지 않는다.
+   * frac 은 예고 진행률 (0~1). 시트를 못 쓰면 false.
+   */
+  private fillZoneFx(o: CanvasRenderingContext2D, z: ZoneSnapshot, key: string, now: number, alpha: number, frac: number): boolean {
+    const sheet = tryFx(key);
+    if (!sheet) return false;
+    const fi = fxFrameIndex(sheet, now);
+    if (fi < 0) return false;
+    const img = fxFrameCanvas(sheet, fi);
+    if (!img) return false;
+    let pat: CanvasPattern | null = null;
+    try {
+      pat = o.createPattern(img, 'repeat');
+    } catch {
+      return false;
+    }
+    if (!pat) return false;
+    o.save();
+    if (!this.trace(o, z, 0, frac)) {
+      o.restore();
+      return false;
+    }
+    o.clip();
+    o.imageSmoothingEnabled = false;
+    if (sheet.meta.blend === 'add') o.globalCompositeOperation = 'lighter';
+    o.globalAlpha = clamp01(alpha);
+    o.fillStyle = pat;
+    // 타일 격자를 맵 원점에 맞춘다 (여백 폭이 타일 크기의 배수가 아니어도 맵 칸과 어긋나지 않게)
+    const ox = ((this.terrain.originX % sheet.meta.frameW) + sheet.meta.frameW) % sheet.meta.frameW;
+    const oy = ((this.terrain.originY % sheet.meta.frameH) + sheet.meta.frameH) % sheet.meta.frameH;
+    o.translate(ox, oy);
+    o.fillRect(-ox, -oy, this.terrain.width, this.terrain.height);
+    o.restore();
+    return true;
+  }
+
+  /**
+   * 영역 테두리: 그 반경의 **실제 크기 그대로** 만든 원 시트(zone_ring_<계열>_r<반경×10>) 한 장을 그린다.
+   * 시트의 앵커가 원의 중심이라 영역 중심에 그대로 놓으면 테두리가 실제 반경 위에 온다.
+   * 늘리지도(배율 1) 이어 붙이지도 않으므로 픽셀 밀도가 캐릭터 스프라이트와 같고, **영역당 draw 는 1회**다.
+   *
+   * 정확히 맞는 키가 없을 때(예: 눈보라가 파도마다 0.1 씩 자라 3.7 이 될 때)만 배율이 1 이 아니며,
+   * 그 배율이 ZONE_RING_SCALE_MIN~MAX 를 벗어나면 시트를 쓰지 않고 기존 벡터 테두리로 폴백한다.
+   * 선분(line) 영역은 원이 아니라 이 시트를 쓸 수 없어 기존 벡터 테두리로 남긴다.
+   */
+  private drawZoneRingFx(o: CanvasRenderingContext2D, z: ZoneSnapshot, now: number, alpha: number): boolean {
+    if (z.shape !== 'circle' || !(z.radius > 0)) return false;
+    const a = clamp01(alpha);
+    if (a <= 0) return false;
+    const key = zoneRingFxKey(this.zoneSchool(z), z.side === 'neutral', z.radius);
+    const scale = zoneRingFxScale(key, z.radius);
+    if (!(scale >= ZONE_RING_SCALE_MIN) || !(scale <= ZONE_RING_SCALE_MAX)) return false;
+    const sheet = tryFx(key);
+    if (!sheet || sheet.meta.frameW <= 0) return false;
+    // 외부 에셋이 loop:false 로 들어와 재생이 끝났으면 아무것도 못 그리므로 벡터 폴백에 넘긴다
+    if (fxFrameIndex(sheet, now) < 0) return false;
+    drawFx(o, sheet, now, this.px(z.x), this.py(z.y), scale, 0, a);
+    return true;
+  }
+
+  /** 예고: zone_fill 타일(진행률만큼 차오름) + zone_ring 테두리. 시트가 없으면 디더 + 점선. 기믹은 흰 눈송이 */
+  private drawTelegraph(o: CanvasRenderingContext2D, z: ZoneSnapshot, now: number, useFx: boolean): void {
     const { color, light } = this.zoneColors(z.side);
     const neutral = z.side === 'neutral';
     const p = clamp01(z.progress);
     o.save();
-    if (this.trace(o, z)) this.fillDither(o, color, 1, neutral ? 0.9 : 0.75);
-    if (p > 0 && this.trace(o, z, 0, p)) this.fillDither(o, color, 2, 0.85);
-    if (this.trace(o, z)) {
+    let filled = false;
+    let ringed = false;
+    if (useFx) {
+      const key = zoneFillFxKey(this.zoneSchool(z), neutral);
+      filled = this.fillZoneFx(o, z, key, now, 0.42, 1);
+      if (filled && p > 0) this.fillZoneFx(o, z, key, now, 0.95, p);
+      ringed = this.drawZoneRingFx(o, z, now, 0.55 + 0.45 * p);
+    }
+    if (!filled) {
+      if (this.trace(o, z)) this.fillDither(o, color, 1, neutral ? 0.9 : 0.75);
+      if (p > 0 && this.trace(o, z, 0, p)) this.fillDither(o, color, 2, 0.85);
+    }
+    if (!ringed && this.trace(o, z)) {
       o.setLineDash([6, 4]);
       o.lineDashOffset = -Math.round(now * 24);
       o.lineWidth = 2;
@@ -763,25 +891,33 @@ export class PixelRenderer implements IBattleRenderer {
     o.restore();
   }
 
-  /** 장판: 체커 디더 + 실선 테두리 + 퍼지는 고리. 기믹은 눈송이 */
-  private drawLinger(o: CanvasRenderingContext2D, z: ZoneSnapshot, now: number): void {
+  /** 장판: zone_fill 타일 + zone_ring 테두리. 시트가 없으면 체커 디더 + 실선 + 퍼지는 고리. 기믹은 눈송이 */
+  private drawLinger(o: CanvasRenderingContext2D, z: ZoneSnapshot, now: number, useFx: boolean): void {
     const { color, light } = this.zoneColors(z.side);
     const neutral = z.side === 'neutral';
     const p = clamp01(z.progress);
     o.save();
-    if (this.trace(o, z)) this.fillDither(o, color, 2, 0.8 * (1 - 0.5 * p));
-    // 퍼지는 고리 2개
-    for (let i = 0; i < 2; i++) {
-      const f = (now * 0.7 + i / 2) % 1;
-      const ok = z.shape === 'circle' ? this.trace(o, z, 0, f) : this.trace(o, z, Math.max(0, f - 0.12), f);
-      if (!ok) continue;
-      o.globalAlpha = 0.5 * (1 - f);
-      o.lineWidth = 2;
-      o.strokeStyle = light;
-      o.stroke();
-      o.globalAlpha = 1;
+    let filled = false;
+    let ringed = false;
+    if (useFx) {
+      filled = this.fillZoneFx(o, z, zoneFillFxKey(this.zoneSchool(z), neutral), now, 0.85 * (1 - 0.35 * p), 1);
+      ringed = this.drawZoneRingFx(o, z, now, 0.9 * (1 - 0.4 * p));
     }
-    if (this.trace(o, z)) {
+    if (!filled) {
+      if (this.trace(o, z)) this.fillDither(o, color, 2, 0.8 * (1 - 0.5 * p));
+      // 퍼지는 고리 2개
+      for (let i = 0; i < 2; i++) {
+        const f = (now * 0.7 + i / 2) % 1;
+        const ok = z.shape === 'circle' ? this.trace(o, z, 0, f) : this.trace(o, z, Math.max(0, f - 0.12), f);
+        if (!ok) continue;
+        o.globalAlpha = 0.5 * (1 - f);
+        o.lineWidth = 2;
+        o.strokeStyle = light;
+        o.stroke();
+        o.globalAlpha = 1;
+      }
+    }
+    if (!ringed && this.trace(o, z)) {
       o.lineWidth = 2;
       o.strokeStyle = color;
       o.stroke();
@@ -790,8 +926,11 @@ export class PixelRenderer implements IBattleRenderer {
     o.restore();
   }
 
-  /** 폭발 플래시: 밝은 체커 채움이 사라지며 테두리가 바깥으로 */
-  private drawFlash(o: CanvasRenderingContext2D, z: ZoneSnapshot): void {
+  /**
+   * 폭발 플래시: 기존 밝은 체커 채움 + 바깥으로 퍼지는 테두리 위에 impact 시트를 겹친다.
+   * 플래시 구간(ZONE_FLASH_SEC 0.25초)의 진행률에 맞춰 impact 한 바퀴를 전부 재생한다.
+   */
+  private drawFlash(o: CanvasRenderingContext2D, z: ZoneSnapshot, useFx: boolean): void {
     const { color, light } = this.zoneColors(z.side);
     const p = clamp01(z.progress);
     const fade = 1 - p;
@@ -804,6 +943,14 @@ export class PixelRenderer implements IBattleRenderer {
       o.stroke();
     }
     o.restore();
+    if (!useFx) return;
+    const sheet = tryFx(impactFxKey(this.zoneSchool(z)));
+    if (!sheet) return;
+    const dur = fxSheetDuration(sheet, 0.3);
+    const c = zoneCenter(z);
+    const r = z.shape === 'circle' ? z.radius : Math.max(0.5, (z.width ?? 1) * 0.5);
+    const scale = Math.min(4, Math.max(0.7, r));
+    drawFx(o, sheet, Math.min(p, 0.999) * dur, this.px(c.x), this.py(c.y), scale, 0, 1);
   }
 
   /** 눈보라 입자 (흰·하늘색 2~3px). 고정 패턴이 시뮬레이션 시간에 따라 아래로 흐른다 */
